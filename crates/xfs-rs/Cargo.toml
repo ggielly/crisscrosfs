@@ -1,0 +1,36 @@
+[package]
+name = "xfs-rs"
+description = "Pure Rust XFS filesystem parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fs-abstraction = { path = "../fs-abstraction", default-features = false }
+crc32c = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { workspace = true }
+fs-abstraction = { path = "../fs-abstraction" }
+
+[[test]]
+name = "xfs_parser_tests"
+path = "../../tests/proptest/xfs_parser_tests.rs"
+
+[[test]]
+name = "corrupted_images"
+path = "../../tests/corrupted_images.rs"
+
+[features]
+default = []
+nightly = []
+# Enable alloc for dynamic memory (Vec, Box)
+alloc = ["fs-abstraction/alloc"]
+# Enable std library - for user mode (WinFsp)
+std = ["alloc", "fs-abstraction/std"]
+
+[[bench]]
+name = "crc_bench"
+harness = false

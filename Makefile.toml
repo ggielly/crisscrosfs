@@ -1,0 +1,75 @@
+# Makefile.toml - Build tasks for XFS WinFSP
+# Usage: cargo make <task>
+
+[config]
+default_to_workspace = false
+
+# ============================================================================
+# XFS WinFSP Tasks (User-mode filesystem) - DEFAULT
+# ============================================================================
+
+[tasks.default]
+description = "Build fs-winfsp-glue (debug)"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+Write-Host "Building fs-winfsp-glue (debug)..." -ForegroundColor Cyan
+cargo build -p fs-winfsp-glue
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "Build complete! Binary: target\debug\xfs-mount.exe" -ForegroundColor Green
+'''
+
+[tasks.release]
+description = "Build fs-winfsp-glue (release)"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+Write-Host "Building fs-winfsp-glue (release)..." -ForegroundColor Cyan
+cargo build -p fs-winfsp-glue --release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "Build complete! Binary: target\release\xfs-mount.exe" -ForegroundColor Green
+'''
+
+[tasks.run]
+description = "Run fs-winfsp-glue (debug)"
+dependencies = ["default"]
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+Write-Host "Running xfs-mount..." -ForegroundColor Cyan
+."target\debug\xfs-mount.exe"
+'''
+
+[tasks.run-release]
+description = "Run fs-winfsp-glue (release)"
+dependencies = ["release"]
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+Write-Host "Running xfs-mount (release)..." -ForegroundColor Cyan
+."target\release\xfs-mount.exe"
+'''
+
+# ============================================================================
+# Help
+# ============================================================================
+
+[tasks.help]
+description = "Show available tasks"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+Write-Host ""
+Write-Host "VFS WinFSP Glue Build Tasks" -ForegroundColor Cyan
+Write-Host "=============================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Main Commands:" -ForegroundColor Yellow
+Write-Host "  cargo make              - Build fs-winfsp-glue (debug)"
+Write-Host "  cargo make release      - Build fs-winfsp-glue (release)"
+Write-Host "  cargo make run          - Run xfs-mount (debug)"
+Write-Host "  cargo make run-release  - Run xfs-mount (release)"
+Write-Host ""
+Write-Host "Help:" -ForegroundColor Yellow
+Write-Host "  cargo make help         - Show this help message"
+Write-Host ""
+'''

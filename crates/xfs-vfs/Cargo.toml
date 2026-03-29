@@ -1,0 +1,32 @@
+[package]
+name = "xfs-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "XFS filesystem implementation of VFS traits"
+license = "GPL-3.0"
+authors = ["XFS Development Team"]
+
+[dependencies]
+# VFS abstraction layer
+fs-abstraction = { path = "../fs-abstraction", default-features = false, features = ["std"] }
+
+# XFS parser
+xfs-rs = { path = "../xfs-rs", default-features = false, features = ["std"] }
+
+# Logging
+tracing = "0.1"
+
+# CRC32C
+crc32c = "0.6"
+
+# LRU cache
+lru = "0.16.3"
+
+# Synchronization
+parking_lot = "0.12"
+
+# Static assertions
+static_assertions = "1.1"
+
+[dev-dependencies]
+tempfile = "3"

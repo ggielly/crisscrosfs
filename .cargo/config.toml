@@ -1,0 +1,5 @@
+# No special linker configuration needed for build dependencies
+# The driver-specific linking will be handled by wdk-build
+
+[build]
+rustflags = ["-C", "target-feature=+crt-static", "-Zthreads=8"]
