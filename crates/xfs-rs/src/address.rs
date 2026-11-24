@@ -178,6 +178,7 @@ mod tests {
             free_inodes: 0,
             free_blocks: 0,
             free_realtime_extents: 0,
+            features2: 0,
             features_compat: 0,
             features_ro_compat: 0,
             features_incompat: 0,

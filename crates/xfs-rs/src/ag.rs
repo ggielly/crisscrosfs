@@ -64,15 +64,15 @@ impl AgFreeHeader {
             length: buffer.read_be_u32(0x00C)?,
             bno_root: buffer.read_be_u32(0x010)?,
             cnt_root: buffer.read_be_u32(0x014)?,
-            rmap_root: 0, // Set from extended area if v5
-            bno_level: buffer.read_be_u32(0x018)?,
-            cnt_level: buffer.read_be_u32(0x01C)?,
-            free_list_first: buffer.read_be_u32(0x020)?,
-            free_list_last: buffer.read_be_u32(0x024)?,
-            free_list_count: buffer.read_be_u32(0x028)?,
-            free_blocks: buffer.read_be_u32(0x02C)?,
-            longest_extent: buffer.read_be_u32(0x030)?,
-            btree_blocks: buffer.read_be_u32(0x034)?,
+            rmap_root: buffer.read_be_u32(0x018)?,
+            bno_level: buffer.read_be_u32(0x01C)?,
+            cnt_level: buffer.read_be_u32(0x020)?,
+            free_list_first: buffer.read_be_u32(0x028)?,
+            free_list_last: buffer.read_be_u32(0x02C)?,
+            free_list_count: buffer.read_be_u32(0x030)?,
+            free_blocks: buffer.read_be_u32(0x034)?,
+            longest_extent: buffer.read_be_u32(0x038)?,
+            btree_blocks: buffer.read_be_u32(0x03C)?,
         })
     }
 
@@ -85,14 +85,15 @@ impl AgFreeHeader {
         buf[0x00C..0x010].copy_from_slice(&self.length.to_be_bytes());
         buf[0x010..0x014].copy_from_slice(&self.bno_root.to_be_bytes());
         buf[0x014..0x018].copy_from_slice(&self.cnt_root.to_be_bytes());
-        buf[0x018..0x01C].copy_from_slice(&self.bno_level.to_be_bytes());
-        buf[0x01C..0x020].copy_from_slice(&self.cnt_level.to_be_bytes());
-        buf[0x020..0x024].copy_from_slice(&self.free_list_first.to_be_bytes());
-        buf[0x024..0x028].copy_from_slice(&self.free_list_last.to_be_bytes());
-        buf[0x028..0x02C].copy_from_slice(&self.free_list_count.to_be_bytes());
-        buf[0x02C..0x030].copy_from_slice(&self.free_blocks.to_be_bytes());
-        buf[0x030..0x034].copy_from_slice(&self.longest_extent.to_be_bytes());
-        buf[0x034..0x038].copy_from_slice(&self.btree_blocks.to_be_bytes());
+        buf[0x018..0x01C].copy_from_slice(&self.rmap_root.to_be_bytes());
+        buf[0x01C..0x020].copy_from_slice(&self.bno_level.to_be_bytes());
+        buf[0x020..0x024].copy_from_slice(&self.cnt_level.to_be_bytes());
+        buf[0x028..0x02C].copy_from_slice(&self.free_list_first.to_be_bytes());
+        buf[0x02C..0x030].copy_from_slice(&self.free_list_last.to_be_bytes());
+        buf[0x030..0x034].copy_from_slice(&self.free_list_count.to_be_bytes());
+        buf[0x034..0x038].copy_from_slice(&self.free_blocks.to_be_bytes());
+        buf[0x038..0x03C].copy_from_slice(&self.longest_extent.to_be_bytes());
+        buf[0x03C..0x040].copy_from_slice(&self.btree_blocks.to_be_bytes());
         buf
     }
 }
@@ -144,8 +145,9 @@ impl AgInodeHeader {
 
     /// Parses an AGI from a byte buffer.
     pub fn parse(buffer: &[u8]) -> FsResult<Self> {
-        if buffer.len() < 40 {
-            // Minimum legacy size
+        // The unlinked hash table ends at 0x128, so even a legacy AGI needs
+        // that many bytes.
+        if buffer.len() < 0x128 {
             return Err(FsError::BufferTooSmall);
         }
 
@@ -180,11 +182,16 @@ impl AgInodeHeader {
             free_inode_level: 0,
         };
 
-        if version >= 1 && buffer.len() >= 0x14C {
-            // V5 check (simplified)
-            agi.crc = buffer.read_be_u32(0x128)?;
-            agi.lsn = buffer.read_be_u64(0x130)?;
-            agi.uuid.copy_from_slice(&buffer[0x138..0x148]);
+        // V5 layout: uuid at 0x128, crc (little-endian) at 0x138,
+        // lsn at 0x140, finobt root/level at 0x148/0x14C.
+        if buffer.len() >= 0x150 {
+            agi.uuid.copy_from_slice(&buffer[0x128..0x138]);
+            agi.crc = u32::from_le_bytes(
+                buffer[0x138..0x13C]
+                    .try_into()
+                    .map_err(|_| FsError::BufferTooSmall)?,
+            );
+            agi.lsn = buffer.read_be_u64(0x140)?;
             agi.free_inode_root = buffer.read_be_u32(0x148)?;
             agi.free_inode_level = buffer.read_be_u32(0x14C)?;
         }
@@ -210,14 +217,12 @@ impl AgInodeHeader {
             buf[0x028 + i * 4..0x02C + i * 4].copy_from_slice(&self.unlinked[i].to_be_bytes());
         }
 
-        if self.version >= 1 {
-            // V5 fields
-            buf[0x128..0x12C].copy_from_slice(&self.crc.to_be_bytes());
-            buf[0x130..0x138].copy_from_slice(&self.lsn.to_be_bytes());
-            buf[0x138..0x148].copy_from_slice(&self.uuid);
-            buf[0x148..0x14C].copy_from_slice(&self.free_inode_root.to_be_bytes());
-            buf[0x14C..0x150].copy_from_slice(&self.free_inode_level.to_be_bytes());
-        }
+        // V5 layout (uuid at 0x128, crc LE at 0x138, lsn at 0x140).
+        buf[0x128..0x138].copy_from_slice(&self.uuid);
+        buf[0x138..0x13C].copy_from_slice(&self.crc.to_le_bytes());
+        buf[0x140..0x148].copy_from_slice(&self.lsn.to_be_bytes());
+        buf[0x148..0x14C].copy_from_slice(&self.free_inode_root.to_be_bytes());
+        buf[0x14C..0x150].copy_from_slice(&self.free_inode_level.to_be_bytes());
         buf
     }
 }
@@ -234,4 +239,61 @@ impl AgOffsets {
     pub const AGI: u64 = 2;
     /// Superblock is at offset 0.
     pub const SUPERBLOCK: u64 = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agf_fields_are_read_at_real_offsets() {
+        let mut buf = vec![0u8; 512];
+        buf[0x000..0x004].copy_from_slice(&XFS_AGF_MAGIC.to_be_bytes());
+        buf[0x004..0x008].copy_from_slice(&1u32.to_be_bytes());
+        buf[0x008..0x00C].copy_from_slice(&0u32.to_be_bytes()); // seqno
+        buf[0x00C..0x010].copy_from_slice(&1024u32.to_be_bytes()); // length
+        buf[0x010..0x014].copy_from_slice(&3u32.to_be_bytes()); // bno_root
+        buf[0x014..0x018].copy_from_slice(&4u32.to_be_bytes()); // cnt_root
+        buf[0x018..0x01C].copy_from_slice(&5u32.to_be_bytes()); // rmap_root
+        buf[0x01C..0x020].copy_from_slice(&1u32.to_be_bytes()); // bno_level
+        buf[0x020..0x024].copy_from_slice(&1u32.to_be_bytes()); // cnt_level
+        buf[0x028..0x02C].copy_from_slice(&7u32.to_be_bytes()); // flfirst
+        buf[0x02C..0x030].copy_from_slice(&8u32.to_be_bytes()); // fllast
+        buf[0x030..0x034].copy_from_slice(&9u32.to_be_bytes()); // flcount
+        buf[0x034..0x038].copy_from_slice(&100u32.to_be_bytes()); // freeblks
+        buf[0x038..0x03C].copy_from_slice(&50u32.to_be_bytes()); // longest
+        buf[0x03C..0x040].copy_from_slice(&10u32.to_be_bytes()); // btreeblks
+
+        let agf = AgFreeHeader::parse(&buf).unwrap();
+        assert_eq!(agf.bno_root, 3);
+        assert_eq!(agf.cnt_root, 4);
+        assert_eq!(agf.rmap_root, 5);
+        assert_eq!(agf.bno_level, 1);
+        assert_eq!(agf.cnt_level, 1);
+        assert_eq!(agf.free_list_first, 7);
+        assert_eq!(agf.free_blocks, 100);
+        assert_eq!(agf.btree_blocks, 10);
+
+        let roundtrip = agf.to_bytes();
+        assert_eq!(&roundtrip[..0x40], &buf[..0x40]);
+    }
+
+    #[test]
+    fn agi_v5_fields_are_read_at_real_offsets() {
+        let mut buf = vec![0u8; 512];
+        buf[0x000..0x004].copy_from_slice(&XFS_AGI_MAGIC.to_be_bytes());
+        buf[0x004..0x008].copy_from_slice(&1u32.to_be_bytes());
+        buf[0x128..0x138].copy_from_slice(&[0xAA; 16]); // uuid
+        buf[0x138..0x13C].copy_from_slice(&0x11223344u32.to_le_bytes()); // crc
+        buf[0x140..0x148].copy_from_slice(&99u64.to_be_bytes()); // lsn
+        buf[0x148..0x14C].copy_from_slice(&6u32.to_be_bytes()); // finobt root
+        buf[0x14C..0x150].copy_from_slice(&2u32.to_be_bytes()); // finobt level
+
+        let agi = AgInodeHeader::parse(&buf).unwrap();
+        assert_eq!(agi.uuid, [0xAA; 16]);
+        assert_eq!(agi.crc, 0x11223344);
+        assert_eq!(agi.lsn, 99);
+        assert_eq!(agi.free_inode_root, 6);
+        assert_eq!(agi.free_inode_level, 2);
+    }
 }

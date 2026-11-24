@@ -57,16 +57,8 @@ pub use error::XfsVfsError;
 pub use filesystem::XfsVfs;
 // Re-export VFS types for convenience
 pub use fs_abstraction::{
-    BlockDevice,
-    FsCapabilities,
-    FsError,
-    FsResult,
-    VfsDirEntry,
-    VfsFileInfo,
-    VfsFileSystem,
-    VfsFileType,
-    VfsTimestamp,
-    VfsVolumeInfo,
+    BlockDevice, FsCapabilities, FsError, FsResult, VfsDirEntry, VfsFileInfo, VfsFileSystem,
+    VfsFileType, VfsTimestamp, VfsVolumeInfo,
 };
 
 /// XFS filesystem magic number

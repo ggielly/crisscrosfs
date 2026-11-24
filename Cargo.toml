@@ -6,6 +6,8 @@ members = [
     "crates/xfs-vfs",
     "crates/fs-winfsp-glue",
 ]
+# cargo-fuzz has its own workspace and is run with `cargo fuzz`.
+exclude = ["fuzz"]
 
 # Build: cargo build -p fs-winfsp-glue
 
@@ -41,13 +43,15 @@ criterion = "0.5"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind so a panic reaching a WinFsp callback cannot take down the whole
+# service process (callbacks are caught at the FFI boundary).
+panic = "unwind"
 strip = true
 
 [profile.dev]
 opt-level = 0
 debug = true
-panic = "abort"
+panic = "unwind"
 incremental = true
 strip = false
 

@@ -42,15 +42,15 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Mount a physical disk with XFS
-//! xfs-mount --disk 1 --mount-point X:
+//! # Mount a physical disk with XFS (read-only)
+//! xfs-mount mount --disk 1 --mount-point X:
 //!
-//! # Mount an XFS image file
-//! xfs-mount --image /path/to/xfs.img --mount-point X:
+//! # Mount an XFS image file (read-only)
+//! xfs-mount mount --image /path/to/xfs.img --mount-point X:
 //!
-//! # Run as Windows service (auto-detect XFS disks)
-//! xfs-service install
-//! xfs-service start
+//! # Install/start the Windows service (auto-detect XFS disks)
+//! xfs-mount service install
+//! xfs-mount service start
 //! ```
 
 pub mod allocator;

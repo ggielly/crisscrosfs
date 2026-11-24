@@ -2,4 +2,4 @@
 # The driver-specific linking will be handled by wdk-build
 
 [build]
-rustflags = ["-C", "target-feature=+crt-static", "-Zthreads=8"]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -13,11 +13,7 @@
 use std::sync::Arc;
 
 use xfs_rs::freespace::{
-    find_free_extent_by_size,
-    read_leaf_records,
-    write_leaf_records,
-    AllocBtreeBlock,
-    AllocRec,
+    find_free_extent_by_size, read_leaf_records, write_leaf_records, AllocBtreeBlock, AllocRec,
 };
 
 use crate::{

@@ -5,19 +5,19 @@
 //! 2. Automatically mounts detected XFS filesystems
 //! 3. Monitors for new disk arrivals (USB, etc.)
 
-use std::{ffi::OsString, sync::{mpsc, Arc}, time::Duration};
+use std::{
+    ffi::OsString,
+    sync::{mpsc, Arc},
+    time::Duration,
+};
 
 use tracing::{error, info, warn};
 #[cfg(windows)]
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceControl,
-        ServiceControlAccept,
-        ServiceExitCode,
-        ServiceState as WinServiceState,
-        ServiceStatus,
-        ServiceType,
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState as WinServiceState,
+        ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -37,6 +37,9 @@ pub const SERVICE_DISPLAY_NAME: &str = "XFS Filesystem Service";
 
 /// Service description.
 pub const SERVICE_DESCRIPTION: &str = "Automatically detects and mounts XFS filesystems on Windows";
+
+/// Arguments the SCM must pass to the service binary.
+pub const SERVICE_LAUNCH_ARGUMENTS: [&str; 2] = ["service", "run"];
 
 /// Currently mounted XFS volumes.
 struct MountedVolume {
@@ -194,15 +197,12 @@ fn scan_and_mount(state: &mut XfsServiceState) {
         let fs = match detect_and_create(device, /* read_only = */ true) {
             Ok(fs) => fs,
             Err(e) => {
-                error!(
-                    "Failed to create VFS for {}: {:?}",
-                    disk_info.disk_path, e
-                );
+                error!("Failed to create VFS for {}: {:?}", disk_info.disk_path, e);
                 continue;
             }
         };
 
-        let handle = match start_mount(&mount_point, fs) {
+        let handle = match start_mount(&mount_point, fs, false) {
             Ok(h) => h,
             Err(e) => {
                 error!(
@@ -272,7 +272,12 @@ pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary,
-        launch_arguments: vec![OsString::from("--service")],
+        // Must match the Clap hierarchy in main.rs: `xfs-mount service run`.
+        // The SCM appends these verbatim to the executable path.
+        launch_arguments: SERVICE_LAUNCH_ARGUMENTS
+            .iter()
+            .map(|arg| OsString::from(arg))
+            .collect(),
         dependencies: vec![],
         account_name: None, // Run as LocalSystem
         account_password: None,
@@ -353,6 +358,13 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn service_launch_arguments_match_cli() {
+        // Regression test for the SCM launch line: Clap expects the
+        // `service run` subcommand pair, not a `--service` flag.
+        assert_eq!(SERVICE_LAUNCH_ARGUMENTS, ["service", "run"]);
+    }
 
     /// Sending on a cloned Sender delivers to the shared Receiver.
     ///

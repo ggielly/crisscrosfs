@@ -9,7 +9,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use windows::{
@@ -17,18 +17,9 @@ use windows::{
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            CreateFileW,
-            FlushFileBuffers,
-            ReadFile,
-            SetFilePointerEx,
-            WriteFile,
-            FILE_BEGIN,
-            FILE_FLAGS_AND_ATTRIBUTES,
-            FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE,
-            FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
-            OPEN_EXISTING,
+            CreateFileW, FlushFileBuffers, ReadFile, SetFilePointerEx, WriteFile, FILE_BEGIN,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
         },
     },
 };
@@ -211,6 +202,18 @@ pub struct ImageFileReader {
 impl ImageFileReader {
     /// Open an image file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        // Deny write sharing so an external process cannot mutate the image
+        // while it is mounted (which would mix metadata generations).
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001) // FILE_SHARE_READ only
+                .open(path.as_ref())?
+        };
+        #[cfg(not(windows))]
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
 
@@ -504,9 +507,12 @@ pub struct PhysicalDiskReader {
     handle: HANDLE,
     size: u64,
     sector_size: u32,
+    /// Serialises `SetFilePointerEx` + `ReadFile` pairs.  WinFsp issues
+    /// concurrent reads, and the file pointer is shared by the handle.
+    io_lock: Mutex<()>,
 }
 
-// SAFETY: HANDLE is Send+Sync safe when used correctly
+// SAFETY: access to `handle` is serialised by `io_lock`; HANDLE is Send+Sync.
 unsafe impl Send for PhysicalDiskReader {}
 unsafe impl Sync for PhysicalDiskReader {}
 
@@ -530,23 +536,18 @@ impl PhysicalDiskReader {
         tracing::debug!("Wide path created with {} characters", wide_path.len());
 
         // Different types of paths may need different flags
-        use windows::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_NORMAL,
-            FILE_FLAG_NO_BUFFERING,
-            FILE_FLAG_RANDOM_ACCESS,
-        };
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_RANDOM_ACCESS};
 
-        // For raw disk access, we typically want to avoid buffering
-        // But for volume paths, we might need different flags
+        // Do not use FILE_FLAG_NO_BUFFERING: it requires sector-aligned buffer
+        // addresses and lengths, but the VFS passes ordinary `Vec<u8>` buffers
+        // of arbitrary alignment/length.  Buffered I/O is correct here and the
+        // OS cache handles alignment for us.
         let flags = if path.contains("HarddiskVolume") {
             tracing::debug!("Detected HarddiskVolume path, using FILE_ATTRIBUTE_NORMAL only");
-            // For volume devices, use simpler flags
             FILE_ATTRIBUTE_NORMAL.0
         } else {
             tracing::debug!("Using raw disk access flags");
-            // For physical drives, use flags for raw access
             let mut f = FILE_ATTRIBUTE_NORMAL.0;
-            f |= FILE_FLAG_NO_BUFFERING.0;
             f |= FILE_FLAG_RANDOM_ACCESS.0;
             f
         };
@@ -560,9 +561,10 @@ impl PhysicalDiskReader {
             FILE_SHARE_WRITE.0 != 0
         );
 
-        // For volume access, we might need to use different share modes or access
-        // rights Let's try a more permissive approach for volumes
-        let (access, share_mode) = (FILE_GENERIC_READ.0, FILE_SHARE_READ | FILE_SHARE_WRITE);
+        // Read-only handle and no write sharing: this prevents an external
+        // writer from modifying the volume while it is being parsed/mounted,
+        // which would otherwise mix old and new metadata.
+        let (access, share_mode) = (FILE_GENERIC_READ.0, FILE_SHARE_READ);
 
         tracing::debug!("Final access rights: 0x{:X}", access);
         tracing::debug!("Final share mode: 0x{:X}", share_mode.0);
@@ -657,51 +659,14 @@ impl PhysicalDiskReader {
             handle,
             size,
             sector_size,
+            io_lock: Mutex::new(()),
         })
-    }
-
-    /// Attempt to map a volume path to a physical disk path.
-    /// This is a fallback when direct volume access is denied.
-    fn map_volume_to_physical_disk(volume_path: &str) -> Option<String> {
-        use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
-
-        // This is a simplified approach - in practice, you'd need to use APIs like:
-        // - QueryDosDevice to map drive letters
-        // - DeviceIoControl with IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
-        // For now, we'll just try to extract the disk number if it exists in the path
-
-        // If the volume path is like \\?\Volume{GUID}, we could potentially map it
-        // But for HarddiskVolume paths, we can try to guess the physical disk
-
-        if let Some(vol_num_str) = volume_path.strip_prefix(r"\\.\HarddiskVolume") {
-            if let Ok(vol_num) = vol_num_str.parse::<u32>() {
-                // This is a heuristic - in reality, you'd need to query the system
-                // to find which physical disk contains this volume
-                tracing::debug!("Trying to map HarddiskVolume{} to a physical disk", vol_num);
-
-                // For now, we'll try a few common physical disk numbers
-                // In a real implementation, you'd need to use APIs like SetupAPI
-                // or WMI to properly map volumes to physical disks
-                for disk_num in 0..8 {
-                    let physical_path = format!("\\\\.\\PhysicalDrive{}", disk_num);
-                    tracing::debug!("Trying physical disk path: {}", physical_path);
-
-                    // We can't directly test here without creating another handle,
-                    // so we'll just return the first possibility
-                    return Some(physical_path);
-                }
-            }
-        }
-
-        None
     }
 
     fn get_disk_geometry(handle: HANDLE) -> (u64, u32) {
         use windows::Win32::System::{
             Ioctl::{
-                DISK_GEOMETRY_EX,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                IOCTL_DISK_GET_LENGTH_INFO,
+                DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
             },
             IO::DeviceIoControl,
         };
@@ -769,6 +734,17 @@ impl DiskReader for PhysicalDiskReader {
             offset,
             buffer.len()
         );
+        if offset > i64::MAX as u64 {
+            return Err(XfsWinfspError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "disk offset exceeds i64 range",
+            )));
+        }
+
+        // Seek + read must be atomic with respect to other readers: the
+        // handle's file pointer is shared by every WinFsp worker thread.
+        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         unsafe {
             // For volume handles, we need to use SetFilePointerEx and ReadFile
             // Seek to offset
@@ -797,8 +773,7 @@ impl DiskReader for PhysicalDiskReader {
                     // FSCTL_ALLOW_EXTENDED_DASD_IO to bypass certain
                     // restrictions
                     use windows::Win32::System::{
-                        Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO,
-                        IO::DeviceIoControl,
+                        Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO, IO::DeviceIoControl,
                     };
 
                     let mut bytes_returned: u32 = 0;
@@ -935,9 +910,11 @@ pub struct PhysicalDiskWriter {
     handle: HANDLE,
     size: u64,
     sector_size: u32,
+    /// Serialises seek + read/write pairs sharing this handle's file pointer.
+    io_lock: Mutex<()>,
 }
 
-// SAFETY: HANDLE is Send+Sync safe when used correctly
+// SAFETY: access to `handle` is serialised by `io_lock`; HANDLE is Send+Sync.
 unsafe impl Send for PhysicalDiskWriter {}
 unsafe impl Sync for PhysicalDiskWriter {}
 
@@ -1047,12 +1024,14 @@ impl PhysicalDiskWriter {
             handle,
             size,
             sector_size,
+            io_lock: Mutex::new(()),
         })
     }
 }
 
 impl DiskReader for PhysicalDiskWriter {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut new_pos: i64 = 0;
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
@@ -1083,6 +1062,7 @@ impl DiskReader for PhysicalDiskWriter {
 
 impl DiskWriter for PhysicalDiskWriter {
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut new_pos: i64 = 0;
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
@@ -1283,9 +1263,15 @@ pub struct PartitionInfo {
 pub fn detect_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
     let mut partitions = Vec::new();
 
-    // Read first sector to detect partition table type
-    let mut boot_sector = vec![0u8; 512];
-    reader.read_raw_at(0, &mut boot_sector)?;
+    // Read the first logical sector (512 B legacy MBR or 4Kn).
+    let sector_size = reader.get_sector_size().max(512) as usize;
+    let mut boot_sector = vec![0u8; sector_size];
+    let read = reader.read_raw_at(0, &mut boot_sector)?;
+    if read < 512 {
+        return Err(XfsWinfspError::DiskError(
+            "Short read of partition boot sector".to_string(),
+        ));
+    }
 
     // Check for GPT signature
     if boot_sector.len() >= 512 {
@@ -1329,9 +1315,16 @@ fn read_mbr_partitions(_reader: &dyn DiskReader, boot_sector: &[u8]) -> Result<V
         let lba_start = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as u64;
         let sector_count = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as u64;
 
+        let offset = lba_start.checked_mul(512).ok_or_else(|| {
+            XfsWinfspError::InvalidArgument("MBR partition offset overflow".into())
+        })?;
+        let size = sector_count
+            .checked_mul(512)
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("MBR partition size overflow".into()))?;
+
         partitions.push(PartitionInfo {
-            offset: lba_start * 512,
-            size: sector_count * 512,
+            offset,
+            size,
             partition_type,
         });
     }
@@ -1341,54 +1334,97 @@ fn read_mbr_partitions(_reader: &dyn DiskReader, boot_sector: &[u8]) -> Result<V
 
 /// Read GPT partition table.
 fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
+    const GPT_MAX_ENTRIES: u32 = 128;
+
     let mut partitions = Vec::new();
+    // GPT LBAs are expressed in logical sectors, which can be 512 or 4096
+    // bytes (4Kn drives).
+    let lba_size = u64::from(reader.get_sector_size().max(512));
 
-    // Read GPT header from LBA 1
-    let mut gpt_header = vec![0u8; 512];
-    reader.read_raw_at(512, &mut gpt_header)?;
-
-    // Verify GPT signature "EFI PART"
-    if gpt_header.len() >= 8 {
-        let sig = &gpt_header[0..8];
-        if sig != b"EFI PART" {
-            return Ok(partitions);
-        }
+    // Read GPT header from LBA 1 (one logical sector).
+    let mut gpt_header = vec![0u8; lba_size as usize];
+    let header_read = reader.read_raw_at(lba_size, &mut gpt_header)?;
+    if header_read != gpt_header.len() {
+        return Err(XfsWinfspError::DiskError(
+            "Short read of GPT header".to_string(),
+        ));
     }
 
-    // Get partition entry LBA and count
-    let partition_entry_lba = if gpt_header.len() >= 80 {
-        u64::from_le_bytes([
-            gpt_header[72],
-            gpt_header[73],
-            gpt_header[74],
-            gpt_header[75],
-            gpt_header[76],
-            gpt_header[77],
-            gpt_header[78],
-            gpt_header[79],
-        ])
-    } else {
+    // Verify GPT signature "EFI PART"
+    if &gpt_header[0..8] != b"EFI PART" {
         return Ok(partitions);
-    };
+    }
 
-    let num_partitions = if gpt_header.len() >= 84 {
-        u32::from_le_bytes([
-            gpt_header[80],
-            gpt_header[81],
-            gpt_header[82],
-            gpt_header[83],
-        ])
-    } else {
-        return Ok(partitions);
-    };
+    // HeaderSize must cover the fields we read, and fit the sector.
+    let header_size = u32::from_le_bytes([
+        gpt_header[12],
+        gpt_header[13],
+        gpt_header[14],
+        gpt_header[15],
+    ]);
+    if header_size < 92 || header_size as u64 > lba_size {
+        return Err(XfsWinfspError::InvalidArgument(
+            "Invalid GPT header size".to_string(),
+        ));
+    }
 
-    // Read partition entries (each is 128 bytes)
-    let entries_size = (num_partitions as usize) * 128;
-    let mut entries = vec![0u8; entries_size];
-    reader.read_raw_at(partition_entry_lba * 512, &mut entries)?;
+    // Get partition entry LBA and count, with strict bounds.
+    let partition_entry_lba = u64::from_le_bytes([
+        gpt_header[72],
+        gpt_header[73],
+        gpt_header[74],
+        gpt_header[75],
+        gpt_header[76],
+        gpt_header[77],
+        gpt_header[78],
+        gpt_header[79],
+    ]);
+
+    let num_partitions = u32::from_le_bytes([
+        gpt_header[80],
+        gpt_header[81],
+        gpt_header[82],
+        gpt_header[83],
+    ]);
+    if num_partitions > GPT_MAX_ENTRIES {
+        return Err(XfsWinfspError::InvalidArgument(
+            "GPT partition entry count is unreasonably large".to_string(),
+        ));
+    }
+
+    let entry_size = u32::from_le_bytes([
+        gpt_header[84],
+        gpt_header[85],
+        gpt_header[86],
+        gpt_header[87],
+    ]);
+    // UEFI allows entry sizes >= 128; large values are legal but we only need
+    // the first 128 bytes of each entry.
+    if entry_size < 128 {
+        return Err(XfsWinfspError::InvalidArgument(
+            "Invalid GPT partition entry size".to_string(),
+        ));
+    }
+
+    // Read partition entries.  Read exactly num_partitions * entry_size bytes,
+    // but cap the allocation at the GPT maximum (128 entries).
+    let entries_bytes = (num_partitions as usize)
+        .checked_mul(entry_size as usize)
+        .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT entry table overflow".into()))?;
+    let entries_offset = partition_entry_lba
+        .checked_mul(lba_size)
+        .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT entry LBA overflow".into()))?;
+
+    let mut entries = vec![0u8; entries_bytes];
+    let entries_read = reader.read_raw_at(entries_offset, &mut entries)?;
+    if entries_read != entries_bytes {
+        return Err(XfsWinfspError::DiskError(
+            "Short read of GPT partition entries".to_string(),
+        ));
+    }
 
     for i in 0..num_partitions as usize {
-        let entry_offset = i * 128;
+        let entry_offset = i * entry_size as usize;
         if entry_offset + 128 > entries.len() {
             break;
         }
@@ -1409,10 +1445,26 @@ fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
         let last_lba = u64::from_le_bytes([
             entry[40], entry[41], entry[42], entry[43], entry[44], entry[45], entry[46], entry[47],
         ]);
+        if last_lba < first_lba {
+            return Err(XfsWinfspError::InvalidArgument(
+                "GPT partition has last LBA before first LBA".to_string(),
+            ));
+        }
+
+        let offset = first_lba.checked_mul(lba_size).ok_or_else(|| {
+            XfsWinfspError::InvalidArgument("GPT partition offset overflow".into())
+        })?;
+        let count = last_lba
+            .checked_sub(first_lba)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT partition size overflow".into()))?;
+        let size = count
+            .checked_mul(lba_size)
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT partition size overflow".into()))?;
 
         partitions.push(PartitionInfo {
-            offset: first_lba * 512,
-            size: (last_lba - first_lba + 1) * 512,
+            offset,
+            size,
             partition_type: 0, // GPT doesn't use a simple type byte
         });
     }

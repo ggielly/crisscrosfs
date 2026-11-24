@@ -26,7 +26,7 @@ fs-abstraction → xfs-rs → xfs-vfs → fs-winfsp-glue
 
 ### Essential Code Conventions
 
-1. **Big-Endian Everywhere**: XFS stores everything in big-endian → systematic use of `from_be_bytes()`
+1. **Big-Endian Everywhere (except CRCs)**: XFS metadata is big-endian, but CRC fields (`sb_crc`, `di_crc`, btree/dir CRC) are little-endian `__le32`. Use `from_be_bytes()` for fields and `from_le_bytes()` for CRCs.
 2. **Nightly Rustfmt**: `rustfmt.toml` uses unstable features (`imports_granularity`, etc.)
 3. **Tracing, Not Log**: Use `trace!()`, `debug!()`, `info!()` from the `tracing` crate
 4. **CheckedOps**: Safe arithmetic via `CheckedOps` trait → returns `FsError::ArithmeticOverflow`
@@ -48,9 +48,9 @@ cargo clippy -- -D warnings
 # Format (NIGHTLY required)
 cargo fmt
 
-# Run (example)
-cargo run -p fs-winfsp-glue -- --disk 1 --mount-point X:
-cargo run -p fs-winfsp-glue -- --image test.img --mount-point X:
+# Run (example; a subcommand is required)
+cargo run -p fs-winfsp-glue -- mount --disk 1 --mount-point X:
+cargo run -p fs-winfsp-glue -- mount --image test.img --mount-point X:
 ```
 
 ### B+Tree: Implementation Details

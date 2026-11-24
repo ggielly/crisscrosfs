@@ -115,6 +115,9 @@ pub const XFS_SB_VERSION_MOREBITSBIT: u16 = 0x8000;
 
 // ─── Feature Flags (v5) ───────────────────────────────────────────────────
 
+/// v4 `sb_features2` bit: file type in directory entries.
+pub const XFS_SB_VERSION2_FTYPE: u32 = 0x0000_0200;
+
 /// Feature: File type in directory entries.
 pub const XFS_SB_FEAT_INCOMPAT_FTYPE: u32 = 1 << 0;
 

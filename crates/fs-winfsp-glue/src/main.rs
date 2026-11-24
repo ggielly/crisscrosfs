@@ -17,9 +17,7 @@ use fs_winfsp_glue::{
     disk::{self, scan_for_xfs_disks, ImageFileReader, ImageFileWriter, PhysicalDiskReader},
     error::Result,
     mount::{MountOptions, MountSource},
-    service,
-    winfsp_mount,
-    XfsWinfspError,
+    service, winfsp_mount, XfsWinfspError,
 };
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -141,12 +139,8 @@ fn main() {
         #[cfg(windows)]
         {
             use windows::Win32::System::Console::{
-                GetStdHandle,
-                SetConsoleMode,
-                CONSOLE_MODE,
-                ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-                STD_ERROR_HANDLE,
-                STD_OUTPUT_HANDLE,
+                GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
             };
             unsafe {
                 // Enable ANSI for stdout
@@ -333,7 +327,7 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
 
     // Start the mount using VFS layer
     let handle: winfsp_mount::MountHandle =
-        winfsp_mount::start_mount(&options.mount_point, fs.clone())?;
+        winfsp_mount::start_mount(&options.mount_point, fs.clone(), options.debug)?;
 
     // Show volume information
     info!("Volume Information:");

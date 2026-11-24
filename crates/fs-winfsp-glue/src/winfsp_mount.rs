@@ -9,7 +9,10 @@ use winfsp::{
     winfsp_init_or_die,
 };
 
-use crate::{context::VfsContext, error::{Result, XfsWinfspError}};
+use crate::{
+    context::VfsContext,
+    error::{Result, XfsWinfspError},
+};
 
 /// Thread-safe shared handle to the live WinFsp host.
 ///
@@ -100,6 +103,7 @@ impl Drop for MountHandle {
 pub fn start_mount(
     mount_point: &str,
     fs: Arc<dyn fs_abstraction::VfsFileSystem>,
+    debug_enabled: bool,
 ) -> Result<MountHandle> {
     info!("Starting VFS mount at {}", mount_point);
 
@@ -123,14 +127,25 @@ pub fn start_mount(
         .spawn(move || {
             info!("Mount thread started for {}", mount_point_owned);
 
-            // Get volume label
-            let volume_label = if let Ok(vol_info) = fs.get_volume_info() {
-                vol_info
-                    .volume_label
-                    .unwrap_or_else(|| "VFS Volume".to_string())
-            } else {
-                "VFS Volume".to_string()
-            };
+            // Derive volume geometry/serial from the filesystem instead of
+            // hardcoding values that are identical for every mounted volume.
+            let vol_info = fs.get_volume_info().ok();
+            let volume_label = vol_info
+                .as_ref()
+                .and_then(|v| v.volume_label.clone())
+                .unwrap_or_else(|| "VFS Volume".to_string());
+            let block_size = vol_info
+                .as_ref()
+                .map(|v| v.block_size)
+                .filter(|b| b.is_power_of_two())
+                .unwrap_or(4096);
+            let sector_size = block_size.clamp(512, 4096) as u16;
+            let volume_serial = vol_info
+                .as_ref()
+                .and_then(|v| v.uuid)
+                .map(|uuid| u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]))
+                .filter(|serial| *serial != 0)
+                .unwrap_or(0x58465342); // "XFSB"
 
             // Build context using the new generic VfsContext
             let ctx = VfsContext::new(fs.clone(), volume_label);
@@ -140,8 +155,8 @@ pub fn start_mount(
             // Configure volume parameters
             let mut volume_params = VolumeParams::default();
             volume_params.filesystem_name(fs.fs_type());
-            volume_params.volume_serial_number(0x58465342); // "XFSB"
-            volume_params.sector_size(4096);
+            volume_params.volume_serial_number(volume_serial);
+            volume_params.sector_size(sector_size);
             volume_params.sectors_per_allocation_unit(1);
             volume_params.read_only_volume(is_read_only);
             volume_params.case_sensitive_search(true);
@@ -151,11 +166,18 @@ pub fn start_mount(
             volume_params.flush_and_purge_on_cleanup(false);
             volume_params.post_cleanup_when_modified_only(true);
 
-            debug!("FileSystemHost VolumeParams configured");
+            debug!(
+                "FileSystemHost VolumeParams configured (sector_size={}, serial=0x{:08X})",
+                sector_size, volume_serial
+            );
 
-            // Create filesystem params with debug mode enabled
-            let fs_params = FileSystemParams::default_params_debug(volume_params, DebugMode::all());
-            debug!("FileSystemParams with DebugMode::all() created");
+            // Only enable WinFsp tracing when the caller asked for it.
+            let fs_params = if debug_enabled {
+                FileSystemParams::default_params_debug(volume_params, DebugMode::all())
+            } else {
+                FileSystemParams::default_params(volume_params)
+            };
+            debug!("FileSystemParams created (debug={})", debug_enabled);
 
             // Create filesystem host with full options
             match FileSystemHost::new_with_options(fs_params, ctx) {

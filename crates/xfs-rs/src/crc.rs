@@ -77,8 +77,8 @@ pub fn recalculate_crc(buf: &mut [u8], crc_offset: usize) -> Option<u32> {
 
     let crc = xfs_crc32c(buf);
 
-    // Write CRC back (big-endian for XFS)
-    buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_be_bytes());
+    // XFS stores CRC fields as little-endian __le32.
+    buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
 
     Some(crc)
 }
@@ -109,8 +109,8 @@ mod tests {
 
         let crc = recalculate_crc(&mut buf, 8).unwrap();
 
-        // Verify CRC was written
-        let stored = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        // Verify CRC was written (little-endian)
+        let stored = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         assert_eq!(crc, stored);
     }
 
@@ -136,7 +136,7 @@ mod tests {
             let calculated = recalculate_crc(&mut sb_with_crc, offset).unwrap();
 
             // The CRC stored should match the calculated one
-            let stored = u32::from_be_bytes([
+            let stored = u32::from_le_bytes([
                 sb_with_crc[offset],
                 sb_with_crc[offset + 1],
                 sb_with_crc[offset + 2],

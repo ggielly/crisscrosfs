@@ -4,8 +4,7 @@
 
 use fs_abstraction::{
     safe_math::{CheckedOps, CheckedSliceOps},
-    FsError,
-    FsResult,
+    FsError, FsResult,
 };
 
 /// A parsed XFS extent record.

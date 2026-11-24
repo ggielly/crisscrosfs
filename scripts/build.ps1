@@ -1,30 +1,26 @@
 # build.ps1
-# Build script for XFS driver
+# Build script for the XFS WinFsp user-mode driver.
 
 param(
     [string]$Configuration = "Release"
 )
 
-Write-Host "Building XFS driver..." -ForegroundColor Green
+Write-Host "Building XFS WinFsp driver..." -ForegroundColor Green
 
-# Build the driver
-cargo build --release
+# This project is a user-mode WinFsp filesystem, not a kernel .sys driver.
+cargo build --release -p fs-winfsp-glue
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Build completed successfully!" -ForegroundColor Green
+$binary = "target\release\xfs-mount.exe"
 
-# Copy the driver to the Package directory
-$driverSrc = "target\x86_64-pc-windows-msvc\$Configuration\fs_driver_core.sys"
-$driverDst = "Package\xfs_driver.sys"
-
-if (Test-Path $driverSrc) {
-    Copy-Item $driverSrc $driverDst
-    Write-Host "Driver copied to Package directory" -ForegroundColor Green
-} else {
-    Write-Host "Driver file not found: $driverSrc" -ForegroundColor Red
+if (-not (Test-Path $binary)) {
+    Write-Host "Binary not found: $binary" -ForegroundColor Red
     exit 1
 }
+
+Write-Host "Build completed successfully: $binary" -ForegroundColor Green
+Write-Host "Usage: $binary mount --image <image> --mount-point X:" -ForegroundColor Green

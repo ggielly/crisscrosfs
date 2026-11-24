@@ -9,17 +9,10 @@ use fs_abstraction::{BlockDevice, FsError, FsResult};
 use tracing::{debug, error, info, warn};
 use xfs_rs::{
     freespace::{
-        find_free_extent_by_size,
-        read_leaf_records,
-        write_leaf_records,
-        AllocBtreeBlock,
-        AllocKey,
-        AllocPtr,
-        AllocRec,
-        NULLAGBLOCK,
+        find_free_extent_by_size, read_leaf_records, write_leaf_records, AllocBtreeBlock, AllocKey,
+        AllocPtr, AllocRec, NULLAGBLOCK,
     },
-    AgFreeHeader,
-    Superblock,
+    AgFreeHeader, Superblock,
 };
 
 /// A free extent (contiguous block of free space).
@@ -232,7 +225,11 @@ mod tests {
     #[test]
     fn mark_allocated_returns_not_implemented() {
         let a = make_allocator();
-        let extent = FreeExtent { ag_num: 0, ag_block: 0, block_count: 1 };
+        let extent = FreeExtent {
+            ag_num: 0,
+            ag_block: 0,
+            block_count: 1,
+        };
         assert!(
             matches!(a.mark_allocated(&extent), Err(FsError::NotImplemented)),
             "mark_allocated must remain a stub until the B+tree update is written"
@@ -242,7 +239,11 @@ mod tests {
     #[test]
     fn free_blocks_returns_not_implemented() {
         let a = make_allocator();
-        let extent = FreeExtent { ag_num: 0, ag_block: 0, block_count: 1 };
+        let extent = FreeExtent {
+            ag_num: 0,
+            ag_block: 0,
+            block_count: 1,
+        };
         assert!(
             matches!(a.free_blocks(&extent), Err(FsError::NotImplemented)),
             "free_blocks must remain a stub until the B+tree update is written"
@@ -252,7 +253,11 @@ mod tests {
     #[test]
     fn free_extent_round_trips_absolute_block() {
         let ag_blocks: u32 = 100;
-        let fe = FreeExtent { ag_num: 2, ag_block: 15, block_count: 1 };
+        let fe = FreeExtent {
+            ag_num: 2,
+            ag_block: 15,
+            block_count: 1,
+        };
         let abs = fe.to_absolute_block(ag_blocks);
         assert_eq!(abs, 2 * 100 + 15);
         let back = FreeExtent::from_absolute_block(abs, ag_blocks);

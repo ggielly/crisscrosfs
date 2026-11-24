@@ -5,13 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use fs_abstraction::{
-    BlockDevice,
-    FsCapabilities,
-    FsError,
-    FsResult,
-    VfsDirEntry,
-    VfsFileInfo,
-    VfsFileSystem,
+    BlockDevice, FsCapabilities, FsError, FsResult, VfsDirEntry, VfsFileInfo, VfsFileSystem,
     VfsVolumeInfo,
 };
 use tracing::{debug, trace, warn};
@@ -63,9 +57,22 @@ impl XfsVfs {
     /// * `device` - Block device containing the XFS filesystem
     /// * `read_only` - If true, refuse write operations
     pub fn with_options(device: Arc<dyn BlockDevice>, read_only: bool) -> FsResult<Self> {
-        // Read superblock (first 512 bytes)
-        let mut sb_buf = [0u8; 512];
-        device.read_at(0, &mut sb_buf)?;
+        // The write path is not safe yet: the block allocator is a stub, AGI/
+        // AGF decoding and journal recovery are incomplete, and rename is not
+        // atomic.  Refuse to construct a writable instance at the API boundary,
+        // not only in the CLI.
+        if !read_only {
+            return Err(FsError::ReadOnly);
+        }
+
+        // Read enough for any sector size (4KiB is the practical maximum on
+        // Windows; larger logical sectors are re-read below if advertised).
+        let mut sb_buf = [0u8; 4096];
+        let bytes_read = device.read_at(0, &mut sb_buf)?;
+        if bytes_read < 512 {
+            return Err(FsError::Corrupted);
+        }
+        let sb_buf = &sb_buf[..bytes_read];
 
         // Validate magic
         if &sb_buf[0..4] != b"XFSB" {
@@ -73,33 +80,32 @@ impl XfsVfs {
         }
 
         // Parse superblock
-        let superblock = Superblock::parse(&sb_buf).map_err(|_| FsError::Corrupted)?;
+        let superblock = Superblock::parse(sb_buf).map_err(|_| FsError::Corrupted)?;
 
-        // Build capabilities
-        let mut capabilities = FsCapabilities::xfs();
-        capabilities.read_only = read_only;
-
-        let writer = if read_only {
-            None
-        } else {
-            Some(device.clone())
-        };
-
-        // Initialize journal if write-enabled
-        let journal = if !read_only {
-            match Journal::new(device.clone(), superblock.clone()) {
-                Ok(j) => Arc::new(Mutex::new(Some(j))),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to initialize journal: {:?}. Continuing without journal support.",
-                        e
-                    );
-                    Arc::new(Mutex::new(None))
+        // Verify v5 CRC over the full logical sector, not just the 512 bytes
+        // used for initial parsing.
+        if superblock.is_v5() {
+            let sector_size = superblock.sector_size as usize;
+            let raw = if sector_size <= sb_buf.len() {
+                sb_buf[..sector_size].to_vec()
+            } else {
+                let mut buf = vec![0u8; sector_size];
+                let n = device.read_at(0, &mut buf)?;
+                if n != sector_size {
+                    return Err(FsError::Corrupted);
                 }
-            }
-        } else {
-            Arc::new(Mutex::new(None))
-        };
+                buf
+            };
+            superblock.verify_crc(&raw)?;
+        }
+
+        // Build capabilities (read-only is unconditional until the write path
+        // is complete).
+        let mut capabilities = FsCapabilities::xfs();
+        capabilities.read_only = true;
+
+        let writer = None;
+        let journal = Arc::new(Mutex::new(None));
 
         Ok(Self {
             device,
@@ -142,12 +148,21 @@ impl XfsVfs {
         let inode_offset = self.calculate_inode_offset(ino)?;
         let inode_size = self.superblock.inode_size as usize;
 
-        // Read inode data
+        // Read inode data.  A short read must not be silently zero-filled.
         let mut buf = vec![0u8; inode_size];
-        self.device.read_at(inode_offset, &mut buf)?;
+        let bytes_read = self.device.read_at(inode_offset, &mut buf)?;
+        if bytes_read != inode_size {
+            return Err(FsError::Corrupted);
+        }
 
-        // Parse inode
+        // Parse inode and, on v5 filesystems, verify its CRC.
         let inode = Inode::parse(&buf, inode_size).map_err(|_| FsError::Corrupted)?;
+        if self.superblock.is_v5() {
+            inode.verify_crc(&buf, inode_size)?;
+            if inode.core.version >= 3 && inode.core.ino != 0 && inode.core.ino != ino {
+                return Err(FsError::Corrupted);
+            }
+        }
 
         // Cache it
         self.cache.put_inode(ino, inode.clone());
@@ -159,29 +174,66 @@ impl XfsVfs {
     fn calculate_inode_offset(&self, ino: u64) -> FsResult<u64> {
         let sb = &self.superblock;
 
-        // Calculate AG number and inode within AG
-        let ag_number = ino >> (sb.ag_block_log + sb.inode_per_block_log);
-        let inode_in_ag = ino & ((1 << (sb.ag_block_log + sb.inode_per_block_log)) - 1);
+        // Calculate AG number and inode within AG.
+        let shift = u32::from(sb.ag_block_log) + u32::from(sb.inode_per_block_log);
+        if shift >= 64 {
+            return Err(FsError::Corrupted);
+        }
+
+        let ag_number = ino >> shift;
+        if ag_number >= u64::from(sb.ag_count) {
+            return Err(FsError::InodeNotFound);
+        }
+        let inode_in_ag = ino & ((1u64 << shift) - 1);
 
         // AG start offset
-        let ag_start = ag_number * (sb.ag_blocks as u64) * (sb.block_size as u64);
+        let ag_start = ag_number
+            .checked_mul(u64::from(sb.ag_blocks))
+            .and_then(|blocks| blocks.checked_mul(u64::from(sb.block_size)))
+            .ok_or(FsError::ArithmeticOverflow)?;
 
         // Inode offset within AG
+        if u32::from(sb.inode_per_block_log) >= 64 {
+            return Err(FsError::Corrupted);
+        }
         let block_in_ag = inode_in_ag >> sb.inode_per_block_log;
-        let inode_in_block = inode_in_ag & ((1 << sb.inode_per_block_log) - 1);
+        if block_in_ag >= u64::from(sb.ag_blocks) {
+            return Err(FsError::InodeNotFound);
+        }
+        let inode_in_block = inode_in_ag & ((1u64 << sb.inode_per_block_log) - 1);
 
         let offset = ag_start
-            + block_in_ag * (sb.block_size as u64)
-            + inode_in_block * (sb.inode_size as u64);
+            .checked_add(
+                block_in_ag
+                    .checked_mul(u64::from(sb.block_size))
+                    .ok_or(FsError::ArithmeticOverflow)?,
+            )
+            .and_then(|o| {
+                inode_in_block
+                    .checked_mul(u64::from(sb.inode_size))
+                    .and_then(|i| o.checked_add(i))
+            })
+            .ok_or(FsError::ArithmeticOverflow)?;
 
         Ok(offset)
     }
 
     /// Read a filesystem block.
     fn read_block(&self, block_num: u64) -> FsResult<Vec<u8>> {
-        let offset = block_num * self.superblock.block_size as u64;
-        let mut buf = vec![0u8; self.superblock.block_size as usize];
-        self.device.read_at(offset, &mut buf)?;
+        let block_size = self.superblock.block_size as usize;
+        let offset = block_num
+            .checked_mul(u64::from(self.superblock.block_size))
+            .ok_or(FsError::ArithmeticOverflow)?;
+
+        if block_size == 0 {
+            return Err(FsError::Corrupted);
+        }
+
+        let mut buf = vec![0u8; block_size];
+        let bytes_read = self.device.read_at(offset, &mut buf)?;
+        if bytes_read != block_size {
+            return Err(FsError::Corrupted);
+        }
         Ok(buf)
     }
 
@@ -323,12 +375,7 @@ impl VfsFileSystem for XfsVfs {
             if component.is_empty() || component == "." {
                 continue;
             }
-            if component == ".." {
-                // Would need parent tracking - simplified: stay at current
-                continue;
-            }
-
-            // Check that current is a directory
+            // Check that current is a directory (also required for "..").
             let inode = self.read_inode_internal(current)?;
             if !is_directory(&inode) {
                 warn!(
@@ -338,6 +385,8 @@ impl VfsFileSystem for XfsVfs {
                 return Err(FsError::NotADirectory);
             }
 
+            // Every XFS directory contains a ".." entry (including the root,
+            // where it points to itself), so resolving it is exact.
             current = self.lookup_internal(current, component)?;
         }
 
@@ -355,9 +404,14 @@ impl VfsFileSystem for XfsVfs {
             return Err(FsError::IsADirectory);
         }
 
-        read_file_data(&inode, offset, buf, self.block_size(), |block| {
-            self.read_block(block)
-        })
+        read_file_data(
+            &inode,
+            offset,
+            buf,
+            self.block_size(),
+            self.superblock.is_v5(),
+            |block| self.read_block(block),
+        )
     }
 
     fn readdir(&self, ino: u64) -> FsResult<Vec<VfsDirEntry>> {
@@ -371,7 +425,12 @@ impl VfsFileSystem for XfsVfs {
             return Err(FsError::NotSupported);
         }
 
-        read_symlink_target(&inode, self.block_size(), |block| self.read_block(block))
+        read_symlink_target(
+            &inode,
+            self.block_size(),
+            self.superblock.is_v5(),
+            |block| self.read_block(block),
+        )
     }
 
     // Write operations - return ReadOnly by default (trait provides default impl)
@@ -429,7 +488,10 @@ impl VfsFileSystem for XfsVfs {
                     .add_directory_op(tx_id, parent_ino, name.to_string(), ino, true)
                     .and_then(|_| journal.commit_transaction(tx_id));
                 if let Err(e) = result {
-                    warn!("journal create_file log failed (disk write succeeded): {:?}", e);
+                    warn!(
+                        "journal create_file log failed (disk write succeeded): {:?}",
+                        e
+                    );
                 }
             }
         }
@@ -462,7 +524,10 @@ impl VfsFileSystem for XfsVfs {
                     .add_directory_op(tx_id, parent_ino, name.to_string(), ino, true)
                     .and_then(|_| journal.commit_transaction(tx_id));
                 if let Err(e) = result {
-                    warn!("journal create_directory log failed (disk write succeeded): {:?}", e);
+                    warn!(
+                        "journal create_directory log failed (disk write succeeded): {:?}",
+                        e
+                    );
                 }
             }
         }
@@ -489,7 +554,10 @@ impl VfsFileSystem for XfsVfs {
                         .add_inode_update(tx_id, ino, data)
                         .and_then(|_| journal.commit_transaction(tx_id));
                     if let Err(e) = result {
-                        warn!("journal set_size log failed (disk write succeeded): {:?}", e);
+                        warn!(
+                            "journal set_size log failed (disk write succeeded): {:?}",
+                            e
+                        );
                     }
                 }
             }
@@ -521,7 +589,10 @@ impl VfsFileSystem for XfsVfs {
                         .add_inode_update(tx_id, ino, data)
                         .and_then(|_| journal.commit_transaction(tx_id));
                     if let Err(e) = result {
-                        warn!("journal set_times log failed (disk write succeeded): {:?}", e);
+                        warn!(
+                            "journal set_times log failed (disk write succeeded): {:?}",
+                            e
+                        );
                     }
                 }
             }
@@ -546,8 +617,7 @@ impl VfsFileSystem for XfsVfs {
         // old_name there correctly returns NotFound — which the original code
         // then mistakenly propagated as an error to the caller even though
         // the rename had already succeeded on disk.
-        let target_ino =
-            ops.find_entry_inode(&ops.read_inode(old_parent)?, old_name)?;
+        let target_ino = ops.find_entry_inode(&ops.read_inode(old_parent)?, old_name)?;
 
         ops.rename_entry(old_parent, old_name, new_parent, new_name)?;
 
@@ -558,13 +628,15 @@ impl VfsFileSystem for XfsVfs {
                 let tx_id = journal.begin_transaction();
                 let result = journal
                     .add_directory_op(tx_id, old_parent, old_name.to_string(), target_ino, false)
-                    .and_then(|_| journal.add_directory_op(
-                        tx_id,
-                        new_parent,
-                        new_name.to_string(),
-                        target_ino,
-                        true,
-                    ))
+                    .and_then(|_| {
+                        journal.add_directory_op(
+                            tx_id,
+                            new_parent,
+                            new_name.to_string(),
+                            target_ino,
+                            true,
+                        )
+                    })
                     .and_then(|_| journal.commit_transaction(tx_id));
                 if let Err(e) = result {
                     warn!("journal rename log failed (disk write succeeded): {:?}", e);
@@ -626,7 +698,9 @@ mod tests {
 
     impl InMemoryDevice {
         fn new(data: Vec<u8>) -> Self {
-            Self { data: std::sync::RwLock::new(data) }
+            Self {
+                data: std::sync::RwLock::new(data),
+            }
         }
     }
 
@@ -702,13 +776,19 @@ mod tests {
     #[test]
     fn create_file_on_read_only_returns_read_only() {
         let fs = make_read_only_xfs();
-        assert!(matches!(fs.create_file(128, "foo", 0o644), Err(FsError::ReadOnly)));
+        assert!(matches!(
+            fs.create_file(128, "foo", 0o644),
+            Err(FsError::ReadOnly)
+        ));
     }
 
     #[test]
     fn create_directory_on_read_only_returns_read_only() {
         let fs = make_read_only_xfs();
-        assert!(matches!(fs.create_directory(128, "dir", 0o755), Err(FsError::ReadOnly)));
+        assert!(matches!(
+            fs.create_directory(128, "dir", 0o755),
+            Err(FsError::ReadOnly)
+        ));
     }
 
     #[test]
@@ -720,7 +800,10 @@ mod tests {
     #[test]
     fn set_times_on_read_only_returns_read_only() {
         let fs = make_read_only_xfs();
-        assert!(matches!(fs.set_times(128, None, None), Err(FsError::ReadOnly)));
+        assert!(matches!(
+            fs.set_times(128, None, None),
+            Err(FsError::ReadOnly)
+        ));
     }
 
     #[test]

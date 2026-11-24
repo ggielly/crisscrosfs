@@ -9,44 +9,23 @@ use fs_abstraction::{BlockDevice, FsError};
 use tracing::{debug, trace, warn};
 use xfs_rs::{
     constants::{
-        XFS_DIR2_BLOCK_MAGIC,
-        XFS_DIR2_DATA_MAGIC,
-        XFS_DIR3_BLOCK_MAGIC,
-        XFS_DIR3_DATA_MAGIC,
+        XFS_DIR2_BLOCK_MAGIC, XFS_DIR2_DATA_MAGIC, XFS_DIR3_BLOCK_MAGIC, XFS_DIR3_DATA_MAGIC,
         XFS_SB_FEAT_INCOMPAT_FTYPE,
     },
     crc::recalculate_crc,
     dir_write::{
-        add_shortform_entry,
-        remove_shortform_entry,
-        serialize_shortform_header,
-        NewDirEntry,
+        add_shortform_entry, remove_shortform_entry, serialize_shortform_header, NewDirEntry,
     },
     directory::{
-        dir2_hash,
-        parse_shortform_directory,
-        BlockTail,
-        DataHeaderV4,
-        DataHeaderV5,
-        DirFileType,
-        LeafEntry,
-        ShortformHeader,
+        dir2_hash, parse_shortform_directory, BlockTail, DataHeaderV4, DataHeaderV5, DirFileType,
+        LeafEntry, ShortformHeader,
     },
     freespace::NULLAGBLOCK,
     inode_alloc::{
-        create_empty_inode_core,
-        find_free_inode_in_ibt,
-        make_absolute_inode,
-        split_inode_number,
-        InodeBtreeBlock,
-        InodeBtreeRec,
+        create_empty_inode_core, find_free_inode_in_ibt, make_absolute_inode, split_inode_number,
+        InodeBtreeBlock, InodeBtreeRec,
     },
-    AgInodeHeader,
-    DataFork,
-    Extent,
-    Inode,
-    InodeCore,
-    InodeFormat,
+    AgInodeHeader, DataFork, Extent, Inode, InodeCore, InodeFormat,
 };
 
 use crate::{

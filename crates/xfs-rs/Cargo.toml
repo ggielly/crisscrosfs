@@ -23,6 +23,10 @@ path = "../../tests/proptest/xfs_parser_tests.rs"
 name = "corrupted_images"
 path = "../../tests/corrupted_images.rs"
 
+[[test]]
+name = "integration"
+path = "../../integration_test.rs"
+
 [features]
 default = []
 nightly = []

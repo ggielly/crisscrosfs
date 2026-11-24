@@ -71,8 +71,11 @@ impl BtreeBlockLong {
         }
 
         let magic = buffer.read_be_u32(0)?;
-        // Validate magic
+        // Validate magic and consistency with the filesystem version.
         if magic != XFS_BMAP_MAGIC && magic != XFS_BMAP_CRC_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
+        if is_v5 != (magic == XFS_BMAP_CRC_MAGIC) {
             return Err(FsError::InvalidMagic);
         }
 
@@ -87,7 +90,7 @@ impl BtreeBlockLong {
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(&buffer[40..56]);
             let owner = buffer.read_be_u64(56)?;
-            let crc = buffer.read_be_u32(64)?;
+            let crc = buffer.read_le_u32(64)?;
             (block_no, lsn, uuid, owner, crc)
         } else {
             (0, 0, [0u8; 16], 0, 0)
@@ -126,6 +129,43 @@ impl BtreeBlockLong {
         }
     }
 
+    /// Maximum number of records a block of `block_size` bytes can hold.
+    ///
+    /// XFS lays out a bmbt block as `header | keys | pointers`, where the
+    /// pointer array is aligned after the *maximum* key capacity of the block,
+    /// not after `num_recs`.  For both leaves and internal nodes the per-record
+    /// footprint used for this computation is 16 bytes (one key + one pointer,
+    /// or one extent record).
+    pub fn max_recs(&self, block_size: usize) -> FsResult<usize> {
+        let header_size = self.header_size();
+        let payload = block_size
+            .checked_sub(header_size)
+            .ok_or(FsError::Corrupted)?;
+        Ok(payload / (BmbtKey::SIZE + BmbtPtr::SIZE))
+    }
+
+    /// Byte offset of the pointer array inside a block of `block_size` bytes.
+    pub fn ptrs_offset(&self, block_size: usize) -> FsResult<usize> {
+        let max_recs = self.max_recs(block_size)?;
+        self.header_size()
+            .checked_add(
+                max_recs
+                    .checked_mul(BmbtKey::SIZE)
+                    .ok_or(FsError::ArithmeticOverflow)?,
+            )
+            .ok_or(FsError::ArithmeticOverflow)
+    }
+
+    /// Validates that `num_recs` fits this block and that all records are
+    /// entirely inside the buffer.
+    pub fn validate_recs(&self, buffer: &[u8]) -> FsResult<usize> {
+        let max_recs = self.max_recs(buffer.len())?;
+        if self.num_recs as usize > max_recs {
+            return Err(FsError::Corrupted);
+        }
+        Ok(self.num_recs as usize)
+    }
+
     /// Finds the child block pointer for a given file offset in an intermediate
     /// node.
     pub fn get_ptr_for_offset(&self, buffer: &[u8], file_offset: u64) -> FsResult<u64> {
@@ -135,17 +175,22 @@ impl BtreeBlockLong {
 
         let header_size = self.header_size();
         let keys_offset = header_size;
-        let ptrs_offset = header_size + (self.num_recs as usize * BmbtKey::SIZE);
+        let num_recs_usize = self.validate_recs(buffer)?;
+        let ptrs_offset = self.ptrs_offset(buffer.len())?;
 
         // Validate that the buffer is large enough for all records
-        let min_buffer_size = ptrs_offset + (self.num_recs as usize * BmbtPtr::SIZE);
+        let min_buffer_size = ptrs_offset
+            .checked_add(
+                num_recs_usize
+                    .checked_mul(BmbtPtr::SIZE)
+                    .ok_or(FsError::ArithmeticOverflow)?,
+            )
+            .ok_or(FsError::ArithmeticOverflow)?;
         if buffer.len() < min_buffer_size {
             return Err(FsError::BufferTooSmall);
         }
 
         // Binary search for the largest key <= file_offset
-        let num_recs_usize = self.num_recs as usize;
-
         // Handle the case where there are no records
         if num_recs_usize == 0 {
             return Err(FsError::NotFound);
@@ -201,10 +246,15 @@ impl BtreeBlockLong {
         }
 
         let header_size = self.header_size();
-        for i in 0..self.num_recs as usize {
-            let extent = crate::extent::Extent::parse(
-                &buffer[header_size + i * crate::extent::Extent::SIZE..],
-            )?;
+        let num_recs = self.validate_recs(buffer)?;
+        for i in 0..num_recs {
+            let extent_offset = header_size
+                .checked_add(
+                    i.checked_mul(crate::extent::Extent::SIZE)
+                        .ok_or(FsError::ArithmeticOverflow)?,
+                )
+                .ok_or(FsError::ArithmeticOverflow)?;
+            let extent = crate::extent::Extent::parse(&buffer[extent_offset..])?;
             if extent.contains_file_block(file_offset) {
                 return Ok(Some(extent));
             }
@@ -259,12 +309,14 @@ impl BtreeBlockShort {
         let right_sibling = buffer.read_be_u32(12)?;
 
         let (block_no, lsn, uuid, owner, crc) = if is_v5 {
+            // Short (AG) btree block: blkno at 0x10, lsn at 0x18,
+            // uuid at 0x20..0x30, owner at 0x30, crc (LE) at 0x34.
             let block_no = buffer.read_be_u32(16)?;
-            let lsn = buffer.read_be_u64(20)?;
+            let lsn = buffer.read_be_u64(24)?;
             let mut uuid = [0u8; 16];
-            uuid.copy_from_slice(&buffer[28..44]);
-            let owner = buffer.read_be_u32(44)?;
-            let crc = buffer.read_be_u32(48)?;
+            uuid.copy_from_slice(&buffer[32..48]);
+            let owner = buffer.read_be_u32(48)?;
+            let crc = buffer.read_le_u32(52)?;
             (block_no, lsn, uuid, owner, crc)
         } else {
             (0, 0, [0u8; 16], 0, 0)
@@ -371,32 +423,48 @@ impl BmbtRoot {
     /// Parses the BMBT root from an inode's data fork.
     ///
     /// # Arguments
-    /// * `data` - The raw data fork bytes (after the 4-byte header in Inode
-    ///   parsing)
+    /// * `data` - The raw data fork bytes (after the 4-byte `level`/`numrecs`
+    ///   header produced by `Inode` parsing).  Its length is therefore the
+    ///   usable fork size, which determines the maximum record capacity.
     /// * `level` - The B+tree level from the inode
     /// * `num_recs` - The number of records from the inode
     #[cfg(feature = "alloc")]
     pub fn parse(data: &[u8], level: u16, num_recs: u16) -> FsResult<Self> {
-        // Validate we have enough data for keys and pointers
-        let keys_size = num_recs as usize * BmbtKey::SIZE;
-        let ptrs_size = num_recs as usize * BmbtPtr::SIZE;
-        let required_size = keys_size + ptrs_size;
+        // The pointer array starts after the maximum key capacity of the fork,
+        // not after num_recs (`xfs_bmdr_maxrecs` / `xfs_bmdr_ptr_addr`).
+        let max_recs = data.len() / (BmbtKey::SIZE + BmbtPtr::SIZE);
+        let num_recs_usize = num_recs as usize;
+        if num_recs_usize > max_recs {
+            return Err(FsError::Corrupted);
+        }
 
-        if data.len() < required_size {
+        // Validate we have enough data for keys and pointers
+        let keys_size = num_recs_usize
+            .checked_mul(BmbtKey::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let ptrs_offset = max_recs
+            .checked_mul(BmbtKey::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let ptrs_size = num_recs_usize
+            .checked_mul(BmbtPtr::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let required_size = ptrs_offset
+            .checked_add(ptrs_size)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if data.len() < required_size || data.len() < keys_size {
             return Err(FsError::BufferTooSmall);
         }
 
         // Parse keys
-        let mut keys = alloc::vec::Vec::with_capacity(num_recs as usize);
-        for i in 0..num_recs as usize {
+        let mut keys = alloc::vec::Vec::with_capacity(num_recs_usize);
+        for i in 0..num_recs_usize {
             let key = BmbtKey::parse(&data[i * BmbtKey::SIZE..])?;
             keys.push(key);
         }
 
-        // Parse pointers (they come after all keys)
-        let ptrs_offset = keys_size;
-        let mut ptrs = alloc::vec::Vec::with_capacity(num_recs as usize);
-        for i in 0..num_recs as usize {
+        // Parse pointers (they come after the maximum key capacity)
+        let mut ptrs = alloc::vec::Vec::with_capacity(num_recs_usize);
+        for i in 0..num_recs_usize {
             let ptr = BmbtPtr::parse(&data[ptrs_offset + i * BmbtPtr::SIZE..])?;
             ptrs.push(ptr);
         }
@@ -423,6 +491,19 @@ impl BmbtRoot {
         if self.num_recs == 0 {
             return Err(FsError::NotFound);
         }
+        if self.level == 0 {
+            return Err(FsError::Corrupted);
+        }
+        if self.keys.len() != self.num_recs as usize || self.ptrs.len() != self.keys.len() {
+            return Err(FsError::Corrupted);
+        }
+
+        // Keys must be strictly increasing for the binary search to be valid.
+        for pair in self.keys.windows(2) {
+            if pair[0].file_offset >= pair[1].file_offset {
+                return Err(FsError::Corrupted);
+            }
+        }
 
         // Binary search for the largest key <= file_offset
         let mut left = 0usize;
@@ -441,15 +522,7 @@ impl BmbtRoot {
 
         match result_idx {
             Some(idx) => Ok(self.ptrs[idx].block),
-            None => {
-                // file_offset is before the first key - this shouldn't happen
-                // for valid file blocks, but return the first pointer anyway
-                if self.num_recs > 0 && file_offset < self.keys[0].file_offset {
-                    Err(FsError::NotFound)
-                } else {
-                    Err(FsError::NotFound)
-                }
-            }
+            None => Err(FsError::NotFound),
         }
     }
 }
@@ -463,6 +536,12 @@ pub trait BlockReader {
     /// Reads a disk block at the given block number.
     fn read_block(&self, block_num: u64) -> FsResult<alloc::vec::Vec<u8>>;
 }
+
+/// Hard upper bound on the number of B+tree blocks visited for a single
+/// operation.  Prevents crafted/corrupted trees from consuming unbounded CPU
+/// or memory (and from blocking service shutdown).
+#[cfg(feature = "alloc")]
+pub const MAX_BTREE_BLOCKS_PER_OPERATION: usize = 1 << 20;
 
 /// Result of a B+Tree extent lookup.
 #[derive(Debug, Clone)]
@@ -490,23 +569,40 @@ pub fn btree_lookup_extent<R: BlockReader>(
     reader: &R,
     is_v5: bool,
 ) -> FsResult<Option<crate::extent::Extent>> {
+    use alloc::collections::BTreeSet;
+
+    // The root of a btree-format fork always has level >= 1.
+    if root.level == 0 {
+        return Err(FsError::Corrupted);
+    }
+
     // Start with the root's child pointer for this file offset
     let mut current_block = root.find_child_ptr(file_block)?;
     let mut current_level = root.level;
+    let mut visited = BTreeSet::new();
 
-    // Traverse down the tree
+    // Traverse down the tree.  Each child must be exactly one level below its
+    // parent; this also makes cycles impossible, but track visited blocks and
+    // enforce a budget as defence in depth.
     while current_level > 0 {
+        if !visited.insert(current_block) || visited.len() > MAX_BTREE_BLOCKS_PER_OPERATION {
+            return Err(FsError::Corrupted);
+        }
+
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
+        if header.level.checked_add(1) != Some(current_level) {
+            return Err(FsError::Corrupted);
+        }
 
         if header.is_leaf() {
             // We've reached a leaf node - search for the extent
             return header.get_extent_for_offset(&block_data, file_block);
-        } else {
-            // Intermediate node - find the next block to visit
-            current_block = header.get_ptr_for_offset(&block_data, file_block)?;
-            current_level = header.level;
         }
+
+        // Intermediate node - find the next block to visit
+        current_block = header.get_ptr_for_offset(&block_data, file_block)?;
+        current_level = header.level;
     }
 
     // If we exit the loop with level 0, something went wrong
@@ -523,12 +619,19 @@ pub fn btree_collect_extents<R: BlockReader>(
     reader: &R,
     is_v5: bool,
 ) -> FsResult<alloc::vec::Vec<crate::extent::Extent>> {
+    use alloc::collections::BTreeSet;
+
     let mut extents = alloc::vec::Vec::new();
 
     // We need to traverse to find the leftmost leaf, then follow sibling pointers
     if root.num_recs == 0 {
         return Ok(extents);
     }
+    if root.level == 0 || root.ptrs.is_empty() {
+        return Err(FsError::Corrupted);
+    }
+
+    let mut visited = BTreeSet::new();
 
     // Find the leftmost leaf by always taking the first pointer
     let mut current_block = root.ptrs[0].block;
@@ -536,16 +639,23 @@ pub fn btree_collect_extents<R: BlockReader>(
 
     // Traverse down to the leftmost leaf
     while current_level > 1 {
-        let block_data = reader.read_block(current_block)?;
-        let header = BtreeBlockLong::parse(&block_data, is_v5)?;
-
-        if header.num_recs == 0 {
+        if !visited.insert(current_block) || visited.len() > MAX_BTREE_BLOCKS_PER_OPERATION {
             return Err(FsError::Corrupted);
         }
 
-        // Get the first (leftmost) pointer
-        let header_size = header.header_size();
-        let ptrs_offset = header_size + (header.num_recs as usize * BmbtKey::SIZE);
+        let block_data = reader.read_block(current_block)?;
+        let header = BtreeBlockLong::parse(&block_data, is_v5)?;
+        if header.level.checked_add(1) != Some(current_level) {
+            return Err(FsError::Corrupted);
+        }
+
+        let num_recs = header.validate_recs(&block_data)?;
+        if num_recs == 0 {
+            return Err(FsError::Corrupted);
+        }
+
+        // Get the first (leftmost) pointer, at the canonical pointer offset.
+        let ptrs_offset = header.ptrs_offset(block_data.len())?;
         let ptr = BmbtPtr::parse(&block_data[ptrs_offset..])?;
 
         current_block = ptr.block;
@@ -553,7 +663,12 @@ pub fn btree_collect_extents<R: BlockReader>(
     }
 
     // Now traverse all leaves using sibling pointers
+    let mut previous_end: Option<u64> = None;
     loop {
+        if !visited.insert(current_block) || visited.len() > MAX_BTREE_BLOCKS_PER_OPERATION {
+            return Err(FsError::Corrupted);
+        }
+
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
 
@@ -561,11 +676,24 @@ pub fn btree_collect_extents<R: BlockReader>(
             return Err(FsError::Corrupted);
         }
 
-        // Read all extents from this leaf
+        let num_recs = header.validate_recs(&block_data)?;
         let header_size = header.header_size();
-        for i in 0..header.num_recs as usize {
-            let extent_offset = header_size + i * crate::extent::Extent::SIZE;
+        for i in 0..num_recs {
+            let extent_offset = header_size
+                .checked_add(
+                    i.checked_mul(crate::extent::Extent::SIZE)
+                        .ok_or(FsError::ArithmeticOverflow)?,
+                )
+                .ok_or(FsError::ArithmeticOverflow)?;
             let extent = crate::extent::Extent::parse(&block_data[extent_offset..])?;
+
+            // Extent records must be sorted and non-overlapping.
+            if let Some(end) = previous_end {
+                if extent.file_offset < end {
+                    return Err(FsError::Corrupted);
+                }
+            }
+            previous_end = Some(extent.file_end()?);
             extents.push(extent);
         }
 
@@ -577,4 +705,76 @@ pub fn btree_collect_extents<R: BlockReader>(
     }
 
     Ok(extents)
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+
+    fn internal_block(block_size: usize, level: u16, keys: &[u64], ptrs: &[u64]) -> Vec<u8> {
+        let mut buf = vec![0u8; block_size];
+        buf[0..4].copy_from_slice(&XFS_BMAP_MAGIC.to_be_bytes());
+        buf[4..6].copy_from_slice(&level.to_be_bytes());
+        buf[6..8].copy_from_slice(&(keys.len() as u16).to_be_bytes());
+
+        let header = BtreeBlockLong::SIZE_V4;
+        for (i, key) in keys.iter().enumerate() {
+            let off = header + i * BmbtKey::SIZE;
+            buf[off..off + 8].copy_from_slice(&key.to_be_bytes());
+        }
+
+        // Canonical pointer array: after the maximum key capacity.
+        let max_recs = (block_size - header) / (BmbtKey::SIZE + BmbtPtr::SIZE);
+        let ptrs_offset = header + max_recs * BmbtKey::SIZE;
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let off = ptrs_offset + i * BmbtPtr::SIZE;
+            buf[off..off + 8].copy_from_slice(&ptr.to_be_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn internal_node_pointers_use_max_record_capacity() {
+        let buf = internal_block(512, 1, &[0, 10], &[100, 200]);
+        let header = BtreeBlockLong::parse(&buf, false).unwrap();
+        assert_eq!(header.num_recs, 2);
+        assert_eq!(header.get_ptr_for_offset(&buf, 0).unwrap(), 100);
+        assert_eq!(header.get_ptr_for_offset(&buf, 9).unwrap(), 100);
+        assert_eq!(header.get_ptr_for_offset(&buf, 10).unwrap(), 200);
+        assert_eq!(header.get_ptr_for_offset(&buf, 999).unwrap(), 200);
+    }
+
+    #[test]
+    fn internal_node_rejects_num_recs_above_capacity() {
+        let mut buf = internal_block(512, 1, &[0], &[100]);
+        buf[6..8].copy_from_slice(&60u16.to_be_bytes()); // max is 30
+        let header = BtreeBlockLong::parse(&buf, false).unwrap();
+        assert!(matches!(
+            header.get_ptr_for_offset(&buf, 0),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn root_pointers_use_fork_capacity() {
+        // data.len() = 160 => max_recs = 10, pointer array starts at 80.
+        let mut data = vec![0u8; 160];
+        data[0..8].copy_from_slice(&0u64.to_be_bytes());
+        data[8..16].copy_from_slice(&5u64.to_be_bytes());
+        data[80..88].copy_from_slice(&11u64.to_be_bytes());
+        data[88..96].copy_from_slice(&22u64.to_be_bytes());
+
+        let root = BmbtRoot::parse(&data, 1, 2).unwrap();
+        assert_eq!(root.find_child_ptr(6).unwrap(), 22);
+        assert_eq!(root.find_child_ptr(0).unwrap(), 11);
+    }
+
+    #[test]
+    fn root_rejects_num_recs_above_fork_capacity() {
+        let data = vec![0u8; 16];
+        assert!(matches!(
+            BmbtRoot::parse(&data, 1, 2),
+            Err(FsError::Corrupted)
+        ));
+    }
 }

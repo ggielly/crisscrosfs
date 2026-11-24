@@ -223,7 +223,8 @@ impl InodeCore {
         // V3 fields (if magic is present and version is 3)
         let (crc, changecount, lsn, flags2, cowextsize, crtime_sec, crtime_nsec, ino, uuid) =
             if version >= 3 && buffer.len() >= Self::V3_SIZE && magic == XFS_DINODE_MAGIC {
-                let crc = buffer.read_be_u32(0x64)?; // Fixed: was 0x66, should be 0x64
+                // di_crc is a little-endian __le32 in XFS v5.
+                let crc = buffer.read_le_u32(0x64)?;
                 let changecount = buffer.read_be_u64(0x68)?; // Fixed: was 0x6A, should be 0x68
                 let lsn = buffer.read_be_u64(0x70)?; // Fixed: was 0x72, should be 0x70
                 let flags2 = buffer.read_be_u64(0x78)?; // Fixed: was 0x7A, should be 0x78
@@ -438,7 +439,7 @@ impl InodeCore {
 
         // Write v3 fields
         if self.version >= 3 {
-            buf[0x64..0x68].copy_from_slice(&self.crc.to_be_bytes());
+            buf[0x64..0x68].copy_from_slice(&self.crc.to_le_bytes());
             buf[0x68..0x70].copy_from_slice(&self.changecount.to_be_bytes());
             buf[0x70..0x78].copy_from_slice(&self.lsn.to_be_bytes());
             buf[0x78..0x80].copy_from_slice(&self.flags2.to_be_bytes());
@@ -573,6 +574,28 @@ impl Inode {
         };
 
         Ok(Self { core, data_fork })
+    }
+
+    /// Verifies the CRC32c of a v3 (v5 filesystem) inode.
+    ///
+    /// `raw` is the full on-disk inode buffer of `inode_size` bytes.  The CRC
+    /// covers the whole inode with the `di_crc` field zeroed.
+    #[cfg(feature = "alloc")]
+    pub fn verify_crc(&self, raw: &[u8], inode_size: usize) -> FsResult<()> {
+        if self.core.version < 3 {
+            return Ok(());
+        }
+        if raw.len() < inode_size || inode_size < 0x68 {
+            return Err(FsError::BufferTooSmall);
+        }
+
+        let mut copy = alloc::vec::Vec::from(&raw[..inode_size]);
+        copy[0x64..0x68].fill(0);
+        let calculated = crate::crc::xfs_crc32c(&copy);
+        if calculated != self.core.crc {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
     }
 
     /// Returns `true` if data is inline in the inode.
@@ -786,6 +809,27 @@ mod tests {
     use super::*;
     extern crate alloc;
     use alloc::vec;
+
+    #[test]
+    fn v3_inode_crc_verification() {
+        let mut buf = vec![0u8; 256];
+        buf[0..2].copy_from_slice(&XFS_DINODE_MAGIC.to_be_bytes());
+        buf[0x04] = 3;
+        buf[0x05] = XFS_DINODE_FMT_LOCAL;
+        buf[0x64..0x68].fill(0);
+        let crc = crate::crc::xfs_crc32c(&buf);
+        buf[0x64..0x68].copy_from_slice(&crc.to_le_bytes());
+
+        let inode = Inode::parse(&buf, 256).unwrap();
+        assert!(inode.verify_crc(&buf, 256).is_ok());
+
+        let mut corrupted = buf;
+        corrupted[0x08] ^= 0xFF;
+        assert!(matches!(
+            inode.verify_crc(&corrupted, 256),
+            Err(FsError::Corrupted)
+        ));
+    }
 
     #[test]
     fn test_inode_core_parse_minimal() {

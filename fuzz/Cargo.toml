@@ -1,0 +1,19 @@
+[package]
+name = "xfs-rs-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xfs-rs = { path = "..", features = ["std"] }
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false

@@ -200,13 +200,13 @@ impl AllocBtreeBlock {
 
         let (block_no, lsn, uuid, owner, crc) = if is_v5 {
             let mut uuid = [0u8; 16];
-            uuid.copy_from_slice(&buffer[28..44]);
+            uuid.copy_from_slice(&buffer[32..48]);
             (
                 buffer.read_be_u64(16)?,
                 buffer.read_be_u64(24)?,
                 uuid,
-                buffer.read_be_u32(44)?,
                 buffer.read_be_u32(48)?,
+                buffer.read_le_u32(52)?,
             )
         } else {
             (0, 0, [0u8; 16], 0, 0)
@@ -240,9 +240,9 @@ impl AllocBtreeBlock {
         if is_v5 {
             buf[16..24].copy_from_slice(&self.block_no.to_be_bytes());
             buf[24..32].copy_from_slice(&self.lsn.to_be_bytes());
-            buf[28..44].copy_from_slice(&self.uuid);
-            buf[44..48].copy_from_slice(&self.owner.to_be_bytes());
-            buf[48..52].copy_from_slice(&self.crc.to_be_bytes());
+            buf[32..48].copy_from_slice(&self.uuid);
+            buf[48..52].copy_from_slice(&self.owner.to_be_bytes());
+            buf[52..56].copy_from_slice(&self.crc.to_le_bytes());
         }
 
         buf

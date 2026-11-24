@@ -16,18 +16,10 @@ use fs_abstraction::{
 use tracing::{debug, error, trace, warn};
 use winfsp::{
     filesystem::{
-        DirBuffer,
-        DirInfo,
-        DirMarker,
-        FileInfo,
-        FileSecurity,
-        FileSystemContext,
-        OpenFileInfo,
-        VolumeInfo,
-        WideNameInfo,
+        DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
+        VolumeInfo, WideNameInfo,
     },
-    FspError,
-    U16CStr,
+    FspError, U16CStr,
 };
 
 // Windows file attributes constants
