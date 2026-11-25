@@ -9,3 +9,7 @@ publish = false
 [dependencies]
 libfuzzer-sys = "0.4"
 xfs-rs = { path = "../crates/xfs-rs", features = ["std"] }
+
+[[bin]]
+name = "superblock_fuzz"
+path = "fuzz_targets/superblock_fuzz.rs"

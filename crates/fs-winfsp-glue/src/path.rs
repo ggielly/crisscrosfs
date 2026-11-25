@@ -142,7 +142,7 @@ pub fn join_path(components: &[&str]) -> String {
 
 /// Gets the parent path (removes the last component).
 pub fn parent_path(path: &str) -> Option<&str> {
-    let path = path.trim_end_matches(|c| c == '\\' || c == '/');
+    let path = path.trim_end_matches(['\\', '/']);
     if path.is_empty() {
         return None;
     }
@@ -162,7 +162,7 @@ pub fn parent_path(path: &str) -> Option<&str> {
 
 /// Gets the file name (last component) from a path.
 pub fn file_name(path: &str) -> Option<&str> {
-    let path = path.trim_end_matches(|c| c == '\\' || c == '/');
+    let path = path.trim_end_matches(['\\', '/']);
     if path.is_empty() {
         return None;
     }
@@ -202,7 +202,6 @@ pub fn is_absolute(path: &str) -> bool {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 

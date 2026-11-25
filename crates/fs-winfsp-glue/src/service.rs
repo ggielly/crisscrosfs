@@ -299,7 +299,7 @@ pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
         // The SCM appends these verbatim to the executable path.
         launch_arguments: SERVICE_LAUNCH_ARGUMENTS
             .iter()
-            .map(|arg| OsString::from(arg))
+            .map(OsString::from)
             .collect(),
         dependencies: vec![],
         account_name: None, // Run as LocalSystem

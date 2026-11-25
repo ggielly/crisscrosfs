@@ -180,7 +180,7 @@ fn main() {
         Level::INFO
     };
 
-    let _subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(log_level)
         .with_target(false)
         .with_ansi(cli.color)
@@ -335,7 +335,7 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
     ctrlc::set_handler(move || {
         let _ = sig_tx.send(());
     })
-    .map_err(|e| XfsWinfspError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    .map_err(|e| XfsWinfspError::IoError(std::io::Error::other(e)))?;
 
     // Block until signal received
     let _ = sig_rx.recv();

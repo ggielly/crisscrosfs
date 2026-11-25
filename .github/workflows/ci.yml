@@ -22,6 +22,8 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
       - name: Build and test
         run: cargo test --workspace --all-targets
+      - name: Check fuzz workspace
+        run: cargo check --manifest-path fuzz/Cargo.toml
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Formatting

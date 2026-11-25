@@ -127,7 +127,10 @@ impl VfsContext {
         let length = sd.len() as u64;
         if let Some(buffer) = security_descriptor {
             if buffer.len() < sd.len() {
-                return Err(FspError::NTSTATUS(FsError::BufferTooSmall.to_ntstatus()));
+                // WinFsp's GetSecurityByName retry loop specifically expects
+                // STATUS_BUFFER_OVERFLOW when it should grow the descriptor
+                // buffer.
+                return Err(FspError::NTSTATUS(0x8000_0005_u32 as i32));
             }
             // SAFETY: WinFsp guarantees the buffer points to at least
             // `buffer.len()` writable bytes of c_void storage.
@@ -395,8 +398,10 @@ impl FileSystemContext for VfsContext {
             .resolve_path(&new_parent_path)
             .map_err(|e| self.map_error(e))?;
 
-        let mut vfs_flags = fs_abstraction::types::RenameFlags::default();
-        vfs_flags.replace_if_exists = replace_if_exists;
+        let vfs_flags = fs_abstraction::types::RenameFlags {
+            replace_if_exists,
+            ..Default::default()
+        };
 
         match self
             .fs
@@ -426,7 +431,7 @@ impl FileSystemContext for VfsContext {
                 Ok(entries) => {
                     for entry in entries {
                         let mut di = DirInfo::new();
-                        if let Err(_) = di.set_name(OsStr::new(&entry.name)) {
+                        if di.set_name(OsStr::new(&entry.name)).is_err() {
                             continue;
                         }
 
@@ -447,7 +452,7 @@ impl FileSystemContext for VfsContext {
                             continue;
                         }
 
-                        if let Err(_) = lock.write::<255>(&mut di) {
+                        if lock.write::<255>(&mut di).is_err() {
                             break;
                         }
                     }
@@ -469,9 +474,7 @@ impl FileSystemContext for VfsContext {
         let name = file_name.to_string_lossy();
         match self.fs.lookup(context.inode, &name) {
             Ok(info) => {
-                if let Err(e) = out_dir_info.set_name(OsStr::new(&name)) {
-                    return Err(e.into());
-                }
+                out_dir_info.set_name(OsStr::new(&name))?;
                 self.fill_file_info(&info, out_dir_info.file_info_mut())?;
                 Ok(())
             }
@@ -1010,8 +1013,10 @@ mod tests {
         let flags = u32::from_le_bytes(buffer[16..20].try_into().unwrap());
         let start = 20 + print_offset;
         let units: Vec<u16> = buffer[start..start + print_len]
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
             .collect();
         assert_eq!(substitute_len, print_len);
         (String::from_utf16_lossy(&units), flags & 1 != 0)

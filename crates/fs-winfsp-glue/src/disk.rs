@@ -939,7 +939,7 @@ impl DiskReader for PhysicalDiskReader {
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
                 |e| {
                     tracing::error!("SetFilePointerEx failed: error code 0x{:X}", e.code().0);
-                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
+                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
                 },
             )?;
             tracing::debug!("Seek successful, new position: {}", new_pos);
@@ -991,9 +991,7 @@ impl DiskReader for PhysicalDiskReader {
                                 "Second SetFilePointerEx failed: error code 0x{:X}",
                                 e.code().0
                             );
-                            XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
-                                e.code().0 as i32,
-                            ))
+                            XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
                         })?;
 
                         bytes_read = 0;
@@ -1028,7 +1026,7 @@ impl DiskReader for PhysicalDiskReader {
                                 }
 
                                 Err(XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
-                                    e_retry.code().0 as i32,
+                                    e_retry.code().0,
                                 )))
                             }
                         }
@@ -1258,12 +1256,12 @@ impl DiskReader for PhysicalDiskWriter {
         unsafe {
             let mut new_pos: i64 = 0;
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
-                |e| XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32)),
+                |e| XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0)),
             )?;
 
             let mut bytes_read: u32 = 0;
             ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None).map_err(|e| {
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
+                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
             })?;
 
             Ok(bytes_read as usize)
@@ -1295,14 +1293,14 @@ impl DiskWriter for PhysicalDiskWriter {
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
                 |e| {
                     tracing::error!("SetFilePointerEx failed: 0x{:X}", e.code().0);
-                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
+                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
                 },
             )?;
 
             let mut bytes_written: u32 = 0;
             WriteFile(self.handle, Some(data), Some(&mut bytes_written), None).map_err(|e| {
                 tracing::error!("WriteFile failed: 0x{:X}", e.code().0);
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
+                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
             })?;
 
             tracing::trace!("write_at: offset={} wrote {} bytes", offset, bytes_written);
@@ -1314,7 +1312,7 @@ impl DiskWriter for PhysicalDiskWriter {
         let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             FlushFileBuffers(self.handle).map_err(|e| {
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
+                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
             })?;
         }
         Ok(())
@@ -1718,7 +1716,7 @@ fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
     let minimum_size = lba_size
         .checked_mul(4)
         .ok_or_else(|| XfsWinfspError::DiskError("GPT disk size overflow".into()))?;
-    if disk_size < minimum_size || disk_size % lba_size != 0 {
+    if disk_size < minimum_size || !disk_size.is_multiple_of(lba_size) {
         return Err(XfsWinfspError::DiskError(
             "Disk size is too small or not a whole number of logical sectors".to_string(),
         ));
@@ -1748,7 +1746,7 @@ fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
         .first_usable_lba
         .checked_mul(lba_size)
         .ok_or_else(|| XfsWinfspError::DiskError("GPT usable LBA overflow".into()))?;
-    if entries_offset < lba_size.checked_mul(2).unwrap_or(u64::MAX)
+    if entries_offset < lba_size.saturating_mul(2)
         || entries_end > first_usable_offset
         || entries_end > disk_size
     {
@@ -2120,6 +2118,7 @@ mod tests {
         put_u32(image, offset + 16, crc);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_gpt_header(
         image: &mut [u8],
         current_lba: u64,

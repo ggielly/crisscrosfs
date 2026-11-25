@@ -63,6 +63,7 @@ sudo mount -o loop xfs-32M.img /mnt/xfs
 sudo bash scripts/populate.sh /mnt/xfs small   # "large" for the 300 MiB image
 sudo umount /mnt/xfs
 xfs_repair -n -o force_geometry xfs-32M.img
+sha256sum xfs-32M.img > xfs-32M.img.sha256
 ```
 
 `scripts/populate.sh` is the script that produced the trees above.

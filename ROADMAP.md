@@ -80,21 +80,16 @@ cargo run -p fs-winfsp-glue -- mount --image test.img --mount-point X:
 ### 🔴 CRITICAL BUGS TO NEVER FORGET
 
 #### 1. Incomplete Allocator (TOTAL BLOCKER)
-```rust
-// crates/xfs-vfs/src/allocator.rs lines 144-149, 152-155
-mark_allocated()  // STUB - does NOT update BNO/CNT B+trees
-free_blocks()     // STUB - does NOT update B+trees
-```
-**Consequence:** Same block reallocated multiple times → **GUARANTEED CORRUPTION**
-**Action:** NEVER enable write in production without fixing this
+`mark_allocated()` and `free_blocks()` do not transactionally update BNO/CNT/AGF metadata.
+
+**Consequence:** Reusing live blocks would corrupt the filesystem.
+**Action:** Write modules are not compiled and writable VFS construction is rejected.
 
 #### 2. Missing Journal Recovery
-```rust
-// crates/xfs-vfs/src/journal.rs line 418-456
-recover()  // Scans head LSN but does NOT replay transactions
-```
-**Consequence:** Crash = data loss, journal useless
-**Action:** Implement replay before any serious usage
+The journal scaffolding does not implement durable redo/undo or replay.
+
+**Consequence:** Crash consistency cannot be guaranteed.
+**Action:** Keep writes disabled until a real WAL and recovery are implemented and tested.
 
 ### ⚠️ Write Support Limitations
 
@@ -329,9 +324,9 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [x] Inode parsing (data fork formats)
 - [x] Extent parsing (128-bit)
 - [x] Directory parsing (shortform, extent, B+tree)
-- [/] B+tree navigation with cycle/depth/budget validation
+- [x] B+tree navigation with cycle/depth/budget validation
 - [x] Address calculation and big-endian conversion
-- [/] CRC32C verification for v5 metadata
+- [x] CRC32C verification for v5 metadata
 - [x] Serialization scaffolding for Superblock, Inode, Extent
 
 ### 2.2 Unit Tests
@@ -349,7 +344,8 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [x] `XfsVfs` structure with bounded LRU caches
 - [x] Read methods from the `VfsFileSystem` trait
 - [/] Cache invalidation/TTL behavior is incomplete
-- [/] File/directory format reads are implemented but require real-image validation
+- [x] File/directory reads validated against the committed XFS v5 fixture
+- [ ] XFS v4 real-image fixture and WinFsp mount E2E validation
 
 ### 3.2 Read Operations (read_ops.rs)
 - [x] `read_inode()` - Reading and caching inodes
@@ -357,11 +353,11 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [x] `readdir()` - Support for shortform, extent, B+tree
 - [x] B+tree traversal with `btree_collect_extents()`
 
-### 3.3 Write Operations (write_ops.rs) ⚠️ PARTIAL
-- [x] `WriteOperations` infrastructure with superblock cache
-- [x] `read_block()`, `write_block()`, `write_inode()`
-- [x] `serialize_data_fork()` - Data fork serialization
-- [x] `update_timestamps()` - Timestamp updates
+### 3.3 Write Operations (write_ops.rs) ❌ DISABLED
+- [x] Historical write scaffolding retained in source
+- [x] `allocator`, `journal`, and `write_ops` excluded from compilation
+- [x] Writable VFS construction returns `FsError::ReadOnly`
+- [ ] Safe allocation, transactions, recovery, and E2E write validation
 
 #### Inode Allocation
 - [x] `allocate_inode()` - Searching for free inode in IBT
@@ -473,11 +469,11 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [/] `xfs-vfs` tests (write operations - partial)
 
 ### 6.2 Integration Tests
-- [ ] Creation of real XFS v4/v5 images with `mkfs.xfs`
+- [x] Real XFS v5 images generated with `mkfs.xfs` and checked with `xfs_repair -n`
+- [ ] Real XFS v4 image fixture
 - [ ] WinFsp mount/unmount tests in a Windows VM
-- [ ] File reading tests on real images (all formats)
-- [ ] Directory navigation tests on real images (all formats)
-- [ ] Large/sparse/B+tree file tests on real images
+- [x] File and directory reads on the v5 fixture (local, extents, holes, sparse, links, Unicode)
+- [ ] Large B+tree image test in CI (300 MiB fixture is local-only)
 - [x] Synthetic regression tests for malformed metadata and read-only enforcement
 
 ### 6.3 Fuzzing
@@ -535,10 +531,10 @@ This analysis identified several weaknesses in the original B+tree implementatio
 - Suboptimal traversal in `btree_collect_extents()`
 - No infinite loop protection
 
-**Current State (2026-02-06):**
+**Current State (2026-11-25):**
 - ✅ **FIXED**: `BmbtRoot::find_child_ptr()` uses binary search
-- ⚠️ **REMAINING**: `BtreeBlockLong::get_ptr_for_offset()` still uses linear search
-- ⚠️ **REMAINING**: Cycle detection in sibling traversal
+- ✅ **FIXED**: BMBT pointers use canonical max-record capacity
+- ✅ **FIXED**: Sibling cycles, non-decreasing levels, and node budgets are rejected
 
 #### 4. v4 vs v5 Version Management
 **Identified Issues:**
@@ -546,10 +542,10 @@ This analysis identified several weaknesses in the original B+tree implementatio
 - Insufficient validation of v5-specific fields
 - No cross-validation
 
-**Current State (2026-02-06):**
-- ✅ **FIXED**: Automatic detection via magic numbers
-- ✅ **IMPROVED**: CRC validation for v5
-- ✅ **IMPROVED**: Proper propagation of `is_v5` parameter
+**Current State (2026-11-25):**
+- ✅ **FIXED**: Version nibble and magic-number validation
+- ✅ **FIXED**: CRC verification with per-structure offsets and endianness
+- ✅ **FIXED**: Unsupported incompatible features are rejected
 
 #### 5. Documentation
 **Current State (2026-02-06):**
@@ -815,7 +811,7 @@ Maintain a `HashSet<u64>` of visited blocks, error if cycle detected
 ## COMPLETENESS METRICS
 
 ### Read Operations
-Implemented in code, but not yet validated end-to-end on real XFS images:
+Implemented and exercised against a real XFS v5 fixture; WinFsp mount E2E remains pending:
 
 - [x] read() Local files
 - [x] read() Extent files
@@ -824,9 +820,9 @@ Implemented in code, but not yet validated end-to-end on real XFS images:
 - [x] readdir() extent/block/leaf
 - [x] readdir() B+tree
 - [x] stat() / get_file_info()
-- [/] B+tree traversal with corruption budgets
+- [x] B+tree traversal with corruption budgets
 - [x] XFS v4/v5 parsing
-- [/] CRC verification coverage
+- [x] CRC verification coverage
 
 ### Write Operations (Functional)
 ```
