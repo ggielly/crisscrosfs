@@ -9,7 +9,8 @@ pub struct WinFspLogVisualMarker;
 impl WinFspLogVisualMarker {
     /// Adds a visual marker to a single WinFSP log line
     pub fn add_visual_marker(line: &str) -> String {
-        // Add 4 white vertical bars at the beginning to make WinFSP logs stand out
+        // Add 4 white vertical bars at the beginning to make WinFSP logs stand
+        // out
         format!("|||| {}", line)
     }
 }

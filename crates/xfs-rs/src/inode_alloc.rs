@@ -178,6 +178,8 @@ pub struct InodeBtreeBlock {
 }
 
 impl InodeBtreeBlock {
+    /// Offset of the v5 CRC field.
+    pub const CRC_OFFSET_V5: usize = 0x34;
     /// Header size for v4.
     pub const V4_SIZE: usize = 16;
     /// Header size for v5.
@@ -193,11 +195,15 @@ impl InodeBtreeBlock {
         let magic = buffer.read_be_u32(0)?;
 
         // Validate magic
-        let valid_magic = match magic {
-            XFS_IBT_MAGIC | XFS_IBT_CRC_MAGIC | XFS_FIBT_MAGIC | XFS_FIBT_CRC_MAGIC => true,
-            _ => false,
-        };
+        let valid_magic = matches!(
+            magic,
+            XFS_IBT_MAGIC | XFS_IBT_CRC_MAGIC | XFS_FIBT_MAGIC | XFS_FIBT_CRC_MAGIC
+        );
         if !valid_magic {
+            return Err(FsError::InvalidMagic);
+        }
+        let crc_magic = magic == XFS_IBT_CRC_MAGIC || magic == XFS_FIBT_CRC_MAGIC;
+        if is_v5 != crc_magic {
             return Err(FsError::InvalidMagic);
         }
 
@@ -212,7 +218,7 @@ impl InodeBtreeBlock {
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(&buffer[32..48]);
             let owner = buffer.read_be_u32(48)?;
-            let crc = buffer.read_be_u32(52)?;
+            let crc = buffer.read_le_u32(Self::CRC_OFFSET_V5)?;
             (blkno, lsn, uuid, owner, crc)
         } else {
             (0, 0, [0u8; 16], 0, 0)
@@ -250,6 +256,25 @@ impl InodeBtreeBlock {
             Self::V4_SIZE
         }
     }
+
+    /// Returns `true` if this block uses the v5 CRC header.
+    pub fn is_v5(&self) -> bool {
+        self.magic == XFS_IBT_CRC_MAGIC || self.magic == XFS_FIBT_CRC_MAGIC
+    }
+
+    /// Verifies a v5 inode B+tree block CRC over the complete block.
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        if raw.len() < Self::V5_SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
+        if raw.read_be_u32(0)? != self.magic {
+            return Err(FsError::InvalidMagic);
+        }
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
+    }
 }
 
 /// Read leaf records from an inode B+tree block.
@@ -262,14 +287,20 @@ pub fn read_inode_btree_records(
         return Err(FsError::InvalidBlockType);
     }
 
+    header.verify_crc(buffer)?;
     let header_size = header.header_size(is_v5);
-    let mut records = Vec::with_capacity(header.num_recs as usize);
+    if buffer.len() < header_size {
+        return Err(FsError::BufferTooSmall);
+    }
+    let max_recs = (buffer.len() - header_size) / InodeBtreeRec::SIZE;
+    let num_recs = header.num_recs as usize;
+    if num_recs > max_recs {
+        return Err(FsError::Corrupted);
+    }
+    let mut records = Vec::with_capacity(num_recs);
 
-    for i in 0..header.num_recs as usize {
+    for i in 0..num_recs {
         let rec_offset = header_size + i * InodeBtreeRec::SIZE;
-        if rec_offset + InodeBtreeRec::SIZE > buffer.len() {
-            break;
-        }
         records.push(InodeBtreeRec::parse(&buffer[rec_offset..])?);
     }
 
@@ -438,7 +469,9 @@ mod tests {
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&100u32.to_be_bytes()); // start_ino
         buf[4..8].copy_from_slice(&5u32.to_be_bytes()); // free_count
-        buf[8..16].copy_from_slice(&0x1Fu64.to_be_bytes()); // free_bitmap (first 5 bits set)
+        buf[8..16].copy_from_slice(&0x1Fu64.to_be_bytes()); // free_bitmap
+                                                            // (first 5 bits
+                                                            // set)
 
         let rec = InodeBtreeRec::parse(&buf).unwrap();
         assert_eq!(rec.start_ino, 100);
@@ -466,6 +499,43 @@ mod tests {
 
         // Next free should be index 1
         assert_eq!(rec.first_free_inode(), Some(65));
+    }
+
+    #[test]
+    fn inode_btree_crc_is_little_endian_and_version_checked() {
+        let mut buf = vec![0u8; 512];
+        buf[0..4].copy_from_slice(&XFS_IBT_CRC_MAGIC.to_be_bytes());
+        let crc =
+            crate::crc::xfs_crc32c_with_zeroed_field(&buf, InodeBtreeBlock::CRC_OFFSET_V5).unwrap();
+        buf[InodeBtreeBlock::CRC_OFFSET_V5..InodeBtreeBlock::CRC_OFFSET_V5 + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+
+        let header = InodeBtreeBlock::parse(&buf, true).unwrap();
+        assert_eq!(header.crc, crc);
+        assert!(header.verify_crc(&buf).is_ok());
+        assert!(matches!(
+            InodeBtreeBlock::parse(&buf, false),
+            Err(FsError::InvalidMagic)
+        ));
+
+        let mut corrupted = buf;
+        corrupted[100] ^= 1;
+        assert!(matches!(
+            header.verify_crc(&corrupted),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn inode_btree_does_not_silently_truncate_records() {
+        let mut buf = [0u8; InodeBtreeBlock::V4_SIZE];
+        buf[0..4].copy_from_slice(&XFS_IBT_MAGIC.to_be_bytes());
+        buf[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let header = InodeBtreeBlock::parse(&buf, false).unwrap();
+        assert!(matches!(
+            read_inode_btree_records(&buf, &header, false),
+            Err(FsError::Corrupted)
+        ));
     }
 
     #[test]

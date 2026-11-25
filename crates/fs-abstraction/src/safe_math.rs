@@ -196,10 +196,9 @@ impl CheckedSliceOps for [u8] {
 /// Saturating divide that returns 0 for division by zero.
 #[inline]
 pub const fn saturating_div(a: u64, b: u64) -> u64 {
-    if b == 0 {
-        0
-    } else {
-        a / b
+    match a.checked_div(b) {
+        Some(value) => value,
+        None => 0,
     }
 }
 
@@ -211,7 +210,7 @@ pub fn div_ceil(a: u64, b: u64) -> FsResult<u64> {
     }
     // (a + b - 1) / b, but avoid overflow
     let result = a / b;
-    if a % b != 0 {
+    if !a.is_multiple_of(b) {
         result.checked_add(1).ok_or(FsError::ArithmeticOverflow)
     } else {
         Ok(result)

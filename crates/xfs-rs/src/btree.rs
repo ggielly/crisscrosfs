@@ -58,6 +58,8 @@ pub struct BtreeBlockLong {
 }
 
 impl BtreeBlockLong {
+    /// Offset of the v5 CRC field.
+    pub const CRC_OFFSET_V5: usize = 0x40;
     /// Size of v4 header.
     pub const SIZE_V4: usize = 24;
     /// Size of v5 header.
@@ -108,6 +110,20 @@ impl BtreeBlockLong {
             owner,
             crc,
         })
+    }
+
+    /// Verifies a v5 BMBT block CRC over the complete block buffer.
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        if raw.len() < Self::SIZE_V5 {
+            return Err(FsError::BufferTooSmall);
+        }
+        if raw.read_be_u32(0)? != XFS_BMAP_CRC_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
 
     /// Returns `true` if this is a leaf node.
@@ -196,11 +212,28 @@ impl BtreeBlockLong {
             return Err(FsError::NotFound);
         }
 
+        // Binary search is only valid for strictly increasing keys.
+        let mut previous_key = None;
+        for i in 0..num_recs_usize {
+            let key_offset = keys_offset
+                .checked_add(
+                    i.checked_mul(BmbtKey::SIZE)
+                        .ok_or(FsError::ArithmeticOverflow)?,
+                )
+                .ok_or(FsError::ArithmeticOverflow)?;
+            let key = BmbtKey::parse(&buffer[key_offset..])?;
+            if previous_key.is_some_and(|previous| previous >= key.file_offset) {
+                return Err(FsError::Corrupted);
+            }
+            previous_key = Some(key.file_offset);
+        }
+
         let mut left = 0;
         let mut right = num_recs_usize;
         let mut result_idx = None;
 
-        // Perform binary search - using exclusive upper bound to avoid underflow
+        // Perform binary search - using exclusive upper bound to avoid
+        // underflow
         while left < right {
             let mid = left + (right - left) / 2;
 
@@ -290,6 +323,8 @@ pub struct BtreeBlockShort {
 }
 
 impl BtreeBlockShort {
+    /// Offset of the v5 CRC field.
+    pub const CRC_OFFSET_V5: usize = 0x34;
     /// Size of v4 header.
     pub const SIZE_V4: usize = 16;
     /// Size of v5 header.
@@ -303,6 +338,18 @@ impl BtreeBlockShort {
         }
 
         let magic = buffer.read_be_u32(0)?;
+        let legacy_magic = matches!(
+            magic,
+            XFS_ABTB_MAGIC | XFS_ABTC_MAGIC | XFS_IBT_MAGIC | XFS_FIBT_MAGIC
+        );
+        let crc_magic = matches!(
+            magic,
+            XFS_ABTB_CRC_MAGIC | XFS_ABTC_CRC_MAGIC | XFS_IBT_CRC_MAGIC | XFS_FIBT_CRC_MAGIC
+        );
+        if (!legacy_magic && !crc_magic) || is_v5 != crc_magic {
+            return Err(FsError::InvalidMagic);
+        }
+
         let level = buffer.read_be_u16(4)?;
         let num_recs = buffer.read_be_u16(6)?;
         let left_sibling = buffer.read_be_u32(8)?;
@@ -334,6 +381,28 @@ impl BtreeBlockShort {
             owner,
             crc,
         })
+    }
+
+    /// Returns `true` if this is a v5 block.
+    pub fn is_v5(&self) -> bool {
+        matches!(
+            self.magic,
+            XFS_ABTB_CRC_MAGIC | XFS_ABTC_CRC_MAGIC | XFS_IBT_CRC_MAGIC | XFS_FIBT_CRC_MAGIC
+        )
+    }
+
+    /// Verifies a v5 AG-local B+tree block CRC over the complete block.
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        if raw.len() < Self::SIZE_V5 {
+            return Err(FsError::BufferTooSmall);
+        }
+        if raw.read_be_u32(0)? != self.magic {
+            return Err(FsError::InvalidMagic);
+        }
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
 
     /// Returns `true` if this is a leaf node.
@@ -430,6 +499,10 @@ impl BmbtRoot {
     /// * `num_recs` - The number of records from the inode
     #[cfg(feature = "alloc")]
     pub fn parse(data: &[u8], level: u16, num_recs: u16) -> FsResult<Self> {
+        if level == 0 {
+            return Err(FsError::Corrupted);
+        }
+
         // The pointer array starts after the maximum key capacity of the fork,
         // not after num_recs (`xfs_bmdr_maxrecs` / `xfs_bmdr_ptr_addr`).
         let max_recs = data.len() / (BmbtKey::SIZE + BmbtPtr::SIZE);
@@ -469,12 +542,33 @@ impl BmbtRoot {
             ptrs.push(ptr);
         }
 
-        Ok(Self {
+        let root = Self {
             level,
             num_recs,
             keys,
             ptrs,
-        })
+        };
+        root.validate()?;
+        Ok(root)
+    }
+
+    /// Validates the root geometry and key ordering.
+    #[cfg(feature = "alloc")]
+    pub fn validate(&self) -> FsResult<()> {
+        if self.level == 0
+            || self.keys.len() != self.num_recs as usize
+            || self.ptrs.len() != self.keys.len()
+        {
+            return Err(FsError::Corrupted);
+        }
+        if self
+            .keys
+            .windows(2)
+            .any(|pair| pair[0].file_offset >= pair[1].file_offset)
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
     }
 
     /// Returns `true` if this root points directly to leaf nodes.
@@ -488,21 +582,9 @@ impl BmbtRoot {
     /// then returns the corresponding pointer.
     #[cfg(feature = "alloc")]
     pub fn find_child_ptr(&self, file_offset: u64) -> FsResult<u64> {
+        self.validate()?;
         if self.num_recs == 0 {
             return Err(FsError::NotFound);
-        }
-        if self.level == 0 {
-            return Err(FsError::Corrupted);
-        }
-        if self.keys.len() != self.num_recs as usize || self.ptrs.len() != self.keys.len() {
-            return Err(FsError::Corrupted);
-        }
-
-        // Keys must be strictly increasing for the binary search to be valid.
-        for pair in self.keys.windows(2) {
-            if pair[0].file_offset >= pair[1].file_offset {
-                return Err(FsError::Corrupted);
-            }
         }
 
         // Binary search for the largest key <= file_offset
@@ -591,6 +673,7 @@ pub fn btree_lookup_extent<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
+        header.verify_crc(&block_data)?;
         if header.level.checked_add(1) != Some(current_level) {
             return Err(FsError::Corrupted);
         }
@@ -622,8 +705,10 @@ pub fn btree_collect_extents<R: BlockReader>(
     use alloc::collections::BTreeSet;
 
     let mut extents = alloc::vec::Vec::new();
+    root.validate()?;
 
-    // We need to traverse to find the leftmost leaf, then follow sibling pointers
+    // We need to traverse to find the leftmost leaf, then follow sibling
+    // pointers
     if root.num_recs == 0 {
         return Ok(extents);
     }
@@ -645,6 +730,7 @@ pub fn btree_collect_extents<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
+        header.verify_crc(&block_data)?;
         if header.level.checked_add(1) != Some(current_level) {
             return Err(FsError::Corrupted);
         }
@@ -671,6 +757,7 @@ pub fn btree_collect_extents<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
+        header.verify_crc(&block_data)?;
 
         if !header.is_leaf() {
             return Err(FsError::Corrupted);
@@ -709,6 +796,8 @@ pub fn btree_collect_extents<R: BlockReader>(
 
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::*;
 
     fn internal_block(block_size: usize, level: u16, keys: &[u64], ptrs: &[u64]) -> Vec<u8> {
@@ -774,6 +863,151 @@ mod tests {
         let data = vec![0u8; 16];
         assert!(matches!(
             BmbtRoot::parse(&data, 1, 2),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn root_rejects_zero_level_and_unsorted_keys() {
+        let data = vec![0u8; 32];
+        assert!(matches!(
+            BmbtRoot::parse(&data, 0, 1),
+            Err(FsError::Corrupted)
+        ));
+
+        let mut data = vec![0u8; 32];
+        data[0..8].copy_from_slice(&10u64.to_be_bytes());
+        data[8..16].copy_from_slice(&10u64.to_be_bytes());
+        assert!(matches!(
+            BmbtRoot::parse(&data, 1, 2),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    fn finish_v5_crc(buf: &mut [u8], crc_offset: usize) -> u32 {
+        let crc = crate::crc::xfs_crc32c_with_zeroed_field(buf, crc_offset).unwrap();
+        buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+        crc
+    }
+
+    #[test]
+    fn v5_long_and_short_btree_crcs_are_verified() {
+        let mut long = vec![0u8; 512];
+        long[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        let long_crc = finish_v5_crc(&mut long, BtreeBlockLong::CRC_OFFSET_V5);
+        let long_header = BtreeBlockLong::parse(&long, true).unwrap();
+        assert_eq!(long_header.crc, long_crc);
+        assert!(long_header.verify_crc(&long).is_ok());
+        long[100] ^= 1;
+        assert!(matches!(
+            long_header.verify_crc(&long),
+            Err(FsError::Corrupted)
+        ));
+
+        let mut short = vec![0u8; 512];
+        short[0..4].copy_from_slice(&XFS_ABTB_CRC_MAGIC.to_be_bytes());
+        let short_crc = finish_v5_crc(&mut short, BtreeBlockShort::CRC_OFFSET_V5);
+        let short_header = BtreeBlockShort::parse(&short, true).unwrap();
+        assert_eq!(short_header.crc, short_crc);
+        assert!(short_header.verify_crc(&short).is_ok());
+        short[100] ^= 1;
+        assert!(matches!(
+            short_header.verify_crc(&short),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn v5_internal_pointers_use_v5_header_capacity() {
+        let mut buf = vec![0u8; 512];
+        buf[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_be_bytes());
+        buf[6..8].copy_from_slice(&2u16.to_be_bytes());
+        buf[BtreeBlockLong::SIZE_V5..BtreeBlockLong::SIZE_V5 + 8]
+            .copy_from_slice(&0u64.to_be_bytes());
+        buf[BtreeBlockLong::SIZE_V5 + 8..BtreeBlockLong::SIZE_V5 + 16]
+            .copy_from_slice(&10u64.to_be_bytes());
+        let header = BtreeBlockLong::parse(&buf, true).unwrap();
+        let ptrs_offset = header.ptrs_offset(buf.len()).unwrap();
+        assert_eq!(
+            ptrs_offset,
+            BtreeBlockLong::SIZE_V5 + header.max_recs(512).unwrap() * 8
+        );
+        buf[ptrs_offset..ptrs_offset + 8].copy_from_slice(&100u64.to_be_bytes());
+        buf[ptrs_offset + 8..ptrs_offset + 16].copy_from_slice(&200u64.to_be_bytes());
+        finish_v5_crc(&mut buf, BtreeBlockLong::CRC_OFFSET_V5);
+        let header = BtreeBlockLong::parse(&buf, true).unwrap();
+        assert_eq!(header.get_ptr_for_offset(&buf, 10).unwrap(), 200);
+    }
+
+    struct MemoryReader {
+        blocks: alloc::collections::BTreeMap<u64, Vec<u8>>,
+    }
+
+    impl BlockReader for MemoryReader {
+        fn read_block(&self, block_num: u64) -> FsResult<Vec<u8>> {
+            self.blocks
+                .get(&block_num)
+                .cloned()
+                .ok_or(FsError::InvalidBlockAddress)
+        }
+    }
+
+    fn root_for(level: u16, child: u64) -> BmbtRoot {
+        let mut data = vec![0u8; 16];
+        data[8..16].copy_from_slice(&child.to_be_bytes());
+        BmbtRoot::parse(&data, level, 1).unwrap()
+    }
+
+    fn v5_leaf(right_sibling: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; 512];
+        buf[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
+        buf[6..8].copy_from_slice(&1u16.to_be_bytes());
+        buf[16..24].copy_from_slice(&right_sibling.to_be_bytes());
+        let extent = crate::extent::Extent {
+            file_offset: 0,
+            start_block: 1000,
+            block_count: 10,
+            is_unwritten: false,
+        };
+        buf[BtreeBlockLong::SIZE_V5..BtreeBlockLong::SIZE_V5 + 16]
+            .copy_from_slice(&extent.to_bytes());
+        finish_v5_crc(&mut buf, BtreeBlockLong::CRC_OFFSET_V5);
+        buf
+    }
+
+    #[test]
+    fn traversal_rejects_bad_crc_and_non_decreasing_levels() {
+        let root = root_for(1, 100);
+        let mut leaf = v5_leaf(u64::MAX);
+        leaf[200] ^= 1;
+        let reader = MemoryReader {
+            blocks: [(100, leaf)].into_iter().collect(),
+        };
+        assert!(matches!(
+            btree_lookup_extent(&root, 5, &reader, true),
+            Err(FsError::Corrupted)
+        ));
+
+        // The root expects level 1, but this child claims to be a leaf.
+        let reader = MemoryReader {
+            blocks: [(100, v5_leaf(u64::MAX))].into_iter().collect(),
+        };
+        let root = root_for(2, 100);
+        assert!(matches!(
+            btree_lookup_extent(&root, 5, &reader, true),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn collect_detects_sibling_cycles() {
+        let root = root_for(1, 100);
+        let reader = MemoryReader {
+            blocks: [(100, v5_leaf(100))].into_iter().collect(),
+        };
+        assert!(matches!(
+            btree_collect_extents(&root, &reader, true),
             Err(FsError::Corrupted)
         ));
     }

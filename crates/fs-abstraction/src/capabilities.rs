@@ -47,7 +47,10 @@ pub struct FsCapabilities {
     /// Supports extended attributes (xattr)
     pub supports_xattr: bool,
 
-    /// Supports POSIX ACLs
+    /// Supports retrieving, modifying and persisting POSIX ACLs.
+    ///
+    /// This must remain false when a backend only exposes the POSIX mode bits
+    /// or when ACL writes are not implemented.
     pub supports_acl: bool,
 
     // === Timestamps ===
@@ -99,7 +102,7 @@ impl FsCapabilities {
             supports_sparse_files: true,
             max_file_size: 8 * 1024 * 1024 * 1024 * 1024 * 1024, // 8 EiB
             supports_xattr: true,
-            supports_acl: true,
+            supports_acl: false,
             supports_nanoseconds: true,
             supports_crtime: true, // XFS v5 has crtime
         }
@@ -118,7 +121,7 @@ impl FsCapabilities {
             supports_sparse_files: true,
             max_file_size: 16 * 1024 * 1024 * 1024 * 1024, // 16 TiB
             supports_xattr: true,
-            supports_acl: true,
+            supports_acl: false,
             supports_nanoseconds: true,
             supports_crtime: true,
         }
@@ -137,7 +140,7 @@ impl FsCapabilities {
             supports_sparse_files: true,
             max_file_size: 16 * 1024 * 1024 * 1024 * 1024 * 1024, // 16 EiB
             supports_xattr: true,
-            supports_acl: true,
+            supports_acl: false,
             supports_nanoseconds: true,
             supports_crtime: true,
         }
@@ -152,5 +155,23 @@ impl FsCapabilities {
 impl Default for FsCapabilities {
     fn default() -> Self {
         Self::read_only_linux()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_do_not_advertise_unimplemented_posix_acls() {
+        for capabilities in [
+            FsCapabilities::read_only_linux(),
+            FsCapabilities::writable_linux(),
+            FsCapabilities::xfs(),
+            FsCapabilities::ext4(),
+            FsCapabilities::btrfs(),
+        ] {
+            assert!(!capabilities.supports_acl);
+        }
     }
 }

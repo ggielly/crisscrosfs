@@ -1,9 +1,9 @@
 //! XFS Mount CLI - Mount XFS filesystems on Windows.
 //!
 //! Usage:
-//!   xfs-mount --disk 1 --mount-point X:
-//!   xfs-mount --image /path/to/xfs.img --mount-point X:
-//!   xfs-mount --partition D: --mount-point X:
+//!   xfs-mount mount --disk 1 --mount-point X:
+//!   xfs-mount mount --image /path/to/xfs.img --mount-point X:
+//!   xfs-mount mount --partition D: --mount-point X:
 //!   xfs-mount scan
 
 use std::{
@@ -14,12 +14,14 @@ use std::{
 use clap::{Parser, Subcommand};
 use fs_abstraction::VfsFileSystem;
 use fs_winfsp_glue::{
-    disk::{self, scan_for_xfs_disks, ImageFileReader, ImageFileWriter, PhysicalDiskReader},
+    disk::{self, scan_for_xfs_disks, ImageFileReader, PhysicalDiskReader},
     error::Result,
-    mount::{MountOptions, MountSource},
-    service, winfsp_mount, XfsWinfspError,
+    mount::{parse_partition, validate_mount_point, MountOptions, MountSource},
+    service,
+    winfsp_mount,
+    XfsWinfspError,
 };
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 use xfs_vfs::XfsVfs;
 
@@ -48,28 +50,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Mount an XFS filesystem
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false)))]
     Mount {
         /// Physical disk number (0, 1, 2...)
-        #[arg(short, long, conflicts_with_all = ["image", "partition", "volume"])]
+        #[arg(short, long, group = "source", conflicts_with_all = ["image", "partition", "volume"])]
         disk: Option<u32>,
 
         /// Path to XFS image file
-        #[arg(short, long, conflicts_with_all = ["disk", "partition", "volume"])]
+        #[arg(short, long, group = "source", conflicts_with_all = ["disk", "partition", "volume"])]
         image: Option<PathBuf>,
 
         /// Partition drive letter (e.g., D:)
-        #[arg(short, long, conflicts_with_all = ["disk", "image", "volume"])]
+        #[arg(short, long, group = "source", conflicts_with_all = ["disk", "image", "volume"])]
         partition: Option<String>,
 
         /// Volume path (e.g., \\.\HarddiskVolume5)
-        #[arg(short = 'V', long, conflicts_with_all = ["disk", "image", "partition"])]
+        #[arg(short = 'V', long, group = "source", conflicts_with_all = ["disk", "image", "partition"])]
         volume: Option<String>,
 
         /// Mount point (drive letter, e.g., X:)
         #[arg(short, long, required = true)]
         mount_point: String,
 
-        /// Enable read-write mode (EXPERIMENTAL - use with caution!)
+        /// Reserved write-mode flag (currently rejected: allocation/journal are
+        /// incomplete)
         #[arg(long)]
         rw: bool,
     },
@@ -82,24 +86,26 @@ enum Commands {
     },
 
     /// Show information about an XFS filesystem
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false)))]
     Info {
         /// Physical disk number
-        #[arg(short, long, conflicts_with = "image")]
+        #[arg(short, long, group = "source", conflicts_with = "image")]
         disk: Option<u32>,
 
         /// Path to XFS image file
-        #[arg(short, long, conflicts_with = "disk")]
+        #[arg(short, long, group = "source", conflicts_with = "disk")]
         image: Option<PathBuf>,
     },
 
     /// List contents of a directory
+    #[command(group(clap::ArgGroup::new("source").required(true).multiple(false)))]
     Ls {
         /// Physical disk number
-        #[arg(short, long, conflicts_with = "image")]
+        #[arg(short, long, group = "source", conflicts_with = "image")]
         disk: Option<u32>,
 
         /// Path to XFS image file
-        #[arg(short, long, conflicts_with = "disk")]
+        #[arg(short, long, group = "source", conflicts_with = "disk")]
         image: Option<PathBuf>,
 
         /// Path within the XFS filesystem
@@ -139,8 +145,12 @@ fn main() {
         #[cfg(windows)]
         {
             use windows::Win32::System::Console::{
-                GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-                STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+                GetStdHandle,
+                SetConsoleMode,
+                CONSOLE_MODE,
+                ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_ERROR_HANDLE,
+                STD_OUTPUT_HANDLE,
             };
             unsafe {
                 // Enable ANSI for stdout
@@ -184,56 +194,25 @@ fn main() {
             volume,
             mount_point,
             rw,
-        } => {
-            let source = if let Some(disk_num) = disk {
-                MountSource::DiskNumber(disk_num)
-            } else if let Some(img_path) = image {
-                MountSource::ImageFile(img_path)
-            } else if let Some(part) = partition {
-                let letter = part.chars().next().unwrap_or('C');
-                MountSource::Partition(letter)
-            } else if let Some(vol_path) = volume {
-                MountSource::DiskPath(vol_path)
-            } else {
-                error!("Must specify --disk, --image, --partition, or --volume");
-                std::process::exit(1);
-            };
-
+        } => resolve_mount_source(disk, image, partition, volume).and_then(|source| {
             let options = MountOptions {
                 source,
-                mount_point,
+                mount_point: validate_mount_point(&mount_point)?,
                 read_only: !rw,
                 debug: cli.debug,
                 ..Default::default()
             };
-
             cmd_mount(options)
-        }
+        }),
 
         Commands::Scan { verbose } => cmd_scan(verbose || cli.debug),
 
         Commands::Info { disk, image } => {
-            let source = if let Some(disk_num) = disk {
-                MountSource::DiskNumber(disk_num)
-            } else if let Some(img_path) = image {
-                MountSource::ImageFile(img_path)
-            } else {
-                error!("Must specify --disk or --image");
-                std::process::exit(1);
-            };
-            cmd_info(source, cli.debug)
+            resolve_read_source(disk, image).and_then(|source| cmd_info(source, cli.debug))
         }
 
         Commands::Ls { disk, image, path } => {
-            let source = if let Some(disk_num) = disk {
-                MountSource::DiskNumber(disk_num)
-            } else if let Some(img_path) = image {
-                MountSource::ImageFile(img_path)
-            } else {
-                error!("Must specify --disk or --image");
-                std::process::exit(1);
-            };
-            cmd_ls(source, &path, cli.debug)
+            resolve_read_source(disk, image).and_then(|source| cmd_ls(source, &path, cli.debug))
         }
 
         Commands::Service { action } => match action {
@@ -251,71 +230,84 @@ fn main() {
     }
 }
 
+fn resolve_mount_source(
+    disk: Option<u32>,
+    image: Option<PathBuf>,
+    partition: Option<String>,
+    volume: Option<String>,
+) -> Result<MountSource> {
+    if let Some(disk_number) = disk {
+        Ok(MountSource::DiskNumber(disk_number))
+    } else if let Some(path) = image {
+        Ok(MountSource::ImageFile(path))
+    } else if let Some(value) = partition {
+        Ok(MountSource::Partition(parse_partition(&value)?))
+    } else if let Some(path) = volume {
+        Ok(MountSource::DiskPath(path))
+    } else {
+        Err(XfsWinfspError::InvalidArgument(
+            "Must specify --disk, --image, --partition, or --volume".to_string(),
+        ))
+    }
+}
+
+fn resolve_read_source(disk: Option<u32>, image: Option<PathBuf>) -> Result<MountSource> {
+    if let Some(disk_number) = disk {
+        Ok(MountSource::DiskNumber(disk_number))
+    } else if let Some(path) = image {
+        Ok(MountSource::ImageFile(path))
+    } else {
+        Err(XfsWinfspError::InvalidArgument(
+            "Must specify --disk or --image".to_string(),
+        ))
+    }
+}
+
+/// Open a validated source read-only.
+///
+/// Disk numbers deliberately use the same GPT-aware resolution for mount,
+/// info, and ls. No command path opens a writer: RW remains disabled until the
+/// allocator and journal implementation are complete.
+fn open_read_only_source(source: &MountSource) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
+    source.validate()?;
+    match source {
+        MountSource::DiskNumber(number) => disk::open_disk_with_partitions(*number),
+        MountSource::ImageFile(path) => Ok(Arc::new(ImageFileReader::open(path)?)),
+        MountSource::Partition(letter) => {
+            Ok(Arc::new(PhysicalDiskReader::open_partition(*letter)?))
+        }
+        MountSource::DiskPath(path) => Ok(Arc::new(PhysicalDiskReader::open_by_path(path)?)),
+    }
+}
+
 /// Mount an XFS filesystem.
 fn cmd_mount(options: MountOptions) -> Result<()> {
     info!("Mounting XFS filesystem to {}", options.mount_point);
     tracing::debug!("Mount options: {:?}", options);
 
-    let write_enabled = !options.read_only;
-
-    if write_enabled {
+    if !options.read_only {
         // The block allocator's mark_allocated() and free_blocks() are stubs
         // that have not been implemented yet.  Allowing write operations would
         // silently reuse blocks that still appear free in the on-disk
         // free-space B+trees, corrupting the filesystem without any error.
         // Refuse here before any device is opened or write path is entered.
         error!(
-            "--rw is disabled: the block allocator is not implemented. \
-             Write operations would silently corrupt the filesystem by \
-             reusing blocks that are already in use. \
-             Remove this error once mark_allocated() and free_blocks() \
-             in xfs-vfs/src/allocator.rs are fully implemented."
+            "--rw is disabled: the block allocator is not implemented. Write operations would \
+             silently corrupt the filesystem by reusing blocks that are already in use. Remove \
+             this error once mark_allocated() and free_blocks() in xfs-vfs/src/allocator.rs are \
+             fully implemented."
         );
         return Err(XfsWinfspError::WinFspError(
             "--rw is not available: block allocator not implemented (see allocator.rs)".to_string(),
         ));
     }
 
-    // Open XFS filesystem using VFS layer
-    // Open the block device based on source
-    let device: Arc<dyn fs_abstraction::BlockDevice> = match &options.source {
-        MountSource::ImageFile(path) => {
-            info!("Opening image file {:?}", path);
-            if write_enabled {
-                Arc::new(ImageFileWriter::open(path)?)
-            } else {
-                Arc::new(ImageFileReader::open(path)?)
-            }
-        }
-        MountSource::DiskNumber(num) => {
-            info!("Opening physical disk {}", num);
-            if write_enabled {
-                Arc::new(disk::PhysicalDiskWriter::open(*num)?)
-            } else {
-                Arc::new(PhysicalDiskReader::open(*num)?)
-            }
-        }
-        MountSource::Partition(letter) => {
-            info!("Opening partition {}:", letter);
-            if write_enabled {
-                Arc::new(disk::PhysicalDiskWriter::open_partition(*letter)?)
-            } else {
-                Arc::new(PhysicalDiskReader::open_partition(*letter)?)
-            }
-        }
-        MountSource::DiskPath(path) => {
-            info!("Opening disk path {}", path);
-            if write_enabled {
-                Arc::new(disk::PhysicalDiskWriter::open_by_path(path)?)
-            } else {
-                Arc::new(PhysicalDiskReader::open_by_path(path)?)
-            }
-        }
-    };
+    options.validate()?;
+    let device = open_read_only_source(&options.source)?;
 
     // Detect and create filesystem
     info!("Detecting filesystem type...");
-    let fs = fs_winfsp_glue::factory::detect_and_create(device, !write_enabled)?;
+    let fs = fs_winfsp_glue::factory::detect_and_create(device, true)?;
 
     // Get volume info for display
     let vol_info = fs.get_volume_info()?;
@@ -387,13 +379,7 @@ fn cmd_scan(verbose: bool) -> Result<()> {
 
 /// Show XFS filesystem information.
 fn cmd_info(source: MountSource, debug: bool) -> Result<()> {
-    let reader: Arc<dyn fs_abstraction::BlockDevice> = match &source {
-        MountSource::DiskNumber(num) => disk::open_disk_with_partitions(*num)?,
-        MountSource::ImageFile(path) => Arc::new(ImageFileReader::open(path)?),
-        MountSource::Partition(letter) => Arc::new(PhysicalDiskReader::open_partition(*letter)?),
-        MountSource::DiskPath(path) => Arc::new(PhysicalDiskReader::open_by_path(path)?),
-    };
-
+    let reader = open_read_only_source(&source)?;
     let fs = XfsVfs::with_options(reader, true)?;
     let vol_info = fs.get_volume_info()?;
 
@@ -423,13 +409,7 @@ fn cmd_info(source: MountSource, debug: bool) -> Result<()> {
 
 /// List directory contents.
 fn cmd_ls(source: MountSource, path: &str, debug: bool) -> Result<()> {
-    let reader: Arc<dyn fs_abstraction::BlockDevice> = match &source {
-        MountSource::DiskNumber(num) => disk::open_disk_with_partitions(*num)?,
-        MountSource::ImageFile(path) => Arc::new(ImageFileReader::open(path)?),
-        MountSource::Partition(letter) => Arc::new(PhysicalDiskReader::open_partition(*letter)?),
-        MountSource::DiskPath(p) => Arc::new(PhysicalDiskReader::open_by_path(p)?),
-    };
-
+    let reader = open_read_only_source(&source)?;
     let fs = Arc::new(XfsVfs::with_options(reader, true)?);
 
     if debug {
@@ -555,5 +535,44 @@ mod tests {
             msg.contains("block allocator not implemented"),
             "error must mention the missing allocator, got: {msg}"
         );
+    }
+
+    #[test]
+    fn partition_source_is_not_truncated_to_its_first_character() {
+        assert!(matches!(
+            resolve_mount_source(None, None, Some("DD:".to_string()), None),
+            Err(XfsWinfspError::InvalidArgument(_))
+        ));
+        let source = resolve_mount_source(None, None, Some("d:".to_string()), None).unwrap();
+        assert!(matches!(source, MountSource::Partition('D')));
+    }
+
+    #[test]
+    fn cli_requires_exactly_one_source() {
+        assert!(Cli::try_parse_from(["xfs-mount", "mount", "--mount-point", "X:"]).is_err());
+        assert!(Cli::try_parse_from(["xfs-mount", "info"]).is_err());
+        assert!(Cli::try_parse_from(["xfs-mount", "ls", "/"]).is_err());
+        assert!(Cli::try_parse_from([
+            "xfs-mount",
+            "mount",
+            "--disk",
+            "0",
+            "--image",
+            "disk.img",
+            "--mount-point",
+            "X:",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn service_run_arguments_match_the_cli() {
+        let cli = Cli::try_parse_from(["xfs-mount", "service", "run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                action: ServiceAction::Run
+            }
+        ));
     }
 }

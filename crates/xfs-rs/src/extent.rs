@@ -4,7 +4,8 @@
 
 use fs_abstraction::{
     safe_math::{CheckedOps, CheckedSliceOps},
-    FsError, FsResult,
+    FsError,
+    FsResult,
 };
 
 /// A parsed XFS extent record.
@@ -84,8 +85,9 @@ impl Extent {
         let mut buffer = [0u8; Self::SIZE];
 
         // Build the 128-bit packed format
-        // hi contains: flag (1 bit) | file_offset (54 bits) | start_block high (9 bits)
-        // lo contains: start_block low (43 bits) | block_count (21 bits)
+        // hi contains: flag (1 bit) | file_offset (54 bits) | start_block high
+        // (9 bits) lo contains: start_block low (43 bits) | block_count (21
+        // bits)
 
         let flag_bit: u64 = if self.is_unwritten { 1 << 63 } else { 0 };
         let file_offset_bits = (self.file_offset & 0x003F_FFFF_FFFF_FFFF) << 9;

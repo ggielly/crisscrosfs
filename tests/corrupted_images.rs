@@ -16,7 +16,8 @@ mod corrupted_image_tests {
 
     #[test]
     fn test_truncated_superblock() {
-        let data = vec![0x58, 0x46, 0x53, 0x42]; // Just "XFSB" magic, nothing else
+        let data = vec![0x58, 0x46, 0x53, 0x42]; // Just "XFSB" magic, nothing
+                                                 // else
         match Superblock::parse(&data) {
             Err(FsError::BufferTooSmall) => {} // Expected
             _ => panic!("Expected BufferTooSmall error"),

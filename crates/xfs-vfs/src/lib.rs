@@ -35,30 +35,39 @@
 //! // Create a block device (disk, file, etc.)
 //! // let device: Arc<dyn BlockDevice> = ...;
 //!
-//! // Create XFS VFS instance
-//! // let xfs = XfsVfs::new(device)?;
+//! // Create a structurally read-only XFS VFS instance
+//! // let xfs = XfsVfs::read_only(device)?;
 //!
 //! // Use through VFS trait
 //! // let root = xfs.root_inode();
 //! // let entries = xfs.readdir(root)?;
 //! ```
 
-mod allocator;
 mod cache;
 mod directory;
 mod error;
 mod filesystem;
 mod inode;
-mod journal;
+mod io;
 mod read_ops;
-mod write_ops;
+
+// allocator, journal and write_ops are intentionally not compiled.  The VFS is
+// structurally read-only and must not contain an accidental write path.
 
 pub use error::XfsVfsError;
 pub use filesystem::XfsVfs;
 // Re-export VFS types for convenience
 pub use fs_abstraction::{
-    BlockDevice, FsCapabilities, FsError, FsResult, VfsDirEntry, VfsFileInfo, VfsFileSystem,
-    VfsFileType, VfsTimestamp, VfsVolumeInfo,
+    BlockDevice,
+    FsCapabilities,
+    FsError,
+    FsResult,
+    VfsDirEntry,
+    VfsFileInfo,
+    VfsFileSystem,
+    VfsFileType,
+    VfsTimestamp,
+    VfsVolumeInfo,
 };
 
 /// XFS filesystem magic number

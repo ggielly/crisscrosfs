@@ -1,7 +1,7 @@
 # XFS Driver Implementation Roadmap
 
 > **Version**: 5.0
-> **Last Updated**: 2026-02-06
+> **Last Updated**: 2026-11-25
 > **Overall Status**: 🚧 Actively Under Development
 
 ---
@@ -38,12 +38,11 @@ fs-abstraction → xfs-rs → xfs-vfs → fs-winfsp-glue
 # Full build
 cargo build -p fs-winfsp-glue
 
-# Tests (read operations work)
-cargo test -p xfs-vfs
-cargo test -p xfs-rs
+# Tests (unit/property/regression; real-image E2E is still pending)
+cargo test --workspace --all-targets
 
 # Linter
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Format (NIGHTLY required)
 cargo fmt
@@ -99,33 +98,30 @@ recover()  // Scans head LSN but does NOT replay transactions
 
 ### ⚠️ Write Support Limitations
 
-**Works:**
-- ✅ Shortform directories (inline in inode)
-- ✅ Local (inline) and Extents files
-- ✅ Shortform → block directory conversion
+**Implemented but disabled and not validated for production:**
+- Shortform directory mutations
+- Local and extent file writes
+- Shortform → block directory conversion
+- Partial journal infrastructure
 
-**Does NOT Work:**
-- ❌ Extent-based or B+tree directories (returns `NotImplemented`)
-- ❌ B+tree files (returns `NotImplemented`)
-- ❌ Local → Extents file conversion
-- ❌ Block → Leaf directory conversion
+**Known unsafe or incomplete:**
+- Block and inode allocation do not update all XFS metadata trees
+- Journal recovery does not replay transactions
+- Extent/B+tree directory mutations are incomplete
+- Local → Extents conversion is incomplete
+- Block → Leaf directory conversion is incomplete
+- Concurrent mutation and rollback are not implemented
 
-**Key Code Lines:**
-- `write_ops.rs:413, 483, 569, 602` - Directory ops not shortform
-- `write_ops.rs:636` - Overflow inline file
-- `write_ops.rs:676` - B+tree file write
-- `write_ops.rs:843` - Local→Extents conversion
-- `write_ops.rs:1072` - Block→Leaf conversion
+The CLI and VFS constructors must continue to reject writable mounts until these issues are fixed.
 
 ### Documentation Files
 
 ```
-docs/IMPLEMENTATION_TRACKER.md  - Detailed tracker (EN)
-docs/WRITE_SUPPORT_STATUS.md    - Write ops status
-docs/XFS_Driver_v4.md           - Complete spec
-docs/MODULAR_VFS_ARCHITECTURE.md - VFS Architecture
-CLAUDE.md                       - Claude Code Guide
+README.md                       - Build, usage, and service documentation
 ROADMAP.md                      - THIS FILE (single source of truth)
+crates/*/src                   - Module-level API documentation
+fuzz/                          - libFuzzer workspace and targets
+.github/workflows/ci.yml        - Windows and Linux CI
 ```
 
 ### Common Pitfalls & Solutions
@@ -197,29 +193,29 @@ while left < right {
    - Reason: Easier to develop, debug, deploy
    - Trade-off: Slightly lower performance
 
-2. **Read-Only by Default**: Write ops return `ReadOnly` unless implemented
-   - Reason: Security, avoid accidental corruptions
-   - Activation: `--writable` flag + full implementation required
+2. **Read-Only Enforced**: Writable VFS construction and the `--rw` CLI path are rejected
+   - Reason: Avoid accidental filesystem corruption
+   - Activation: Requires a future explicit implementation and validation effort
 
-3. **No `unsafe`**: Zero unsafe in user-mode crates
-   - Reason: Maximum security, avoid UB
-   - Trade-off: May be slightly less performant
+3. **Limited `unsafe`**: `unsafe` is confined to Windows FFI boundaries
+   - Reason: Raw disk handles and WinFsp require native interop
+   - Requirement: Document invariants and serialize shared handles
 
-4. **LRU with TTL**: Caches expire after timeout
-   - Reason: Avoid staleness, bounded memory
-   - Configuration: Different TTL per cache type
+4. **LRU Caches**: Bounded caches exist; TTL behavior is incomplete
+   - Reason: Bound memory while avoiding stale metadata
+   - Limitation: External modifications require invalidation or exclusive access
 
-5. **Journal WAL**: Write-Ahead Logging implemented
-   - Reason: Consistency after crash (when recovery is implemented)
-   - State: Infrastructure OK, replay missing
+5. **Journal Infrastructure**: Partial transaction scaffolding only
+   - Reason: Future crash consistency
+   - State: No durable WAL, replay, or rollback; writes remain disabled
 
 ### Tests to Always Run
 
 **Before Commit:**
 ```bash
-cargo test                     # All tests
-cargo clippy -- -D warnings    # Strict linting
-cargo fmt -- --check           # Format check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 **Before Release:**
@@ -240,10 +236,10 @@ cargo test -p xfs-vfs journal  # Journal tests
 
 | Component | Completeness | Status |
 |-----------|--------------|--------|
-| Reading | 100% | ✅ Production-ready |
-| Shortform Writing | 30% | ⚠️ Experimental |
-| Full Writing | 0% | ❌ Non-functional (allocator) |
-| Stability | 10% | 🧪 Tests only |
+| Reading | Experimental | ⚠️ Parser/VFS fixes in progress; real-image E2E validation still required |
+| Shortform Writing | 0% | ❌ Disabled |
+| Full Writing | 0% | ❌ Non-functional (allocator/journal/recovery) |
+| Stability | Prototype | 🧪 Unit/property tests only |
 
 ### Absolute Priorities (Don't Forget)
 
@@ -267,14 +263,15 @@ This document tracks the progress of the XFS driver implementation for Windows i
 
 ---
 
-## Current Project Status (February 2026)
+## Current Project Status (November 2026)
 
-### Read Operations: ✅ COMPLETE
-- ✅ Complete XFS v4 and v5 support with CRC validation
-- ✅ All directory formats (shortform, extent, B+tree)
-- ✅ All file formats (Local, Extents, Btree)
-- ✅ Complete B+tree traversal for large files and directories
-- ✅ LRU cache with TTL (inodes, blocks, paths, directories)
+### Read Operations: ⚠️ EXPERIMENTAL
+- ⚠️ XFS v4/v5 parsing implemented; CRC and geometry validation are being hardened
+- ⚠️ Shortform/block/leaf/B+tree directory parsing implemented with known limitations
+- ⚠️ Local/Extents/B+tree file reads implemented; sparse/unwritten semantics are being corrected
+- ⚠️ B+tree traversal requires cycle/depth/budget validation
+- ⚠️ LRU caches exist; TTL behavior is incomplete
+- ❌ No real XFS image or WinFsp mount E2E suite yet
 
 ### Write Operations: ⚠️ EXPERIMENTAL & PARTIAL
 
@@ -325,17 +322,17 @@ This document tracks the progress of the XFS driver implementation for Windows i
 
 ---
 
-## Phase 2: XFS Parser ✅ COMPLETED
+## Phase 2: XFS Parser ⚠️ HARDENING
 
 ### 2.1 `xfs-rs` Crate (Pure Rust Parser, no_std)
-- [x] Superblock Parsing (v4 and v5)
-- [x] Inode Parsing (all data fork formats)
-- [x] Extent Parsing (128-bit)
-- [x] Directory Parsing (shortform, extent, B+tree)
-- [x] Complete B+tree Navigation
-- [x] Address Calculation and Big-Endian Conversion
-- [x] CRC32C Support for XFS v5
-- [x] Serialization (to_bytes) for Superblock, Inode, Extent
+- [x] Superblock parsing (v4 and v5)
+- [x] Inode parsing (data fork formats)
+- [x] Extent parsing (128-bit)
+- [x] Directory parsing (shortform, extent, B+tree)
+- [/] B+tree navigation with cycle/depth/budget validation
+- [x] Address calculation and big-endian conversion
+- [/] CRC32C verification for v5 metadata
+- [x] Serialization scaffolding for Superblock, Inode, Extent
 
 ### 2.2 Unit Tests
 - [x] Superblock tests
@@ -346,13 +343,13 @@ This document tracks the progress of the XFS driver implementation for Windows i
 
 ---
 
-## Phase 3: XFS VFS ✅ COMPLETE READING
+## Phase 3: XFS VFS ⚠️ EXPERIMENTAL READING
 
 ### 3.1 `xfs-vfs` Crate (VfsFileSystem Implementation)
-- [x] `XfsVfs` structure with LRU cache
-- [x] Complete implementation of read methods from `VfsFileSystem` trait
-- [x] Cache management (inodes: 4096, blocks: 1024, paths: 2048, dirs: 512)
-- [x] Reading all file and directory formats
+- [x] `XfsVfs` structure with bounded LRU caches
+- [x] Read methods from the `VfsFileSystem` trait
+- [/] Cache invalidation/TTL behavior is incomplete
+- [/] File/directory format reads are implemented but require real-image validation
 
 ### 3.2 Read Operations (read_ops.rs)
 - [x] `read_inode()` - Reading and caching inodes
@@ -426,42 +423,34 @@ This document tracks the progress of the XFS driver implementation for Windows i
 
 ---
 
-## Phase 4: WinFsp Integration ✅ COMPLETED
+## Phase 4: WinFsp Integration ⚠️ EXPERIMENTAL
 
 ### 4.1 `fs-winfsp-glue` Crate
-- [x] CLI with clap (scan, mount, version)
+- [x] CLI with clap (scan, mount, info, ls, service)
 - [x] Automatic XFS disk detection
-- [x] Mounting via `\\.\PhysicalDriveN` or image file
-- [x] All WinFsp callbacks implemented
+- [x] Mounting via physical disk, partition, volume, or image file
+- [/] Core read callbacks implemented; real WinFsp E2E validation is pending
 
 ### 4.2 WinFsp Callbacks (context.rs)
 - [x] `get_volume_info()` - Volume info
-- [x] `get_security_by_name()` - Security by name
-- [x] `open()` - File opening
-- [x] `close()` - Closing
-- [x] `read()` - Reading delegated to `VfsFileSystem::read()`
-- [x] `write()` - Writing delegated to `VfsFileSystem::write()`
+- [/] `get_security_by_name()` - Restrictive default policy; POSIX ACL mapping is not implemented
+- [x] `open()` / `close()` - Handle lifecycle
+- [x] `read()` - Delegated to `VfsFileSystem::read()`
 - [x] `get_file_info()` - Metadata
-- [x] `set_basic_info()` - Timestamps
-- [x] `set_file_size()` - Truncation/extension
-- [x] `can_delete()` - Deletion check
-- [x] `rename()` - Rename
 - [x] `read_directory()` - Enumeration
-- [x] `create()` - File/directory creation
-- [x] `overwrite()` - Overwriting
-- [x] `cleanup()` - Delete-on-close
-- [ ] `set_security()` - Permissions (not implemented)
+- [/] Reparse/symlink callbacks implemented; path containment requires E2E validation
+- [x] Mutation callbacks reject writes while the VFS is read-only
+- [ ] Full POSIX ACL and Windows security-descriptor mapping
 
 ### 4.3 Disk I/O (disk.rs)
 - [x] `BlockDevice` trait for reading
-- [x] `DiskWriter` trait for writing
-- [x] `PhysicalDisk` - Windows physical disk access
-- [x] `ImageFileWriter` - Image file read/write
-- [x] Aligned and non-aligned sector management
+- [x] Physical disk and image reads with serialized handle access
+- [/] GPT validation and bounds checking
+- [ ] Writable disk support (intentionally disabled)
 
 ---
 
-## Phase 5: Build & Deploy ✅ COMPLETED
+## Phase 5: Build & Deploy ⚠️ PARTIAL
 
 ### 5.1 Build Configuration
 - [x] `Cargo.toml` with 4-crate workspace
@@ -470,9 +459,8 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [x] Nightly toolchain required
 
 ### 5.2 PowerShell Scripts
-- [x] `scripts/build.ps1`
-- [x] `scripts/install.ps1`
-- [x] `scripts/uninstall.ps1`
+- [x] `scripts/build.ps1` builds and packages `xfs-mount.exe`
+- [ ] Dedicated install/uninstall scripts (service commands currently live in the CLI)
 
 ---
 
@@ -485,29 +473,29 @@ This document tracks the progress of the XFS driver implementation for Windows i
 - [/] `xfs-vfs` tests (write operations - partial)
 
 ### 6.2 Integration Tests
-- [x] Creation of test XFS images
-- [x] Mount/unmount tests
-- [x] File reading tests (all formats)
-- [x] Directory navigation tests (all formats)
-- [x] Large file tests with B+tree
-- [/] Write tests (only shortform directories)
+- [ ] Creation of real XFS v4/v5 images with `mkfs.xfs`
+- [ ] WinFsp mount/unmount tests in a Windows VM
+- [ ] File reading tests on real images (all formats)
+- [ ] Directory navigation tests on real images (all formats)
+- [ ] Large/sparse/B+tree file tests on real images
+- [x] Synthetic regression tests for malformed metadata and read-only enforcement
 
 ### 6.3 Fuzzing
-- [x] Proptest for xfs-rs
-- [x] Tests with corrupted images
+- [x] Proptest for selected `xfs-rs` parsers
+- [x] libFuzzer target wired through `fuzz/Cargo.toml`
+- [ ] Corpus generated from real XFS images
 - [ ] AFL++ via WSL2 (optional)
 
 ---
 
-## Phase 7: Documentation ✅ COMPLETED
+## Phase 7: Documentation ⚠️ PARTIAL
 
-- [x] Complete README.md
-- [x] CLAUDE.md for development guidance
-- [x] API documentation (rustdoc)
-- [x] `docs/IMPLEMENTATION_TRACKER.md` (progress tracker in English)
-- [x] `docs/WRITE_SUPPORT_STATUS.md` (write operation status)
-- [x] `docs/XFS_Driver_v4.md` (complete specification)
-- [x] `docs/MODULAR_VFS_ARCHITECTURE.md` (VFS architecture)
+- [x] README with current CLI/build/service syntax
+- [x] Module-level API documentation (rustdoc)
+- [x] Roadmap aligned with actual implementation status
+- [x] Windows/Linux CI workflow
+- [ ] Real-image setup and WinFsp E2E validation guide
+- [ ] Complete on-disk format specification
 
 ---
 
@@ -827,30 +815,29 @@ Maintain a `HashSet<u64>` of visited blocks, error if cycle detected
 ## COMPLETENESS METRICS
 
 ### Read Operations
-```
-████████████████████████████████████████ 100% (10/10)
-```
+Implemented in code, but not yet validated end-to-end on real XFS images:
+
 - [x] read() Local files
 - [x] read() Extent files
 - [x] read() Btree files
 - [x] readdir() shortform
-- [x] readdir() extent
+- [x] readdir() extent/block/leaf
 - [x] readdir() B+tree
 - [x] stat() / get_file_info()
-- [x] B+tree traversal
+- [/] B+tree traversal with corruption budgets
 - [x] XFS v4/v5 parsing
-- [x] CRC validation
+- [/] CRC verification coverage
 
 ### Write Operations (Functional)
 ```
-████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 30% (6/20)
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 0% (disabled)
 ```
-- [x] create() shortform directories
-- [x] write() Local/Extent files
-- [x] unlink() shortform directories
-- [x] rename() shortform directories
-- [x] truncate() files
-- [x] Shortform → block directory conversion
+- [ ] create() shortform directories
+- [ ] write() Local/Extent files
+- [ ] unlink() shortform directories
+- [ ] rename() shortform directories
+- [ ] truncate() files
+- [ ] Shortform → block directory conversion
 - [ ] create() extent/btree directories
 - [ ] unlink() extent/btree directories
 - [ ] rename() extent/btree directories
@@ -866,9 +853,9 @@ Maintain a `HashSet<u64>` of visited blocks, error if cycle detected
 - [ ] Project IDs
 - [ ] Reflink/dedupe
 
-### Write Infrastructure (Technical Completeness)
+### Write Infrastructure (Scaffolding Only)
 ```
-██████████████████░░░░░░░░░░░░░░░░░░░░░░ 45% (9/20)
+Scaffolding only; not durable or enabled
 ```
 - [x] XFS structure serialization
 - [x] DiskWriter trait

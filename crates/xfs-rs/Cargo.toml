@@ -4,7 +4,6 @@ description = "Pure Rust XFS filesystem parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [dependencies]
 fs-abstraction = { path = "../fs-abstraction", default-features = false }

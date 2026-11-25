@@ -59,6 +59,3 @@ impl From<XfsVfsError> for FsError {
         }
     }
 }
-
-/// Result type for XFS VFS operations.
-pub type Result<T> = std::result::Result<T, XfsVfsError>;

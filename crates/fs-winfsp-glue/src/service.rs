@@ -16,8 +16,12 @@ use tracing::{error, info, warn};
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState as WinServiceState,
-        ServiceStatus, ServiceType,
+        ServiceControl,
+        ServiceControlAccept,
+        ServiceExitCode,
+        ServiceState as WinServiceState,
+        ServiceStatus,
+        ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -105,7 +109,19 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
         },
     )?;
 
-    // Set service status to running
+    // Report startup progress before the potentially long initial disk scan.
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: WinServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(30),
+        process_id: None,
+    })?;
+
+    scan_and_mount(&mut state);
+
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: WinServiceState::Running,
@@ -117,9 +133,6 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
     })?;
 
     info!("XFS Filesystem Service started");
-
-    // Initial scan for XFS disks
-    scan_and_mount(&mut state);
 
     // Main service loop
     loop {
@@ -138,7 +151,17 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    // Unmount all volumes
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: WinServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(30),
+        process_id: None,
+    })?;
+
+    // Unmount all volumes before reporting Stopped.
     unmount_all(&mut state);
 
     // Set service status to stopped
@@ -301,6 +324,11 @@ pub fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)?;
 
+    // Delete marks a service for deletion but does not stop it. Attempt a clean
+    // stop first; an already-stopped service is harmless and deletion
+    // continues.
+    let _ = stop_service();
+
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
     service.delete()?;
 
@@ -339,11 +367,28 @@ pub fn stop_service() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)?;
 
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::STOP)?;
-    service.stop()?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
+    let status = service.stop()?;
+    if status.current_state == WinServiceState::Stopped {
+        info!("Service stopped");
+        return Ok(());
+    }
 
-    info!("Service stopped");
-    Ok(())
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = service.query_status()?;
+        if status.current_state == WinServiceState::Stopped {
+            info!("Service stopped");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Timed out waiting for XFS service to stop".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Run the service dispatcher (called from main when running as service).

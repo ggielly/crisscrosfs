@@ -2,19 +2,14 @@
 
 use fs_abstraction::{FsError, FsResult, VfsDirEntry, VfsFileType};
 use xfs_rs::{
-    btree::{self, BlockReader, BmbtRoot},
+    btree::{self, BmbtRoot},
     directory::{parse_shortform_directory, DirFileType},
-    DataFork, Inode,
+    DataFork,
+    Extent,
+    Inode,
 };
 
-/// Adapter to implement `BlockReader` from a closure.
-struct ClosureBlockReader<'a, F: Fn(u64) -> FsResult<Vec<u8>>>(&'a F);
-
-impl<F: Fn(u64) -> FsResult<Vec<u8>>> BlockReader for ClosureBlockReader<'_, F> {
-    fn read_block(&self, block_num: u64) -> FsResult<Vec<u8>> {
-        (self.0)(block_num)
-    }
-}
+use crate::{io::ClosureBlockReader, read_ops::validate_extents};
 
 /// XFS directory leaf space starts at 32 GiB (in bytes).
 /// Extents with file_offset >= this threshold (in filesystem blocks) are
@@ -28,9 +23,10 @@ const MAX_DIRECTORY_BLOCKS: u64 = 1 << 20;
 /// Parse directory entries from an XFS inode.
 pub fn parse_directory_entries(
     inode: &Inode,
-    current_ino: u64,
+    _current_ino: u64,
     has_ftype: bool,
     block_size: u32,
+    total_blocks: u64,
     is_v5: bool,
     read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
 ) -> FsResult<Vec<VfsDirEntry>> {
@@ -39,52 +35,38 @@ pub fn parse_directory_entries(
     }
 
     match &inode.data_fork {
-        DataFork::Local(data) => parse_shortform_directory_entries(data, current_ino, has_ftype),
+        DataFork::Local(data) => parse_shortform_directory_entries(data, has_ftype),
         DataFork::Extents(extents) => {
-            parse_extent_directory_entries(extents, has_ftype, block_size, read_block)
+            parse_extent_directory_entries(extents, has_ftype, block_size, total_blocks, read_block)
         }
         DataFork::Btree {
             level,
             num_recs,
             data,
         } => parse_btree_directory_entries(
-            *level, *num_recs, data, has_ftype, block_size, is_v5, read_block,
+            *level,
+            *num_recs,
+            data,
+            has_ftype,
+            block_size,
+            total_blocks,
+            is_v5,
+            read_block,
         ),
         _ => Err(FsError::NotSupported),
     }
 }
 
 /// Parse shortform directory entries.
-fn parse_shortform_directory_entries(
-    data: &[u8],
-    current_ino: u64,
-    has_ftype: bool,
-) -> FsResult<Vec<VfsDirEntry>> {
+fn parse_shortform_directory_entries(data: &[u8], has_ftype: bool) -> FsResult<Vec<VfsDirEntry>> {
     if data.len() < 6 {
         return Err(FsError::Corrupted);
     }
 
     let (header, iter) =
         parse_shortform_directory(data, has_ftype).map_err(|_| FsError::Corrupted)?;
-
-    // Shortform headers store the parent inode separately instead of listing
-    // "." and ".."; synthesize them so every directory format exposes the same
-    // entries.
-    let mut entries = Vec::with_capacity(header.count as usize + 2);
-    entries.push(VfsDirEntry {
-        name: ".".to_string(),
-        ino: current_ino,
-        file_type: VfsFileType::Directory,
-        offset: 1,
-    });
-    entries.push(VfsDirEntry {
-        name: "..".to_string(),
-        ino: header.parent,
-        file_type: VfsFileType::Directory,
-        offset: 2,
-    });
-
-    let mut offset: u64 = 3; // Start after . and ..
+    let mut entries = Vec::with_capacity(usize::from(header.count));
+    let mut offset = 0u64;
 
     for result in iter {
         let entry = result.map_err(|_| FsError::Corrupted)?;
@@ -94,6 +76,9 @@ fn parse_shortform_directory_entries(
         let name = std::str::from_utf8(entry.name_bytes())
             .map_err(|_| FsError::Corrupted)?
             .to_string();
+        if name == "." || name == ".." {
+            continue;
+        }
 
         entries.push(VfsDirEntry {
             name,
@@ -101,7 +86,7 @@ fn parse_shortform_directory_entries(
             file_type: dir_file_type_to_vfs(entry.file_type),
             offset,
         });
-        offset += 1;
+        offset = offset.checked_add(1).ok_or(FsError::ArithmeticOverflow)?;
     }
 
     Ok(entries)
@@ -109,48 +94,49 @@ fn parse_shortform_directory_entries(
 
 /// Parse extent-based directory entries.
 fn parse_extent_directory_entries(
-    extents: &[xfs_rs::Extent],
+    extents: &[Extent],
     has_ftype: bool,
     block_size: u32,
+    total_blocks: u64,
     read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
 ) -> FsResult<Vec<VfsDirEntry>> {
+    if block_size == 0 {
+        return Err(FsError::Corrupted);
+    }
+    validate_extents(extents, u64::from(block_size), total_blocks)?;
+
     let mut entries = Vec::new();
-    let mut offset: u64 = 3;
-    let leaf_offset_blocks = XFS_DIR2_LEAF_OFFSET_BYTES / block_size as u64;
+    let mut offset = 0u64;
+    let leaf_offset_blocks = XFS_DIR2_LEAF_OFFSET_BYTES / u64::from(block_size);
     let mut blocks_read: u64 = 0;
-    let mut previous_end: u64 = 0;
 
     for extent in extents {
-        if extent.block_count == 0 {
-            continue;
-        }
-
-        // Extents must be sorted and non-overlapping.
-        if extent.file_offset < previous_end {
-            return Err(FsError::Corrupted);
-        }
-        previous_end = extent.file_end()?;
-
-        // Skip leaf/free-index address space (not data blocks).
+        // Never scan leaf/free-index address space, even if a malformed extent
+        // starts in the data range and straddles the boundary.
         if extent.file_offset >= leaf_offset_blocks {
             continue;
         }
+        let data_blocks = std::cmp::min(
+            u64::from(extent.block_count),
+            leaf_offset_blocks - extent.file_offset,
+        );
 
-        for block_idx in 0..extent.block_count {
-            blocks_read += 1;
+        for block_idx in 0..data_blocks {
+            blocks_read = blocks_read
+                .checked_add(1)
+                .ok_or(FsError::ArithmeticOverflow)?;
             if blocks_read > MAX_DIRECTORY_BLOCKS {
                 return Err(FsError::Corrupted);
             }
             let block_num = extent
                 .start_block
-                .checked_add(block_idx as u64)
+                .checked_add(block_idx)
                 .ok_or(FsError::ArithmeticOverflow)?;
             let block_data = read_block(block_num)?;
-
             let block_entries = parse_directory_block(&block_data, has_ftype, block_size)?;
             for mut entry in block_entries {
                 entry.offset = offset;
-                offset += 1;
+                offset = offset.checked_add(1).ok_or(FsError::ArithmeticOverflow)?;
                 entries.push(entry);
             }
         }
@@ -169,55 +155,32 @@ fn parse_extent_directory_entries(
 ///
 /// We collect all extents from the B+tree, filter to data blocks only,
 /// then parse directory entries from each data block.
+#[allow(clippy::too_many_arguments)]
 fn parse_btree_directory_entries(
     level: u16,
     num_recs: u16,
     data: &[u8],
     has_ftype: bool,
     block_size: u32,
+    total_blocks: u64,
     is_v5: bool,
     read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
 ) -> FsResult<Vec<VfsDirEntry>> {
-    // 1. Parse the B+tree root from the inode data fork
+    // 1. Parse the B+tree root from the inode data fork.  A btree-format fork
+    // always points at child nodes; level 0 belongs to the extents format.
     let root = BmbtRoot::parse(data, level, num_recs)?;
+    if root.level == 0 || root.num_recs == 0 {
+        return Err(FsError::Corrupted);
+    }
 
     // 2. Collect all extent mappings by traversing the B+tree
-    let reader = ClosureBlockReader(&read_block);
+    let reader = ClosureBlockReader::new(&read_block);
     let extents = btree::btree_collect_extents(&root, &reader, is_v5)?;
 
-    // 3. Threshold: only read DATA blocks (logical offset < leaf space)
-    let leaf_offset_blocks = XFS_DIR2_LEAF_OFFSET_BYTES / block_size as u64;
-
-    // 4. Read and parse directory entries from data blocks
-    let mut entries = Vec::new();
-    let mut dir_offset: u64 = 3; // Start after . and ..
-    let mut blocks_read: u64 = 0;
-
-    for extent in &extents {
-        // Skip leaf and free-index extents
-        if extent.file_offset >= leaf_offset_blocks {
-            continue;
-        }
-
-        for block_idx in 0..extent.block_count {
-            blocks_read += 1;
-            if blocks_read > MAX_DIRECTORY_BLOCKS {
-                return Err(FsError::Corrupted);
-            }
-            let block_num = extent
-                .start_block
-                .checked_add(block_idx as u64)
-                .ok_or(FsError::ArithmeticOverflow)?;
-            let block_data = read_block(block_num)?;
-
-            let block_entries = parse_directory_block(&block_data, has_ftype, block_size)?;
-            for mut entry in block_entries {
-                entry.offset = dir_offset;
-                dir_offset += 1;
-                entries.push(entry);
-            }
-        }
-    }
+    // The xfs-rs walker is cycle-checked and block-budgeted.  Apply the same
+    // extent and DATA-space validation used for inline extent lists.
+    let entries =
+        parse_extent_directory_entries(&extents, has_ftype, block_size, total_blocks, read_block)?;
 
     tracing::debug!(
         "Btree directory: collected {} extents, {} data entries",
@@ -228,54 +191,78 @@ fn parse_btree_directory_entries(
     Ok(entries)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryBlockKind {
+    Data,
+    Block,
+    Leaf,
+    FreeIndex,
+}
+
+fn directory_block_kind(block_data: &[u8]) -> FsResult<DirectoryBlockKind> {
+    let magic = block_data.get(..4).ok_or(FsError::Corrupted)?;
+    match magic {
+        b"XD2D" | b"XDD3" => Ok(DirectoryBlockKind::Data),
+        b"XD2B" | b"XDB3" => Ok(DirectoryBlockKind::Block),
+        b"XD2L" | b"XDL3" => Ok(DirectoryBlockKind::Leaf),
+        b"XD2F" | b"XDF3" => Ok(DirectoryBlockKind::FreeIndex),
+        _ => Err(FsError::Corrupted),
+    }
+}
+
 /// Parse a single directory block.
 fn parse_directory_block(
     block_data: &[u8],
     has_ftype: bool,
-    _block_size: u32,
+    block_size: u32,
 ) -> FsResult<Vec<VfsDirEntry>> {
+    let block_size = usize::try_from(block_size).map_err(|_| FsError::ArithmeticOverflow)?;
+    if block_size < 16 || block_data.len() < block_size {
+        return Err(FsError::Corrupted);
+    }
+    // Never inspect bytes appended after the advertised filesystem block.
+    let block_data = &block_data[..block_size];
+    let kind = directory_block_kind(block_data)?;
+
+    // All v3 directory block formats carry their CRC at offset 4, calculated
+    // over the complete block with that field zeroed.  Validate big-endian as
+    // specified by this parser, while accepting the little-endian encoding
+    // emitted by the xfsprogs real-image fixtures.
+    if block_data[3] == b'3' {
+        let stored = u32::from_be_bytes(
+            block_data[4..8]
+                .try_into()
+                .map_err(|_| FsError::Corrupted)?,
+        );
+        let verified =
+            xfs_rs::crc::verify_crc32c_field(block_data, 4, stored, false).or_else(|_| {
+                xfs_rs::crc::verify_crc32c_field(block_data, 4, stored.swap_bytes(), true)
+            });
+        verified?;
+    }
+
+    // Leaf and free-index blocks are metadata, not directory entry storage.
+    if matches!(
+        kind,
+        DirectoryBlockKind::Leaf | DirectoryBlockKind::FreeIndex
+    ) {
+        return Ok(Vec::new());
+    }
+
     let mut entries = Vec::new();
-
-    // A directory data block always has at least the 16-byte v2 header.
-    if block_data.len() < 16 {
+    let is_v3 = block_data[3] == b'3';
+    let header_size = if is_v3 { 64 } else { 16 };
+    if block_size < header_size {
         return Err(FsError::Corrupted);
     }
 
-    let magic = &block_data[0..4];
-
-    // Data blocks contain directory entries.  Leaf blocks (hash index) and
-    // free-index blocks are metadata and must never be parsed as entries,
-    // even when they are mapped by the inode's extent list.  Single-block
-    // directories (XD2B/XDB3) contain both data entries and an embedded leaf;
-    // the data area ends where the leaf entries begin.
-    let is_data_block = magic == b"XD2D" || magic == b"XDD3"; // v2/v3 data
-    let is_single_block = magic == b"XD2B" || magic == b"XDB3"; // v2/v3 block
-    let is_index_block = magic == b"XD2L"
-        || magic == b"XDL3" // v2/v3 leaf
-        || magic == b"XD2F"
-        || magic == b"XDF3"; // v2/v3 free index
-
-    if is_index_block {
-        return Ok(entries);
-    }
-    if !is_data_block && !is_single_block {
-        // Unknown magic is corruption, not an empty directory.
-        return Err(FsError::Corrupted);
-    }
-
-    // Data block header is 16 bytes for v2, 64 bytes for v3.
-    let header_size = if magic[3] == b'3' { 64 } else { 16 };
-    if block_data.len() < header_size {
-        return Err(FsError::Corrupted);
-    }
-
-    let end = if is_single_block {
-        // The last 8 bytes are xfs_dir2_block_tail { count, stale } and the
-        // leaf entries are stored immediately before it.
-        if block_data.len() < header_size + 8 {
+    let end = if kind == DirectoryBlockKind::Block {
+        // The last 8 bytes are xfs_dir2_block_tail { count, stale }.  Leaf
+        // entries sit immediately before it and must not be scanned as data.
+        let tail_offset = block_size.checked_sub(8).ok_or(FsError::Corrupted)?;
+        if tail_offset < header_size {
             return Err(FsError::Corrupted);
         }
-        let tail_offset = block_data.len() - 8;
         let leaf_count = u32::from_be_bytes(
             block_data[tail_offset..tail_offset + 4]
                 .try_into()
@@ -292,28 +279,39 @@ fn parse_directory_block(
         }
         leaf_start
     } else {
-        block_data.len()
+        block_size
     };
 
     let mut offset = header_size;
 
     // Parse the sequence of entries and free-space records.
-    while offset + 4 <= end {
+    while offset < end {
+        let remaining = end.checked_sub(offset).ok_or(FsError::ArithmeticOverflow)?;
+        if remaining < 4 {
+            if block_data[offset..end].iter().any(|&byte| byte != 0) {
+                return Err(FsError::Corrupted);
+            }
+            break;
+        }
         let free_tag = u16::from_be_bytes([block_data[offset], block_data[offset + 1]]);
 
         if free_tag == 0xFFFF {
             // XFS free space record: freetag (2) + length (2), where `length`
-            // is the total size of the free region (including the tag and the
-            // trailing offset tag).
-            if offset + 4 > end {
-                return Err(FsError::Corrupted);
-            }
+            // is the total size of the free region (including its trailing
+            // tag bytes).  Jump by that length; never scan the free payload.
             let free_len =
                 u16::from_be_bytes([block_data[offset + 2], block_data[offset + 3]]) as usize;
             let next = offset
                 .checked_add(free_len)
                 .ok_or(FsError::ArithmeticOverflow)?;
-            if free_len < 6 || next > end {
+            if free_len < 8 || free_len % 8 != 0 || next > end {
+                return Err(FsError::Corrupted);
+            }
+            let end_tag_offset = next.checked_sub(2).ok_or(FsError::Corrupted)?;
+            let expected_tag = u16::try_from(offset).map_err(|_| FsError::Corrupted)?;
+            let end_tag =
+                u16::from_be_bytes([block_data[end_tag_offset], block_data[end_tag_offset + 1]]);
+            if end_tag != expected_tag {
                 return Err(FsError::Corrupted);
             }
             offset = next;
@@ -322,7 +320,7 @@ fn parse_directory_block(
 
         // Allocated entry: inode(8) + namelen(1) + name + [ftype(1)] + tag(2),
         // padded to an 8-byte boundary.
-        if offset + 9 > end {
+        if remaining < 9 {
             return Err(FsError::Corrupted);
         }
         let entry_ino = u64::from_be_bytes(
@@ -331,7 +329,6 @@ fn parse_directory_block(
                 .map_err(|_| FsError::Corrupted)?,
         );
         if entry_ino == 0 {
-            // Inode 0 is not a valid directory entry.
             return Err(FsError::Corrupted);
         }
 
@@ -340,7 +337,7 @@ fn parse_directory_block(
             return Err(FsError::Corrupted);
         }
 
-        let name_start = offset + 9;
+        let name_start = offset.checked_add(9).ok_or(FsError::ArithmeticOverflow)?;
         let name_end = name_start
             .checked_add(name_len)
             .ok_or(FsError::ArithmeticOverflow)?;
@@ -357,35 +354,49 @@ fn parse_directory_block(
             VfsFileType::Unknown
         };
 
-        // Reject names that are not valid UTF-8 instead of lossily converting
-        // them: two distinct XFS names could otherwise collide on U+FFFD.
+        // Reject non-UTF-8 names rather than folding distinct names onto the
+        // same U+FFFD replacement string.
         let name = std::str::from_utf8(&block_data[name_start..name_end])
             .map_err(|_| FsError::Corrupted)?
             .to_string();
 
         // The entry includes a 2-byte tag after name/ftype, then is rounded up
         // to 8 bytes (xfs_dir2_data_entsize).
-        let payload_end = name_end + usize::from(has_ftype);
+        let payload_end = name_end
+            .checked_add(usize::from(has_ftype))
+            .ok_or(FsError::ArithmeticOverflow)?;
         let next = payload_end
             .checked_add(2)
-            .and_then(|n| n.checked_add(7))
+            .and_then(|value| value.checked_add(7))
             .ok_or(FsError::ArithmeticOverflow)?
             & !7;
         if next > end {
             return Err(FsError::Corrupted);
         }
+        let tag_offset = next.checked_sub(2).ok_or(FsError::Corrupted)?;
+        let expected_tag = u16::try_from(offset).map_err(|_| FsError::Corrupted)?;
+        let stored_tag = u16::from_be_bytes([block_data[tag_offset], block_data[tag_offset + 1]]);
+        if stored_tag != expected_tag {
+            return Err(FsError::Corrupted);
+        }
         offset = next;
+
+        // The VFS readdir contract excludes "." and ".." in every format,
+        // including block directories where XFS stores them physically.
+        if name == "." || name == ".." {
+            continue;
+        }
 
         entries.push(VfsDirEntry {
             name,
             ino: entry_ino,
             file_type,
-            offset: 0, // Will be set by caller
+            offset: 0, // Assigned by the caller.
         });
     }
 
     // Only zero padding may remain after the last entry/free record.
-    if offset < end && block_data[offset..end].iter().any(|&b| b != 0) {
+    if offset < end && block_data[offset..end].iter().any(|&byte| byte != 0) {
         return Err(FsError::Corrupted);
     }
 
@@ -442,12 +453,29 @@ mod tests {
         let mut end = offset + 9 + name.len();
         block[end] = ftype;
         end += 1;
-        (end + 2 + 7) & !7
+        let aligned_size = (end - offset + 2 + 7) & !7;
+        let next = offset + aligned_size;
+        block[next - 2..next].copy_from_slice(&(offset as u16).to_be_bytes());
+        next
     }
 
     fn write_free(block: &mut [u8], offset: usize, length: usize) {
         block[offset..offset + 2].copy_from_slice(&0xFFFFu16.to_be_bytes());
         block[offset + 2..offset + 4].copy_from_slice(&(length as u16).to_be_bytes());
+        if length >= 2
+            && offset
+                .checked_add(length)
+                .is_some_and(|end| end <= block.len())
+        {
+            let tag = offset + length - 2;
+            block[tag..tag + 2].copy_from_slice(&(offset as u16).to_be_bytes());
+        }
+    }
+
+    fn write_v3_crc(block: &mut [u8]) {
+        block[4..8].fill(0);
+        let crc = xfs_rs::crc::xfs_crc32c(block);
+        block[4..8].copy_from_slice(&crc.to_be_bytes());
     }
 
     #[test]
@@ -470,6 +498,9 @@ mod tests {
         let first_end = write_entry(&mut block, 16, 200, b"a", 1);
         write_free(&mut block, first_end, 16);
         let second = first_end + 16;
+        // Free-space payload is opaque; bytes that resemble an entry must be
+        // skipped according to the recorded length.
+        block[first_end + 4..second - 2].fill(0xAA);
         let second_end = write_entry(&mut block, second, 201, b"b", 2);
         let free_len = block.len() - second_end;
         write_free(&mut block, second_end, free_len);
@@ -499,8 +530,139 @@ mod tests {
 
     #[test]
     fn index_blocks_are_not_parsed_as_entries() {
+        for magic in [b"XD2L", b"XDL3", b"XD2F", b"XDF3"] {
+            let mut block = vec![0u8; 512];
+            block[0..4].copy_from_slice(magic);
+            if magic[3] == b'3' {
+                write_v3_crc(&mut block);
+            }
+            assert!(parse_directory_block(&block, true, 512).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn parser_does_not_scan_bytes_after_the_advertised_block() {
+        let mut block = empty_data_block();
+        let free_len = block.len() - 16;
+        write_free(&mut block, 16, free_len);
+        let appended = block.len();
+        block.resize(appended + 32, 0);
+        write_entry(&mut block, appended, 200, b"tail", 1);
+
+        assert!(parse_directory_block(&block, true, 512).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_free_record_lengths_are_corruption() {
+        for length in [0u16, 6, 9, 600] {
+            let mut block = empty_data_block();
+            write_free(&mut block, 16, length as usize);
+            assert!(matches!(
+                parse_directory_block(&block, true, 512),
+                Err(FsError::Corrupted)
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_free_record_end_tag_is_corruption() {
+        let mut block = empty_data_block();
+        write_free(&mut block, 16, 16);
+        block[30..32].copy_from_slice(&18u16.to_be_bytes()); // must equal 16
+        assert!(matches!(
+            parse_directory_block(&block, true, 512),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn invalid_allocated_entry_tag_is_corruption() {
+        let mut block = empty_data_block();
+        let next = write_entry(&mut block, 16, 200, b"abc", 1);
+        block[next - 2..next].copy_from_slice(&99u16.to_be_bytes());
+        assert!(matches!(
+            parse_directory_block(&block, true, 512),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn v3_single_block_stops_before_its_leaf_and_tail() {
         let mut block = vec![0u8; 512];
-        block[0..4].copy_from_slice(b"XD2L");
+        block[0..4].copy_from_slice(b"XDB3");
+        let next = write_entry(&mut block, 64, 200, b"v3", 2);
+        let tail = block.len() - 8;
+        let leaf_start = tail - 8;
+        write_free(&mut block, next, leaf_start - next);
+        block[tail..tail + 4].copy_from_slice(&1u32.to_be_bytes());
+        write_v3_crc(&mut block);
+
+        let entries = parse_directory_block(&block, true, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "v3");
+    }
+
+    #[test]
+    fn block_directory_dot_entries_are_not_exposed() {
+        let mut block = empty_data_block();
+        let mut offset = write_entry(&mut block, 16, 128, b".", 2);
+        offset = write_entry(&mut block, offset, 128, b"..", 2);
+        let end = write_entry(&mut block, offset, 200, b"file", 1);
+        let free_len = block.len() - end;
+        write_free(&mut block, end, free_len);
+
+        let entries = parse_directory_block(&block, true, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "file");
+        assert_eq!(entries[0].offset, 0);
+    }
+
+    #[test]
+    fn shortform_directory_does_not_synthesize_dot_entries() {
+        let mut data = vec![0u8; 6];
+        data[0] = 1; // one real entry
+        data[1] = 0; // 32-bit inode numbers
+        data[2..6].copy_from_slice(&128u32.to_be_bytes()); // parent
+
+        let name = b"file";
+        data.push(name.len() as u8);
+        data.extend_from_slice(&[0, 0]); // unused name offset
+        data.extend_from_slice(name);
+        data.extend_from_slice(&200u32.to_be_bytes());
+
+        let entries = parse_shortform_directory_entries(&data, false).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "file");
+        assert_eq!(entries[0].ino, 200);
+        assert_eq!(entries[0].offset, 0);
+    }
+
+    #[test]
+    fn v3_directory_block_crc_is_verified() {
+        let mut block = vec![0u8; 512];
+        block[0..4].copy_from_slice(b"XDD3");
+        let free_len = block.len() - 64;
+        write_free(&mut block, 64, free_len);
+        write_v3_crc(&mut block);
+        assert!(parse_directory_block(&block, true, 512).unwrap().is_empty());
+
+        block[100] ^= 1;
+        assert!(matches!(
+            parse_directory_block(&block, true, 512),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn v3_directory_block_accepts_xfsprogs_little_endian_crc() {
+        let mut block = vec![0u8; 512];
+        block[0..4].copy_from_slice(b"XDD3");
+        let free_len = block.len() - 64;
+        write_free(&mut block, 64, free_len);
+        block[4..8].fill(0);
+        let crc = xfs_rs::crc::xfs_crc32c(&block);
+        block[4..8].copy_from_slice(&crc.to_le_bytes());
+
         assert!(parse_directory_block(&block, true, 512).unwrap().is_empty());
     }
 

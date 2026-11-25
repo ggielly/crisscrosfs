@@ -13,7 +13,11 @@
 use std::sync::Arc;
 
 use xfs_rs::freespace::{
-    find_free_extent_by_size, read_leaf_records, write_leaf_records, AllocBtreeBlock, AllocRec,
+    find_free_extent_by_size,
+    read_leaf_records,
+    write_leaf_records,
+    AllocBtreeBlock,
+    AllocRec,
 };
 
 use crate::{
@@ -170,7 +174,8 @@ impl BlockAllocator {
                 }))
             }
             Ok(None) => {
-                // No suitable extent in this AG, this shouldn't happen if AGF is correct
+                // No suitable extent in this AG, this shouldn't happen if AGF
+                // is correct
                 Ok(None)
             }
             Err(e) => {

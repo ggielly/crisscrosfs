@@ -53,26 +53,18 @@
 //! xfs-mount service start
 //! ```
 
-pub mod allocator;
-pub mod cache;
 pub mod colored_log;
 pub mod context;
 pub mod disk;
 pub mod error;
 pub mod factory;
-pub mod file_context;
 pub mod log_colorizer;
 pub mod mount;
 pub mod path;
 pub mod security;
 pub mod service;
-pub mod transactional;
-pub mod volume;
 pub mod winfsp_mount;
 
 pub use error::{Result, XfsWinfspError};
-pub use file_context::FileContext;
 pub use mount::MountOptions;
 pub use path::{PathComponents, WidePathComponents};
-pub use transactional::TransactionalWriter;
-pub use volume::{MountedVolume, VolumeContext, VolumeStats};

@@ -2,34 +2,40 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install LLVM (libclang for bindgen)
-        run: choco install llvm -y --no-progress
-
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-
-      - name: Format
+      - name: Install LLVM
+        run: choco install llvm --yes
+      - name: Configure libclang
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+      - name: Build and test
+        run: cargo test --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Formatting
         run: cargo fmt --all -- --check
 
+  parser-vfs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+      - name: Test parser and VFS
+        run: cargo test -p fs-abstraction -p xfs-rs -p xfs-vfs --all-targets
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
-
-      - name: Tests
-        run: cargo test --workspace
-
-      - name: Parser tests with alloc/std features
-        run: cargo test -p xfs-rs --features std
+        run: cargo clippy -p fs-abstraction -p xfs-rs -p xfs-vfs --all-targets -- -D warnings
+      - name: Formatting
+        run: cargo fmt --all -- --check

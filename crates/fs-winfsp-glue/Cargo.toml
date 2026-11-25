@@ -19,7 +19,7 @@ xfs-vfs = { path = "../xfs-vfs" }
 
 # WinFsp bindings
 winfsp = { version = "0.12", features = ["debug"] }  # Safe Rust bindings for WinFsp with debug output
-winfsp-sys = "0.2"           # Raw FFI bindings
+winfsp-sys = "0.12"          # Keep FFI types on the same WinFsp 2.1 version as the safe bindings
 
 # Windows APIs
 windows = { version = "0.58", features = [
@@ -28,19 +28,16 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Services",
     "Win32_System_Console",
     "Win32_System_Threading",
 ] }
 
 # Error handling & logging
-anyhow = "1.0"
-thiserror = "2.0"
+thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Async runtime (optionnel, pour le service)
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -48,7 +45,7 @@ ctrlc = "3.2"
 
 # Serialization for config
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

@@ -12,7 +12,7 @@ use fs_abstraction::{FsError, FsResult};
 
 use crate::{
     constants::*,
-    directory::{parse_shortform_directory, DirFileType, ShortformHeader},
+    directory::{DirFileType, ShortformHeader},
 };
 
 /// Maximum entries in a shortform directory before conversion to block format.
@@ -134,7 +134,8 @@ pub fn add_shortform_entry(
         ShortformHeader::SIZE_4
     };
 
-    // If we transition 32 -> 64, we need to account for existing entries growing
+    // If we transition 32 -> 64, we need to account for existing entries
+    // growing
     let mut total_size = header_size + entry_size;
     if target_is_64 && !current_is_64 && current_data.len() >= 6 {
         let (_, iter) = crate::directory::parse_shortform_directory(current_data, has_ftype)?;
@@ -166,8 +167,9 @@ pub fn add_shortform_entry(
         // We are moving to 64-bit but this entry is small.
         // If parent was the reason, i8count should be initialized or handled.
         // In XFS, i8count is purely for ENTRIES.
-        // If no entries are 64-bit but parent is, i8count is still 1? No, let's check.
-        // Actually, let's just make sure i8count > 0 if we need 64-bit parent.
+        // If no entries are 64-bit but parent is, i8count is still 1? No, let's
+        // check. Actually, let's just make sure i8count > 0 if we need 64-bit
+        // parent.
         if header.i8count == 0 && target_is_64 {
             header.i8count = 1; // Signal 64-bit format
         }
@@ -210,34 +212,6 @@ pub fn add_shortform_entry(
     Ok(new_data)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::directory::DirFileType;
-
-    #[test]
-    fn test_add_shortform_entry_empty() {
-        let entry = NewDirEntry::new(b"test", 123, DirFileType::RegularFile);
-        let result = add_shortform_entry(&[], &entry, 456, true, 256).unwrap();
-
-        let header = ShortformHeader::parse(&result).unwrap();
-        assert_eq!(header.count, 1);
-        assert_eq!(header.parent, 456);
-        assert_eq!(header.i8count, 0); // Both fit in 32-bit
-    }
-
-    #[test]
-    fn test_add_shortform_entry_64bit() {
-        let entry = NewDirEntry::new(b"test", 0x1_0000_0000, DirFileType::RegularFile);
-        let result = add_shortform_entry(&[], &entry, 456, true, 256).unwrap();
-
-        let header = ShortformHeader::parse(&result).unwrap();
-        assert_eq!(header.count, 1);
-        assert_eq!(header.i8count, 1);
-        assert_eq!(header.parent, 456);
-    }
-}
-
 /// Remove an entry from a shortform directory by name.
 pub fn remove_shortform_entry(
     current_data: &[u8],
@@ -273,6 +247,13 @@ pub fn remove_shortform_entry(
 
         let name_len = current_data[offset] as usize;
         offset += 1;
+        if name_len == 0
+            || offset
+                .checked_add(2)
+                .is_none_or(|end| end > current_data.len())
+        {
+            return Err(FsError::Corrupted);
+        }
 
         // Read original offset cookie (we'll ignore and regenerate)
         let _original_offset = u16::from_be_bytes([current_data[offset], current_data[offset + 1]]);
@@ -410,7 +391,8 @@ pub struct BlockDirFree {
 impl BlockDirFree {
     /// Minimum usable free space (for smallest possible entry).
     pub const MIN_USEFUL: u16 = 16;
-    pub const SIZE: usize = 4; // 8 + 1 + 1 + 2 = 12, aligned to 16
+    pub const SIZE: usize = 8; // freetag(2) + length(2) + padding + final
+                               // tag(2)
 }
 
 /// Parse a block directory and return entries and free spaces.
@@ -429,64 +411,175 @@ pub fn parse_block_directory(
     }
 
     let is_v5 = magic == XFS_DIR3_BLOCK_MAGIC || magic == XFS_DIR3_DATA_MAGIC;
+    let is_block = magic == XFS_DIR2_BLOCK_MAGIC || magic == XFS_DIR3_BLOCK_MAGIC;
     let header_size = if is_v5 { 64 } else { 16 };
+    if data.len() < header_size {
+        return Err(FsError::BufferTooSmall);
+    }
+
+    // Only the single-block format has a tail containing leaf pointers. Data
+    // blocks use their entire length for entries and free-space records.
+    let end = if is_block {
+        let tail_offset = data.len().checked_sub(8).ok_or(FsError::Corrupted)?;
+        if tail_offset < header_size {
+            return Err(FsError::Corrupted);
+        }
+        let leaf_count = u32::from_be_bytes(
+            data[tail_offset..tail_offset + 4]
+                .try_into()
+                .map_err(|_| FsError::Corrupted)?,
+        ) as usize;
+        let leaf_bytes = leaf_count
+            .checked_mul(8)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        tail_offset
+            .checked_sub(leaf_bytes)
+            .filter(|start| *start >= header_size)
+            .ok_or(FsError::Corrupted)?
+    } else {
+        data.len()
+    };
+
     let mut entries = Vec::new();
     let mut frees = Vec::new();
-
     let mut offset = header_size;
 
-    while offset + 8 < data.len() - 8 {
-        // Leave room for tail
-        // Check for unused entry (freetag = 0xFFFF)
+    while offset < end {
+        let remaining = end.checked_sub(offset).ok_or(FsError::Corrupted)?;
+        if remaining < 4 {
+            return Err(FsError::Corrupted);
+        }
         let freetag = u16::from_be_bytes([data[offset], data[offset + 1]]);
 
         if freetag == 0xFFFF {
-            // Free space entry
-            let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            let next = offset
+                .checked_add(length)
+                .ok_or(FsError::ArithmeticOverflow)?;
+            if length < 8 || length % 8 != 0 || next > end {
+                return Err(FsError::Corrupted);
+            }
+            let tag_offset = next.checked_sub(2).ok_or(FsError::Corrupted)?;
+            let stored_tag = u16::from_be_bytes([data[tag_offset], data[tag_offset + 1]]);
+            if stored_tag != offset as u16 {
+                return Err(FsError::Corrupted);
+            }
             frees.push(BlockDirFree {
                 offset: offset as u16,
-                length,
+                length: length as u16,
             });
-            offset += length as usize;
-        } else {
-            // Data entry
-            let inode = u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap());
-            let name_len = data[offset + 8] as usize;
-
-            if offset + 9 + name_len > data.len() {
-                break;
-            }
-
-            let name = data[offset + 9..offset + 9 + name_len].to_vec();
-
-            let file_type = if has_ftype && offset + 9 + name_len < data.len() {
-                DirFileType::from(data[offset + 9 + name_len])
-            } else {
-                DirFileType::Unknown
-            };
-
-            let entry_size = 8 + 1 + name_len + if has_ftype { 1 } else { 0 } + 2;
-            let aligned_size = (entry_size + 7) & !7;
-
-            // Tag is at end of aligned entry
-            let tag_offset = offset + aligned_size - 2;
-            let tag = if tag_offset + 2 <= data.len() {
-                u16::from_be_bytes([data[tag_offset], data[tag_offset + 1]])
-            } else {
-                offset as u16
-            };
-
-            entries.push(BlockDirEntry {
-                inode,
-                name_len: name_len as u8,
-                name,
-                file_type,
-                tag,
-            });
-
-            offset += aligned_size;
+            offset = next;
+            continue;
         }
+
+        if remaining < 9 {
+            return Err(FsError::Corrupted);
+        }
+        let inode = u64::from_be_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| FsError::Corrupted)?,
+        );
+        let name_len = data[offset + 8] as usize;
+        if name_len == 0 || name_len > 255 {
+            return Err(FsError::Corrupted);
+        }
+
+        let entry_size = 8 + 1 + name_len + if has_ftype { 1 } else { 0 } + 2;
+        let aligned_size = (entry_size + 7) & !7;
+        if aligned_size > remaining {
+            return Err(FsError::Corrupted);
+        }
+
+        let name_start = offset + 9;
+        let name_end = name_start.checked_add(name_len).ok_or(FsError::Corrupted)?;
+        let name = data[name_start..name_end].to_vec();
+        let file_type = if has_ftype {
+            DirFileType::from(data[name_end])
+        } else {
+            DirFileType::Unknown
+        };
+
+        let tag_offset = offset
+            .checked_add(aligned_size)
+            .and_then(|end| end.checked_sub(2))
+            .ok_or(FsError::Corrupted)?;
+        let tag = u16::from_be_bytes([data[tag_offset], data[tag_offset + 1]]);
+        if tag != offset as u16 {
+            return Err(FsError::Corrupted);
+        }
+
+        entries.push(BlockDirEntry {
+            inode,
+            name_len: name_len as u8,
+            name,
+            file_type,
+            tag,
+        });
+        offset += aligned_size;
     }
 
     Ok((entries, frees))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::DirFileType;
+
+    #[test]
+    fn test_add_shortform_entry_empty() {
+        let entry = NewDirEntry::new(b"test", 123, DirFileType::RegularFile);
+        let result = add_shortform_entry(&[], &entry, 456, true, 256).unwrap();
+
+        let header = ShortformHeader::parse(&result).unwrap();
+        assert_eq!(header.count, 1);
+        assert_eq!(header.parent, 456);
+        assert_eq!(header.i8count, 0); // Both fit in 32-bit
+    }
+
+    #[test]
+    fn test_add_shortform_entry_64bit() {
+        let entry = NewDirEntry::new(b"test", 0x1_0000_0000, DirFileType::RegularFile);
+        let result = add_shortform_entry(&[], &entry, 456, true, 256).unwrap();
+
+        let header = ShortformHeader::parse(&result).unwrap();
+        assert_eq!(header.count, 1);
+        assert_eq!(header.i8count, 1);
+        assert_eq!(header.parent, 456);
+    }
+
+    #[test]
+    fn block_directory_rejects_zero_length_free_record() {
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&XFS_DIR2_DATA_MAGIC.to_be_bytes());
+        data[16..18].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        data[18..20].copy_from_slice(&0u16.to_be_bytes());
+        assert!(matches!(
+            parse_block_directory(&data, false),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn block_directory_rejects_invalid_free_record_tag() {
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&XFS_DIR2_DATA_MAGIC.to_be_bytes());
+        data[16..18].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        data[18..20].copy_from_slice(&8u16.to_be_bytes());
+        data[22..24].copy_from_slice(&99u16.to_be_bytes());
+        assert!(matches!(
+            parse_block_directory(&data, false),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn truncated_shortform_entry_returns_error_instead_of_panicking() {
+        let data = [1, 0, 0, 0, 0, 1, 1];
+        assert!(matches!(
+            remove_shortform_entry(&data, b"x", false),
+            Err(FsError::Corrupted)
+        ));
+    }
 }

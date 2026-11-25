@@ -190,8 +190,17 @@ impl InodeCore {
         }
 
         let magic = buffer.read_be_u16(0x00)?;
+        if magic != XFS_DINODE_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
         let mode = buffer.read_be_u16(0x02)?;
         let version = buffer[0x04];
+        if version != 1 && version != 2 && version != 3 {
+            return Err(FsError::UnsupportedVersion);
+        }
+        if version == 3 && buffer.len() < Self::V3_SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
         let format = InodeFormat::from_u8(buffer[0x05])?;
         let onlink = buffer.read_be_u16(0x06)?;
         let uid = buffer.read_be_u32(0x08)?;
@@ -208,33 +217,47 @@ impl InodeCore {
         let ctime_sec = buffer.read_be_u32(0x30)?;
         let ctime_nsec = buffer.read_be_u32(0x34)?;
         let size = buffer.read_be_u64(0x38)?; // Fixed: was 0x3A, should be 0x38
-        let nblocks = buffer.read_be_u64(0x40)?; // Fixed: was 0x42, should be 0x40
-        let extsize = buffer.read_be_u32(0x48)?; // Fixed: was 0x4A, should be 0x48
-        let nextents = buffer.read_be_u32(0x4C)?; // Fixed: was 0x4E, should be 0x4C
-        let anextents = buffer.read_be_u16(0x50)?; // Fixed: was 0x52, should be 0x50
+        let nblocks = buffer.read_be_u64(0x40)?; // Fixed: was 0x42, should be
+                                                 // 0x40
+        let extsize = buffer.read_be_u32(0x48)?; // Fixed: was 0x4A, should be
+                                                 // 0x48
+        let nextents = buffer.read_be_u32(0x4C)?; // Fixed: was 0x4E, should be
+                                                  // 0x4C
+        let anextents = buffer.read_be_u16(0x50)?; // Fixed: was 0x52, should be
+                                                   // 0x50
         let forkoff = buffer[0x52]; // Fixed: was 0x54, should be 0x52
         let aformat = buffer[0x53]; // Fixed: was 0x55, should be 0x53
-        let dmevmask = buffer.read_be_u32(0x54)?; // Fixed: was 0x56, should be 0x54
-        let dmstate = buffer.read_be_u16(0x58)?; // Fixed: was 0x5A, should be 0x58
-        let flags = buffer.read_be_u16(0x5A)?; // Fixed: was 0x5C, should be 0x5A
+        let dmevmask = buffer.read_be_u32(0x54)?; // Fixed: was 0x56, should be
+                                                  // 0x54
+        let dmstate = buffer.read_be_u16(0x58)?; // Fixed: was 0x5A, should be
+                                                 // 0x58
+        let flags = buffer.read_be_u16(0x5A)?; // Fixed: was 0x5C, should be
+                                               // 0x5A
         let gen = buffer.read_be_u32(0x5C)?; // Fixed: was 0x5E, should be 0x5C
-        let next_unlinked = buffer.read_be_u32(0x60)?; // Fixed: was 0x62, should be 0x60
+        let next_unlinked = buffer.read_be_u32(0x60)?; // Fixed: was 0x62,
+                                                       // should be 0x60
 
-        // V3 fields (if magic is present and version is 3)
+        // V3 fields (the version and minimum size were checked above).
         let (crc, changecount, lsn, flags2, cowextsize, crtime_sec, crtime_nsec, ino, uuid) =
-            if version >= 3 && buffer.len() >= Self::V3_SIZE && magic == XFS_DINODE_MAGIC {
+            if version == 3 {
                 // di_crc is a little-endian __le32 in XFS v5.
                 let crc = buffer.read_le_u32(0x64)?;
-                let changecount = buffer.read_be_u64(0x68)?; // Fixed: was 0x6A, should be 0x68
-                let lsn = buffer.read_be_u64(0x70)?; // Fixed: was 0x72, should be 0x70
-                let flags2 = buffer.read_be_u64(0x78)?; // Fixed: was 0x7A, should be 0x78
+                let changecount = buffer.read_be_u64(0x68)?; // Fixed: was 0x6A,
+                                                             // should be 0x68
+                let lsn = buffer.read_be_u64(0x70)?; // Fixed: was 0x72, should
+                                                     // be 0x70
+                let flags2 = buffer.read_be_u64(0x78)?; // Fixed: was 0x7A,
+                                                        // should be 0x78
                 let cowextsize = buffer.read_be_u32(0x80)?;
                 // 12 bytes padding
                 let crtime_sec = buffer.read_be_u32(0x90)?;
                 let crtime_nsec = buffer.read_be_u32(0x94)?;
-                let ino = buffer.read_be_u64(0x98)?; // Fixed: was 0x9A, should be 0x98
+                let ino = buffer.read_be_u64(0x98)?; // Fixed: was 0x9A, should
+                                                     // be 0x98
                 let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&buffer[0xA0..0xB0]); // Fixed: was 0xA2..0xB2, should be 0xA0..0xB0
+                uuid.copy_from_slice(&buffer[0xA0..0xB0]); // Fixed: was
+                                                           // 0xA2..0xB2, should
+                                                           // be 0xA0..0xB0
                 (
                     crc,
                     changecount,
@@ -292,24 +315,34 @@ impl InodeCore {
     }
 
     /// Converts an XFS timestamp to Unix (seconds, nanoseconds).
-    /// Handles Bigtime and v3 epoch extension.
+    ///
+    /// Classical timestamps store a signed 34-bit second count: the low 32
+    /// bits are in `sec`, and the top two bits of `nsec` are bits 32-33.  The
+    /// remaining 30 bits of `nsec` are the nanosecond fraction.
+    ///
+    /// Bigtime timestamps instead store an unsigned 64-bit nanosecond count
+    /// from 1901-12-13.  Dividing before subtracting the epoch offset avoids
+    /// an overflowing `u64 as i64` conversion for counters with the high bit
+    /// set.
     pub fn timestamp_to_unix(sec: u32, nsec: u32, has_bigtime: bool) -> (i64, u32) {
         if has_bigtime {
-            // In Bigtime format, the timestamp is a 64-bit nanosecond counter
-            // since the XFS epoch (1901-01-01 00:00:00).
+            const NSEC_PER_SEC: u64 = 1_000_000_000;
             let xfs_ns = ((sec as u64) << 32) | (nsec as u64);
-            let unix_ns = xfs_ns as i64 - (XFS_BIGTIME_EPOCH_OFFSET * 1_000_000_000);
-
-            let unix_sec = unix_ns / 1_000_000_000;
-            let unix_nsec = (unix_ns % 1_000_000_000) as u32;
-            (unix_sec, unix_nsec)
+            let xfs_sec = xfs_ns / NSEC_PER_SEC;
+            let unix_nsec = (xfs_ns % NSEC_PER_SEC) as u32;
+            (xfs_sec as i64 - XFS_BIGTIME_EPOCH_OFFSET, unix_nsec)
         } else {
-            // Classical v3 epoch extension
-            // Top 2 bits of nsec are bits 32 and 33 of the seconds field
-            let epoch_ext = (nsec >> 30) as u64;
-            let unix_sec = (sec as i64) | ((epoch_ext << 32) as i64);
-            let unix_nsec = nsec & 0x3FFFFFFF;
-            (unix_sec, unix_nsec)
+            const SECOND_BITS: u32 = 34;
+            let raw_seconds = u64::from(sec) | (u64::from(nsec >> 30) << 32);
+            let unix_seconds = if raw_seconds & (1u64 << (SECOND_BITS - 1)) != 0 {
+                // The raw value is at most 2^34-1 and therefore fits in i64;
+                // subtracting 2^34 performs explicit two's-complement sign
+                // extension without a wrapping cast.
+                raw_seconds as i64 - (1i64 << SECOND_BITS)
+            } else {
+                raw_seconds as i64
+            };
+            (unix_seconds, nsec & 0x3FFF_FFFF)
         }
     }
 
@@ -330,7 +363,7 @@ impl InodeCore {
 
     /// Returns the creation time as (seconds, nanoseconds) (v3 inodes only).
     pub fn crtime(&self, has_bigtime: bool) -> (i64, u32) {
-        if self.version >= 3 {
+        if self.version == 3 {
             Self::timestamp_to_unix(self.crtime_sec, self.crtime_nsec, has_bigtime)
         } else {
             // For v2 inodes, use ctime
@@ -360,7 +393,7 @@ impl InodeCore {
 
     /// Returns the data fork offset from the start of the inode.
     pub fn data_fork_offset(&self) -> usize {
-        if self.version >= 3 {
+        if self.version == 3 {
             Self::V3_SIZE
         } else {
             Self::V2_SIZE
@@ -380,8 +413,10 @@ impl InodeCore {
     /// Returns the size of the data fork.
     pub fn data_fork_size(&self, _inode_size: usize) -> usize {
         if self.forkoff == 0 {
-            // No attr fork, data extends to end of inode
-            _inode_size - self.data_fork_offset()
+            // No attr fork, data extends to end of inode.  Saturating here
+            // keeps this public query panic-free for invalid caller-supplied
+            // geometry; `Inode::parse` performs the strict validation.
+            _inode_size.saturating_sub(self.data_fork_offset())
         } else {
             (self.forkoff as usize) * 8
         }
@@ -398,7 +433,7 @@ impl InodeCore {
     /// Returns either V2_SIZE or V3_SIZE bytes depending on version.
     #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> alloc::vec::Vec<u8> {
-        let size = if self.version >= 3 {
+        let size = if self.version == 3 {
             Self::V3_SIZE
         } else {
             Self::V2_SIZE
@@ -438,7 +473,7 @@ impl InodeCore {
         buf[0x60..0x64].copy_from_slice(&self.next_unlinked.to_be_bytes());
 
         // Write v3 fields
-        if self.version >= 3 {
+        if self.version == 3 {
             buf[0x64..0x68].copy_from_slice(&self.crc.to_le_bytes());
             buf[0x68..0x70].copy_from_slice(&self.changecount.to_be_bytes());
             buf[0x70..0x78].copy_from_slice(&self.lsn.to_be_bytes());
@@ -493,22 +528,39 @@ pub enum DataFork {
 impl Inode {
     /// Parses a full inode from a byte buffer.
     pub fn parse(buffer: &[u8], inode_size: usize) -> FsResult<Self> {
+        if !(XFS_MIN_INODE_SIZE..=XFS_MAX_INODE_SIZE).contains(&inode_size)
+            || !inode_size.is_power_of_two()
+        {
+            return Err(FsError::Corrupted);
+        }
         if buffer.len() < inode_size {
             return Err(FsError::BufferTooSmall);
         }
 
-        let core = InodeCore::parse(buffer)?;
+        let core = InodeCore::parse(&buffer[..inode_size])?;
         let data_fork_offset = core.data_fork_offset();
-        let data_fork_size = core.data_fork_size(inode_size);
-
-        if data_fork_offset + data_fork_size > buffer.len() {
-            return Err(FsError::BufferTooSmall);
+        let literal_size = inode_size
+            .checked_sub(data_fork_offset)
+            .ok_or(FsError::Corrupted)?;
+        let data_fork_size = if core.forkoff == 0 {
+            literal_size
+        } else {
+            usize::from(core.forkoff) * 8
+        };
+        if data_fork_size > literal_size {
+            return Err(FsError::Corrupted);
         }
 
-        let data_fork_raw = &buffer[data_fork_offset..data_fork_offset + data_fork_size];
+        let data_fork_end = data_fork_offset
+            .checked_add(data_fork_size)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let data_fork_raw = &buffer[data_fork_offset..data_fork_end];
 
         let data_fork = match core.format {
             InodeFormat::Device => {
+                if data_fork_size < 4 {
+                    return Err(FsError::Corrupted);
+                }
                 let dev = buffer.read_be_u32(data_fork_offset)?;
                 DataFork::Device {
                     major: (dev >> 8) & 0xFF,
@@ -516,7 +568,10 @@ impl Inode {
                 }
             }
             InodeFormat::Local => {
-                let len = (core.size as usize).min(data_fork_size);
+                let len = usize::try_from(core.size).map_err(|_| FsError::Corrupted)?;
+                if len > data_fork_size {
+                    return Err(FsError::Corrupted);
+                }
                 #[cfg(feature = "alloc")]
                 {
                     DataFork::Local(alloc::vec::Vec::from(&data_fork_raw[..len]))
@@ -533,15 +588,16 @@ impl Inode {
                 }
             }
             InodeFormat::Extents => {
+                let max_extents = data_fork_size / crate::extent::Extent::SIZE;
+                if core.nextents as usize > max_extents {
+                    return Err(FsError::Corrupted);
+                }
                 #[cfg(feature = "alloc")]
                 {
-                    use crate::extent::{Extent, ExtentIter};
-                    // Limit number of extents to what can fit in the data fork
-                    // Each extent is 16 bytes
-                    let max_extents = data_fork_size / Extent::SIZE;
-                    let actual_extents = (core.nextents as usize).min(max_extents);
+                    use crate::extent::ExtentIter;
+                    let actual_extents = core.nextents as usize;
                     let mut extents = alloc::vec::Vec::with_capacity(actual_extents);
-                    let iter = ExtentIter::new(data_fork_raw, actual_extents as u32);
+                    let iter = ExtentIter::new(data_fork_raw, core.nextents);
                     for res in iter {
                         extents.push(res?);
                     }
@@ -555,8 +611,17 @@ impl Inode {
                 }
             }
             InodeFormat::Btree => {
+                if data_fork_size < crate::btree::BmbtRoot::HEADER_SIZE {
+                    return Err(FsError::Corrupted);
+                }
                 let level = buffer.read_be_u16(data_fork_offset)?;
                 let num_recs = buffer.read_be_u16(data_fork_offset + 2)?;
+                let root_data_size = data_fork_size - crate::btree::BmbtRoot::HEADER_SIZE;
+                let max_recs =
+                    root_data_size / (crate::btree::BmbtKey::SIZE + crate::btree::BmbtPtr::SIZE);
+                if level == 0 || num_recs as usize > max_recs {
+                    return Err(FsError::Corrupted);
+                }
                 #[cfg(feature = "alloc")]
                 {
                     DataFork::Btree {
@@ -580,22 +645,23 @@ impl Inode {
     ///
     /// `raw` is the full on-disk inode buffer of `inode_size` bytes.  The CRC
     /// covers the whole inode with the `di_crc` field zeroed.
-    #[cfg(feature = "alloc")]
     pub fn verify_crc(&self, raw: &[u8], inode_size: usize) -> FsResult<()> {
-        if self.core.version < 3 {
+        if self.core.version != 3 {
             return Ok(());
         }
-        if raw.len() < inode_size || inode_size < 0x68 {
+        if self.core.magic != XFS_DINODE_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
+        if !(XFS_MIN_INODE_SIZE..=XFS_MAX_INODE_SIZE).contains(&inode_size)
+            || !inode_size.is_power_of_two()
+        {
+            return Err(FsError::Corrupted);
+        }
+        if raw.len() < inode_size {
             return Err(FsError::BufferTooSmall);
         }
 
-        let mut copy = alloc::vec::Vec::from(&raw[..inode_size]);
-        copy[0x64..0x68].fill(0);
-        let calculated = crate::crc::xfs_crc32c(&copy);
-        if calculated != self.core.crc {
-            return Err(FsError::Corrupted);
-        }
-        Ok(())
+        crate::crc::verify_crc32c_field(&raw[..inode_size], 0x64, self.core.crc, true)
     }
 
     /// Returns `true` if data is inline in the inode.
@@ -654,9 +720,9 @@ impl Inode {
             InodeFormat::Extents | InodeFormat::Btree => {
                 let extents = self.collect_extents(reader, is_v5)?;
                 for extent in extents {
-                    // Only search DATA blocks (ignoring leaf/free blocks for now as we don't use
-                    // hash lookup yet) XFS directory data blocks are at logical
-                    // offsets < 32GB
+                    // Only search DATA blocks (ignoring leaf/free blocks for
+                    // now as we don't use hash lookup yet) XFS directory data
+                    // blocks are at logical offsets < 32GB
                     if extent.file_offset >= (1 << (31 - 9)) {
                         continue;
                     }
@@ -670,9 +736,24 @@ impl Inode {
                             let is_block_format = magic == crate::constants::XFS_DIR2_BLOCK_MAGIC
                                 || magic == crate::constants::XFS_DIR3_BLOCK_MAGIC;
 
-                            let res = crate::directory::find_entry_block(
-                                &buffer, name, block_size, has_ftype, is_v5,
-                            );
+                            let res = if is_block_format {
+                                crate::directory::find_entry_block(
+                                    &buffer, name, block_size, has_ftype, is_v5,
+                                )
+                            } else {
+                                crate::directory::parse_data_block(
+                                    &buffer, has_ftype, is_v5, false, block_size,
+                                )
+                                .and_then(|iter| {
+                                    for entry in iter {
+                                        let entry = entry?;
+                                        if entry.name_bytes() == name {
+                                            return Ok(entry);
+                                        }
+                                    }
+                                    Err(FsError::NotFound)
+                                })
+                            };
 
                             if let Ok(entry) = res {
                                 return Ok(entry.inode);
@@ -704,7 +785,8 @@ impl Inode {
             }
             #[cfg(feature = "alloc")]
             DataFork::Btree { .. } => {
-                // B+Tree requires external block reading - use map_block_btree instead
+                // B+Tree requires external block reading - use map_block_btree
+                // instead
                 Err(FsError::NotImplemented)
             }
             _ => Err(FsError::NotImplemented),
@@ -808,7 +890,7 @@ impl Inode {
 mod tests {
     use super::*;
     extern crate alloc;
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn v3_inode_crc_verification() {
@@ -837,8 +919,10 @@ mod tests {
         // Set magic number
         buffer[0..2].copy_from_slice(&XFS_DINODE_MAGIC.to_be_bytes());
         // Set mode to regular file
-        buffer[2..4].copy_from_slice(&0x81A4u16.to_be_bytes()); // Regular file with permissions
-                                                                // Set version to 2
+        buffer[2..4].copy_from_slice(&0x81A4u16.to_be_bytes()); // Regular file
+                                                                // with permissions
+                                                                // Set version
+                                                                // to 2
         buffer[4] = 2;
         // Set format to local
         buffer[5] = XFS_DINODE_FMT_LOCAL;
@@ -918,15 +1002,95 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_to_unix_v3_extension() {
-        // Test epoch extension: sec = 1, nsec = (3 << 30) | 123
-        let sec = 1;
-        let nsec = (3 << 30) | 123;
-
-        let (u_sec, u_nsec) = InodeCore::timestamp_to_unix(sec, nsec, false);
-
-        // sec = 1 | (3 << 32) = 1 + 12884901888 = 12884901889
-        assert_eq!(u_sec, 12884901889);
+    fn test_timestamp_to_unix_legacy_sign_extension() {
+        // Pre-1970 values use epoch bits 3 to sign-extend bit 31.
+        let (u_sec, u_nsec) = InodeCore::timestamp_to_unix(0x8000_0000, (3 << 30) | 123, false);
+        assert_eq!(u_sec, -2_147_483_648);
         assert_eq!(u_nsec, 123);
+
+        let (u_sec, u_nsec) =
+            InodeCore::timestamp_to_unix(0xFFFF_FFFF, (3 << 30) | 999_999_999, false);
+        assert_eq!(u_sec, -1);
+        assert_eq!(u_nsec, 999_999_999);
+
+        // Epoch bit 32 extends the range beyond 2038.
+        let (u_sec, u_nsec) = InodeCore::timestamp_to_unix(1, (1 << 30) | 456, false);
+        assert_eq!(u_sec, 4_294_967_297);
+        assert_eq!(u_nsec, 456);
+    }
+
+    #[test]
+    fn test_timestamp_to_unix_legacy_bounds() {
+        // Maximum positive signed 34-bit second count.
+        assert_eq!(
+            InodeCore::timestamp_to_unix(u32::MAX, (1 << 30) | 999_999_999, false),
+            (8_589_934_591, 999_999_999)
+        );
+        // Minimum negative signed 34-bit second count.
+        assert_eq!(
+            InodeCore::timestamp_to_unix(0, 2 << 30, false),
+            (-8_589_934_592, 0)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_to_unix_bigtime_does_not_wrap() {
+        assert_eq!(
+            InodeCore::timestamp_to_unix(0, 0, true),
+            (-2_147_483_648, 0)
+        );
+        assert_eq!(
+            InodeCore::timestamp_to_unix(u32::MAX, u32::MAX, true),
+            (16_299_260_425, 709_551_615)
+        );
+    }
+
+    fn minimal_inode(version: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; 256];
+        buf[0..2].copy_from_slice(&XFS_DINODE_MAGIC.to_be_bytes());
+        buf[2..4].copy_from_slice(&0x81A4u16.to_be_bytes());
+        buf[4] = version;
+        buf[5] = XFS_DINODE_FMT_LOCAL;
+        buf
+    }
+
+    #[test]
+    fn inode_magic_and_version_are_validated() {
+        let mut buf = minimal_inode(2);
+        buf[0..2].copy_from_slice(&0u16.to_be_bytes());
+        assert!(matches!(InodeCore::parse(&buf), Err(FsError::InvalidMagic)));
+
+        let buf = minimal_inode(4);
+        assert!(matches!(
+            InodeCore::parse(&buf),
+            Err(FsError::UnsupportedVersion)
+        ));
+
+        let buf = minimal_inode(3);
+        assert!(matches!(
+            InodeCore::parse(&buf[..InodeCore::V2_SIZE]),
+            Err(FsError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn inode_rejects_out_of_bounds_forks_and_counts() {
+        let mut buf = minimal_inode(3);
+        buf[0x52] = 11; // 88-byte data fork, but only 80 literal bytes remain.
+        assert!(matches!(Inode::parse(&buf, 256), Err(FsError::Corrupted)));
+
+        let mut buf = minimal_inode(3);
+        buf[0x38..0x40].copy_from_slice(&81u64.to_be_bytes());
+        assert!(matches!(Inode::parse(&buf, 256), Err(FsError::Corrupted)));
+
+        let mut buf = minimal_inode(3);
+        buf[5] = XFS_DINODE_FMT_EXTENTS;
+        buf[0x4C..0x50].copy_from_slice(&6u32.to_be_bytes()); // capacity is 5.
+        assert!(matches!(Inode::parse(&buf, 256), Err(FsError::Corrupted)));
+
+        let mut buf = minimal_inode(3);
+        buf[5] = XFS_DINODE_FMT_BTREE;
+        buf[InodeCore::V3_SIZE + 2..InodeCore::V3_SIZE + 4].copy_from_slice(&5u16.to_be_bytes()); // root capacity is 4.
+        assert!(matches!(Inode::parse(&buf, 256), Err(FsError::Corrupted)));
     }
 }

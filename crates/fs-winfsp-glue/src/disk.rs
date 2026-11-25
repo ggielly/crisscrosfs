@@ -17,14 +17,46 @@ use windows::{
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            CreateFileW, FlushFileBuffers, ReadFile, SetFilePointerEx, WriteFile, FILE_BEGIN,
-            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING,
+            CreateFileW,
+            FlushFileBuffers,
+            ReadFile,
+            SetFilePointerEx,
+            WriteFile,
+            FILE_BEGIN,
+            FILE_FLAGS_AND_ATTRIBUTES,
+            FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE,
+            FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+            OPEN_EXISTING,
         },
     },
 };
 
 use crate::error::{Result, XfsWinfspError};
+
+fn checked_sector_size(sector_size: u32) -> Result<u64> {
+    if !(512..=65_536).contains(&sector_size) || !sector_size.is_power_of_two() {
+        return Err(XfsWinfspError::InvalidArgument(format!(
+            "Invalid logical sector size: {sector_size}"
+        )));
+    }
+    Ok(u64::from(sector_size))
+}
+
+fn validate_raw_io_args(offset: u64, len: usize) -> Result<()> {
+    if offset > i64::MAX as u64 {
+        return Err(XfsWinfspError::InvalidArgument(
+            "Disk offset exceeds the Win32 signed range".to_string(),
+        ));
+    }
+    if len > u32::MAX as usize {
+        return Err(XfsWinfspError::InvalidArgument(
+            "Win32 I/O buffer exceeds the u32 length range".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Trait for reading raw disk/image data.
 pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
@@ -47,21 +79,54 @@ pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
     /// This method handles unaligned reads by reading aligned sectors
     /// and extracting the requested portion.
     fn read_unaligned(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let sector = self.get_sector_size() as u64;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let sector = checked_sector_size(self.get_sector_size())?;
+        let sector_usize = usize::try_from(sector).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Logical sector size does not fit usize".to_string())
+        })?;
 
-        // Calculate aligned offset and size
+        // Calculate the aligned range with checked arithmetic. Buffered Win32
+        // I/O does not require this alignment, but keeping one aligned range
+        // avoids read/modify/write races in the default writer implementation.
         let aligned_offset = offset & !(sector - 1);
-        let offset_in_sector = (offset - aligned_offset) as usize;
-        let aligned_size =
-            ((offset_in_sector + size + sector as usize - 1) / sector as usize) * sector as usize;
+        let offset_in_sector = usize::try_from(offset - aligned_offset).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Sector offset does not fit usize".to_string())
+        })?;
+        let requested_end = offset_in_sector.checked_add(size).ok_or_else(|| {
+            XfsWinfspError::InvalidArgument("Unaligned read size overflow".to_string())
+        })?;
+        let aligned_size_u64 = requested_end
+            .checked_add(sector_usize - 1)
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("Aligned read size overflow".into()))?
+            as u64
+            / sector
+            * sector;
+        aligned_offset
+            .checked_add(aligned_size_u64)
+            .ok_or_else(|| {
+                XfsWinfspError::InvalidArgument("Aligned read offset overflow".into())
+            })?;
 
-        // Allocate aligned buffer
-        let mut aligned_buffer = vec![0u8; aligned_size];
-
-        // Read aligned data
+        // Do not allocate beyond a known device size. A short read at EOF is
+        // still returned as the available prefix, preserving Read semantics.
+        if offset >= self.total_size() || aligned_offset >= self.total_size() {
+            return Ok(Vec::new());
+        }
+        let readable = usize::try_from((self.total_size() - aligned_offset).min(aligned_size_u64))
+            .map_err(|_| {
+                XfsWinfspError::InvalidArgument("Aligned read size does not fit usize".to_string())
+            })?;
+        let mut aligned_buffer = vec![0u8; readable];
         let bytes_read = self.read_raw_at(aligned_offset, &mut aligned_buffer)?;
+        if bytes_read > aligned_buffer.len() {
+            return Err(XfsWinfspError::DiskError(
+                "Disk reader returned more bytes than requested".to_string(),
+            ));
+        }
 
-        if bytes_read < offset_in_sector + size {
+        if bytes_read < requested_end {
             let available = bytes_read.saturating_sub(offset_in_sector);
             if available == 0 {
                 return Ok(Vec::new());
@@ -70,7 +135,6 @@ pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
             return Ok(aligned_buffer[offset_in_sector..offset_in_sector + to_copy].to_vec());
         }
 
-        // Extract requested portion
         Ok(aligned_buffer[offset_in_sector..offset_in_sector + size].to_vec())
     }
 
@@ -81,15 +145,7 @@ pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
             .ok_or_else(|| XfsWinfspError::XfsError("Block offset overflow".to_string()))?;
 
         let mut buffer = vec![0u8; block_size as usize];
-        let bytes_read = self.read_raw_at(offset, &mut buffer)?;
-
-        if bytes_read != block_size as usize {
-            return Err(XfsWinfspError::DiskError(format!(
-                "Short read: expected {} bytes, got {}",
-                block_size, bytes_read
-            )));
-        }
-
+        read_exact_at(self, offset, &mut buffer)?;
         Ok(buffer)
     }
 
@@ -104,15 +160,7 @@ pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
             .ok_or_else(|| XfsWinfspError::XfsError("Block size overflow".to_string()))?;
 
         let mut buffer = vec![0u8; total_size];
-        let bytes_read = self.read_raw_at(offset, &mut buffer)?;
-
-        if bytes_read != total_size {
-            return Err(XfsWinfspError::DiskError(format!(
-                "Short read: expected {} bytes, got {}",
-                total_size, bytes_read
-            )));
-        }
-
+        read_exact_at(self, offset, &mut buffer)?;
         Ok(buffer)
     }
 }
@@ -121,7 +169,8 @@ pub trait DiskReader: fs_abstraction::BlockDevice + Send + Sync {
 ///
 /// This extends DiskReader to provide write capabilities.
 /// Not all disk readers support writing (e.g., read-only images).
-pub trait DiskWriter: DiskReader {
+#[allow(dead_code)]
+pub(crate) trait DiskWriter: DiskReader {
     /// Write bytes at a specific offset.
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize>;
 
@@ -132,32 +181,51 @@ pub trait DiskWriter: DiskReader {
     /// 2. Modifying the relevant bytes
     /// 3. Writing the sectors back
     fn write_unaligned(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        let sector = self.get_sector_size() as u64;
-
-        // Calculate aligned offset and size
-        let aligned_offset = offset & !(sector - 1);
-        let offset_in_sector = (offset - aligned_offset) as usize;
-        let aligned_size = ((offset_in_sector + data.len() + sector as usize - 1)
-            / sector as usize)
-            * sector as usize;
-
-        // Read existing aligned data
-        let mut aligned_buffer = vec![0u8; aligned_size];
-        self.read_raw_at(aligned_offset, &mut aligned_buffer)?;
-
-        // Modify the relevant portion
-        aligned_buffer[offset_in_sector..offset_in_sector + data.len()].copy_from_slice(data);
-
-        // Write back
-        let bytes_written = self.write_raw_at(aligned_offset, &aligned_buffer)?;
-
-        if bytes_written < aligned_size {
-            return Err(XfsWinfspError::DiskError(format!(
-                "Short write: expected {} bytes, wrote {}",
-                aligned_size, bytes_written
-            )));
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let sector = checked_sector_size(self.get_sector_size())?;
+        let sector_usize = usize::try_from(sector).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Logical sector size does not fit usize".to_string())
+        })?;
+        let data_len = u64::try_from(data.len()).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Write size does not fit u64".to_string())
+        })?;
+        let end = offset
+            .checked_add(data_len)
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("Write offset overflow".to_string()))?;
+        if end > self.total_size() {
+            return Err(XfsWinfspError::InvalidArgument(
+                "Write extends beyond the device".to_string(),
+            ));
         }
 
+        let aligned_offset = offset & !(sector - 1);
+        let offset_in_sector = usize::try_from(offset - aligned_offset).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Sector offset does not fit usize".to_string())
+        })?;
+        let requested_end = offset_in_sector.checked_add(data.len()).ok_or_else(|| {
+            XfsWinfspError::InvalidArgument("Unaligned write size overflow".to_string())
+        })?;
+        let aligned_size_u64 = requested_end
+            .checked_add(sector_usize - 1)
+            .ok_or_else(|| XfsWinfspError::InvalidArgument("Aligned write size overflow".into()))?
+            as u64
+            / sector
+            * sector;
+        let aligned_size = usize::try_from(aligned_size_u64).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Aligned write size does not fit usize".to_string())
+        })?;
+
+        // A read/modify/write must never use zero-filled data after a short
+        // read: doing so would destroy the untouched edges of the sector.
+        let mut aligned_buffer = vec![0u8; aligned_size];
+        read_exact_at(self, aligned_offset, &mut aligned_buffer)?;
+        aligned_buffer[offset_in_sector..requested_end].copy_from_slice(data);
+
+        // Positional writes may legally complete partially. Continue until
+        // the entire aligned range is persistent before reporting success.
+        write_all_at(self, aligned_offset, &aligned_buffer)?;
         Ok(data.len())
     }
 
@@ -175,15 +243,7 @@ pub trait DiskWriter: DiskReader {
             .checked_mul(block_size as u64)
             .ok_or_else(|| XfsWinfspError::XfsError("Block offset overflow".to_string()))?;
 
-        let bytes_written = self.write_raw_at(offset, data)?;
-
-        if bytes_written != block_size as usize {
-            return Err(XfsWinfspError::DiskError(format!(
-                "Short write: expected {} bytes, wrote {}",
-                block_size, bytes_written
-            )));
-        }
-
+        write_all_at(self, offset, data)?;
         Ok(())
     }
 
@@ -191,6 +251,55 @@ pub trait DiskWriter: DiskReader {
     fn flush_raw(&self) -> Result<()> {
         Ok(()) // Default: no-op
     }
+}
+
+/// Read exactly `buffer.len()` bytes, retrying positional short reads.
+fn read_exact_at<R: DiskReader + ?Sized>(reader: &R, offset: u64, buffer: &mut [u8]) -> Result<()> {
+    let mut completed = 0usize;
+    while completed < buffer.len() {
+        let current_offset = offset
+            .checked_add(completed as u64)
+            .ok_or_else(|| XfsWinfspError::DiskError("Read offset overflow".to_string()))?;
+        let count = reader.read_raw_at(current_offset, &mut buffer[completed..])?;
+        if count == 0 {
+            return Err(XfsWinfspError::DiskError(format!(
+                "Short read at offset {current_offset}: expected {} bytes, got {completed}",
+                buffer.len()
+            )));
+        }
+        if count > buffer.len() - completed {
+            return Err(XfsWinfspError::DiskError(
+                "Disk reader returned more bytes than requested".to_string(),
+            ));
+        }
+        completed += count;
+    }
+    Ok(())
+}
+
+/// Write the entire buffer, retrying positional partial writes.
+#[allow(dead_code)]
+fn write_all_at<W: DiskWriter + ?Sized>(writer: &W, offset: u64, buffer: &[u8]) -> Result<()> {
+    let mut completed = 0usize;
+    while completed < buffer.len() {
+        let current_offset = offset
+            .checked_add(completed as u64)
+            .ok_or_else(|| XfsWinfspError::DiskError("Write offset overflow".to_string()))?;
+        let count = writer.write_raw_at(current_offset, &buffer[completed..])?;
+        if count == 0 {
+            return Err(XfsWinfspError::DiskError(format!(
+                "Short write at offset {current_offset}: expected {} bytes, wrote {completed}",
+                buffer.len()
+            )));
+        }
+        if count > buffer.len() - completed {
+            return Err(XfsWinfspError::DiskError(
+                "Disk writer returned more bytes than requested".to_string(),
+            ));
+        }
+        completed += count;
+    }
+    Ok(())
 }
 
 /// Reader for image files (.img, .raw, etc.).
@@ -210,7 +319,7 @@ impl ImageFileReader {
 
             std::fs::OpenOptions::new()
                 .read(true)
-                .share_mode(0x0000_0001) // FILE_SHARE_READ only
+                .share_mode(FILE_SHARE_READ.0)
                 .open(path.as_ref())?
         };
         #[cfg(not(windows))]
@@ -260,14 +369,16 @@ impl fs_abstraction::BlockDevice for ImageFileReader {
 ///
 /// Unlike ImageFileReader, this opens the file with read-write permissions
 /// and implements the DiskWriter trait.
-pub struct ImageFileWriter {
+#[allow(dead_code)]
+pub(crate) struct ImageFileWriter {
     file: std::sync::Mutex<File>,
     size: u64,
 }
 
+#[allow(dead_code)]
 impl ImageFileWriter {
     /// Open an image file for reading and writing.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         use std::fs::OpenOptions;
 
         let file = OpenOptions::new()
@@ -283,7 +394,7 @@ impl ImageFileWriter {
     }
 
     /// Create a new image file with the specified size.
-    pub fn create<P: AsRef<Path>>(path: P, size: u64) -> Result<Self> {
+    pub(crate) fn create<P: AsRef<Path>>(path: P, size: u64) -> Result<Self> {
         use std::fs::OpenOptions;
 
         let file = OpenOptions::new()
@@ -385,13 +496,12 @@ impl PartitionReader {
 
 impl DiskReader for PartitionReader {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        // Add partition offset to requested offset
-        let actual_offset = self.offset + offset;
-
-        // Ensure we don't read beyond partition bounds
-        if offset >= self.size {
+        if buffer.is_empty() || offset >= self.size {
             return Ok(0);
         }
+        let actual_offset = self.offset.checked_add(offset).ok_or_else(|| {
+            XfsWinfspError::DiskError("Partition read offset overflow".to_string())
+        })?;
 
         let max_read = (self.size - offset).min(buffer.len() as u64) as usize;
         self.inner
@@ -422,15 +532,17 @@ impl fs_abstraction::BlockDevice for PartitionReader {
 }
 
 /// Wraps a DiskWriter and applies an offset for partition access.
-pub struct PartitionWriter {
+#[allow(dead_code)]
+pub(crate) struct PartitionWriter {
     inner: Arc<dyn DiskWriter>,
     offset: u64,
     size: u64,
 }
 
+#[allow(dead_code)]
 impl PartitionWriter {
     /// Create a new partition writer.
-    pub fn new(inner: Arc<dyn DiskWriter>, offset: u64, size: u64) -> Self {
+    pub(crate) fn new(inner: Arc<dyn DiskWriter>, offset: u64, size: u64) -> Self {
         Self {
             inner,
             offset,
@@ -441,10 +553,12 @@ impl PartitionWriter {
 
 impl DiskReader for PartitionWriter {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        let actual_offset = self.offset + offset;
-        if offset >= self.size {
+        if buffer.is_empty() || offset >= self.size {
             return Ok(0);
         }
+        let actual_offset = self.offset.checked_add(offset).ok_or_else(|| {
+            XfsWinfspError::DiskError("Partition read offset overflow".to_string())
+        })?;
         let max_read = (self.size - offset).min(buffer.len() as u64) as usize;
         self.inner
             .read_raw_at(actual_offset, &mut buffer[..max_read])
@@ -465,14 +579,24 @@ impl DiskReader for PartitionWriter {
 
 impl DiskWriter for PartitionWriter {
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        let actual_offset = self.offset + offset;
-        if offset >= self.size {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let data_len = u64::try_from(data.len()).map_err(|_| {
+            XfsWinfspError::InvalidArgument("Partition write size does not fit u64".to_string())
+        })?;
+        let end = offset.checked_add(data_len).ok_or_else(|| {
+            XfsWinfspError::InvalidArgument("Partition write offset overflow".to_string())
+        })?;
+        if end > self.size {
             return Err(XfsWinfspError::InvalidArgument(
-                "Write beyond partition bounds".to_string(),
+                "Write extends beyond partition bounds".to_string(),
             ));
         }
-        let max_write = (self.size - offset).min(data.len() as u64) as usize;
-        self.inner.write_raw_at(actual_offset, &data[..max_write])
+        let actual_offset = self.offset.checked_add(offset).ok_or_else(|| {
+            XfsWinfspError::DiskError("Partition write offset overflow".to_string())
+        })?;
+        self.inner.write_raw_at(actual_offset, data)
     }
 
     fn flush_raw(&self) -> Result<()> {
@@ -507,12 +631,15 @@ pub struct PhysicalDiskReader {
     handle: HANDLE,
     size: u64,
     sector_size: u32,
-    /// Serialises `SetFilePointerEx` + `ReadFile` pairs.  WinFsp issues
-    /// concurrent reads, and the file pointer is shared by the handle.
+    /// Serialises every operation on the shared handle, including seeks,
+    /// reads, retries, and the extended-DASD IOCTL.
     io_lock: Mutex<()>,
 }
 
-// SAFETY: access to `handle` is serialised by `io_lock`; HANDLE is Send+Sync.
+// SAFETY: HANDLE is an opaque Win32 resource and is not modelled as Send/Sync
+// by the windows crate. Every operation using it is protected by `io_lock`;
+// construction-time geometry IOCTLs run before the handle is shared, and
+// `CloseHandle` runs only from Drop after all shared references are gone.
 unsafe impl Send for PhysicalDiskReader {}
 unsafe impl Sync for PhysicalDiskReader {}
 
@@ -525,12 +652,22 @@ impl PhysicalDiskReader {
 
     /// Open a partition by drive letter (e.g., "D:").
     pub fn open_partition(drive_letter: char) -> Result<Self> {
-        let path = format!("\\\\.\\{}:", drive_letter);
+        if !drive_letter.is_ascii_alphabetic() {
+            return Err(XfsWinfspError::InvalidArgument(format!(
+                "Partition must be one ASCII drive letter, got {drive_letter:?}"
+            )));
+        }
+        let path = format!("\\\\.\\{}:", drive_letter.to_ascii_uppercase());
         Self::open_by_path(&path)
     }
 
     /// Open a disk or partition by path.
     pub fn open_by_path(path: &str) -> Result<Self> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(XfsWinfspError::InvalidArgument(
+                "Disk path must be non-empty and contain no NUL bytes".to_string(),
+            ));
+        }
         tracing::debug!("open_by_path: {}", path);
         let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         tracing::debug!("Wide path created with {} characters", wide_path.len());
@@ -538,10 +675,9 @@ impl PhysicalDiskReader {
         // Different types of paths may need different flags
         use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_RANDOM_ACCESS};
 
-        // Do not use FILE_FLAG_NO_BUFFERING: it requires sector-aligned buffer
+        // Use buffered I/O: unbuffered I/O would require sector-aligned buffer
         // addresses and lengths, but the VFS passes ordinary `Vec<u8>` buffers
-        // of arbitrary alignment/length.  Buffered I/O is correct here and the
-        // OS cache handles alignment for us.
+        // of arbitrary alignment/length. The OS cache handles alignment for us.
         let flags = if path.contains("HarddiskVolume") {
             tracing::debug!("Detected HarddiskVolume path, using FILE_ATTRIBUTE_NORMAL only");
             FILE_ATTRIBUTE_NORMAL.0
@@ -555,11 +691,7 @@ impl PhysicalDiskReader {
         tracing::debug!("Attempting to call CreateFileW with flags: 0x{:X}", flags);
         tracing::debug!("Path: {}", path);
         tracing::debug!("Generic read access: 0x{:X}", FILE_GENERIC_READ.0);
-        tracing::debug!(
-            "Share mode: READ({}) | WRITE({})",
-            FILE_SHARE_READ.0 != 0,
-            FILE_SHARE_WRITE.0 != 0
-        );
+        tracing::debug!("Share mode: FILE_SHARE_READ only");
 
         // Read-only handle and no write sharing: this prevents an external
         // writer from modifying the volume while it is being parsed/mounted,
@@ -599,7 +731,8 @@ impl PhysicalDiskReader {
                             path
                         );
 
-                        // Inform the user that mounted volumes typically can't be accessed directly
+                        // Inform the user that mounted volumes typically can't
+                        // be accessed directly
                         tracing::warn!("Mounted volumes cannot typically be accessed directly.");
                         tracing::warn!(
                             "Consider unmounting the volume first or using a different approach."
@@ -651,8 +784,18 @@ impl PhysicalDiskReader {
             }
         };
 
-        // Get disk geometry (never fails - uses defaults if needed)
-        let (size, sector_size) = Self::get_disk_geometry(handle);
+        // Geometry is mandatory. Never advertise a fabricated 1 TiB/512-byte
+        // device when Windows cannot report the real geometry.
+        let (size, sector_size) = match Self::get_disk_geometry(handle) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                use windows::Win32::Foundation::CloseHandle;
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return Err(error);
+            }
+        };
         tracing::debug!("Disk size: {}, sector size: {}", size, sector_size);
 
         Ok(Self {
@@ -663,44 +806,76 @@ impl PhysicalDiskReader {
         })
     }
 
-    fn get_disk_geometry(handle: HANDLE) -> (u64, u32) {
+    fn get_disk_geometry(handle: HANDLE) -> Result<(u64, u32)> {
         use windows::Win32::System::{
             Ioctl::{
-                DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO,
+                DISK_GEOMETRY,
+                DISK_GEOMETRY_EX,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                IOCTL_DISK_GET_LENGTH_INFO,
             },
             IO::DeviceIoControl,
         };
 
-        let mut geometry: DISK_GEOMETRY_EX = unsafe { std::mem::zeroed() };
-        let mut bytes_returned: u32 = 0;
-
-        // Try IOCTL_DISK_GET_DRIVE_GEOMETRY_EX first
-        let result = unsafe {
+        // This runs during construction, before the handle can be shared, so
+        // it does not need the instance's I/O mutex.
+        let mut geometry_ex: DISK_GEOMETRY_EX = unsafe { std::mem::zeroed() };
+        let mut bytes_returned = 0u32;
+        let geometry_ex_result = unsafe {
             DeviceIoControl(
                 handle,
                 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
                 None,
                 0,
-                Some(&mut geometry as *mut _ as *mut _),
+                Some(&mut geometry_ex as *mut _ as *mut _),
                 std::mem::size_of::<DISK_GEOMETRY_EX>() as u32,
                 Some(&mut bytes_returned),
                 None,
             )
         };
-
-        if result.is_ok() && bytes_returned > 0 {
-            let size = geometry.DiskSize as u64;
-            let sector_size = if geometry.Geometry.BytesPerSector > 0 {
-                geometry.Geometry.BytesPerSector
-            } else {
-                512
-            };
-            tracing::debug!("Got geometry via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX");
-            return (size, sector_size);
+        let size_from_geometry = if geometry_ex_result.is_ok()
+            && bytes_returned >= std::mem::size_of::<DISK_GEOMETRY_EX>() as u32
+            && geometry_ex.DiskSize > 0
+        {
+            Some(geometry_ex.DiskSize as u64)
+        } else {
+            None
+        };
+        if let (Some(size), Some(sector_size)) = (
+            size_from_geometry,
+            checked_sector_size(geometry_ex.Geometry.BytesPerSector).ok(),
+        ) {
+            return Ok((size, sector_size as u32));
         }
 
-        // Fallback: Try IOCTL_DISK_GET_LENGTH_INFO for volumes
-        let mut length_info: i64 = 0;
+        // Some volume handles reject GEOMETRY_EX but still expose the logical
+        // sector size through GEOMETRY and the exact byte length separately.
+        let mut geometry: DISK_GEOMETRY = unsafe { std::mem::zeroed() };
+        bytes_returned = 0;
+        let geometry_result = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                None,
+                0,
+                Some(&mut geometry as *mut _ as *mut _),
+                std::mem::size_of::<DISK_GEOMETRY>() as u32,
+                Some(&mut bytes_returned),
+                None,
+            )
+        };
+        let sector_size = if geometry_result.is_ok()
+            && bytes_returned >= std::mem::size_of::<DISK_GEOMETRY>() as u32
+        {
+            checked_sector_size(geometry.BytesPerSector)
+                .ok()
+                .map(|size| size as u32)
+        } else {
+            None
+        };
+
+        let mut length_info = 0i64;
         bytes_returned = 0;
         let length_result = unsafe {
             DeviceIoControl(
@@ -714,16 +889,30 @@ impl PhysicalDiskReader {
                 None,
             )
         };
+        let size_from_length = if length_result.is_ok()
+            && bytes_returned >= std::mem::size_of::<i64>() as u32
+            && length_info > 0
+        {
+            Some(length_info as u64)
+        } else {
+            None
+        };
 
-        if length_result.is_ok() && length_info > 0 {
-            tracing::debug!("Got length via IOCTL_DISK_GET_LENGTH_INFO");
-            return (length_info as u64, 512);
+        if let (Some(size), Some(sector_size)) = (
+            size_from_geometry.or(size_from_length),
+            sector_size.or_else(|| {
+                checked_sector_size(geometry_ex.Geometry.BytesPerSector)
+                    .ok()
+                    .map(|size| size as u32)
+            }),
+        ) {
+            return Ok((size, sector_size));
         }
 
-        // Last resort: Use a default size - we'll read until we hit an error
-        // This is safe for read-only filesystem drivers
-        tracing::warn!("Could not determine disk size, using default");
-        (1024 * 1024 * 1024 * 1024, 512) // Default to 1TB, 512-byte sectors
+        Err(XfsWinfspError::DiskOpenError(format!(
+            "Could not determine the real disk size and logical sector size (size: \
+             {size_from_geometry:?}, length: {size_from_length:?}, sector: {sector_size:?})"
+        )))
     }
 }
 
@@ -734,11 +923,9 @@ impl DiskReader for PhysicalDiskReader {
             offset,
             buffer.len()
         );
-        if offset > i64::MAX as u64 {
-            return Err(XfsWinfspError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "disk offset exceeds i64 range",
-            )));
+        validate_raw_io_args(offset, buffer.len())?;
+        if buffer.is_empty() {
+            return Ok(0);
         }
 
         // Seek + read must be atomic with respect to other readers: the
@@ -752,7 +939,7 @@ impl DiskReader for PhysicalDiskReader {
             SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
                 |e| {
                     tracing::error!("SetFilePointerEx failed: error code 0x{:X}", e.code().0);
-                    XfsWinfspError::IoError(std::io::Error::last_os_error())
+                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
                 },
             )?;
             tracing::debug!("Seek successful, new position: {}", new_pos);
@@ -769,11 +956,12 @@ impl DiskReader for PhysicalDiskReader {
                 Err(e) => {
                     tracing::error!("ReadFile failed: error code 0x{:X}", e.code().0);
 
-                    // For volume devices, sometimes we need to use DeviceIoControl with
-                    // FSCTL_ALLOW_EXTENDED_DASD_IO to bypass certain
-                    // restrictions
+                    // For volume devices, sometimes we need to use
+                    // DeviceIoControl with FSCTL_ALLOW_EXTENDED_DASD_IO to
+                    // bypass certain restrictions
                     use windows::Win32::System::{
-                        Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO, IO::DeviceIoControl,
+                        Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO,
+                        IO::DeviceIoControl,
                     };
 
                     let mut bytes_returned: u32 = 0;
@@ -803,9 +991,12 @@ impl DiskReader for PhysicalDiskReader {
                                 "Second SetFilePointerEx failed: error code 0x{:X}",
                                 e.code().0
                             );
-                            XfsWinfspError::IoError(std::io::Error::last_os_error())
+                            XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
+                                e.code().0 as i32,
+                            ))
                         })?;
 
+                        bytes_read = 0;
                         let result_retry =
                             ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None);
                         match result_retry {
@@ -836,7 +1027,9 @@ impl DiskReader for PhysicalDiskReader {
                                     );
                                 }
 
-                                Err(XfsWinfspError::IoError(std::io::Error::last_os_error()))
+                                Err(XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
+                                    e_retry.code().0 as i32,
+                                )))
                             }
                         }
                     } else {
@@ -846,8 +1039,8 @@ impl DiskReader for PhysicalDiskReader {
                             dasd_error.code().0
                         );
 
-                        // Check if the failure to enable extended DASD I/O is due to the volume
-                        // being mounted
+                        // Check if the failure to enable extended DASD I/O is
+                        // due to the volume being mounted
                         let dasd_error_code = dasd_error.code().0 as u32;
                         if dasd_error_code == 0x80070057 {
                             // ERROR_INVALID_PARAMETER
@@ -862,7 +1055,9 @@ impl DiskReader for PhysicalDiskReader {
                             );
                         }
 
-                        Err(XfsWinfspError::IoError(std::io::Error::last_os_error()))
+                        Err(XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
+                            dasd_error.code().0 as i32,
+                        )))
                     }
                 }
             }
@@ -906,45 +1101,60 @@ impl fs_abstraction::BlockDevice for PhysicalDiskReader {
 ///
 /// WARNING: Writing to physical disks can cause data loss!
 /// Use with extreme caution.
-pub struct PhysicalDiskWriter {
+#[allow(dead_code)]
+pub(crate) struct PhysicalDiskWriter {
     handle: HANDLE,
     size: u64,
     sector_size: u32,
-    /// Serialises seek + read/write pairs sharing this handle's file pointer.
+    /// Serialises every operation on the shared handle, including seeks,
+    /// reads, writes, flushes, and construction-time geometry IOCTLs.
     io_lock: Mutex<()>,
 }
 
-// SAFETY: access to `handle` is serialised by `io_lock`; HANDLE is Send+Sync.
+// SAFETY: HANDLE is an opaque Win32 resource and is not modelled as Send/Sync
+// by the windows crate. Every shared-handle operation (including flush) is
+// protected by `io_lock`; geometry IOCTLs run before the handle is shared, and
+// `CloseHandle` runs only from Drop after all shared references are gone.
 unsafe impl Send for PhysicalDiskWriter {}
 unsafe impl Sync for PhysicalDiskWriter {}
 
+#[allow(dead_code)]
 impl PhysicalDiskWriter {
     /// Open a physical disk by number for read-write access.
-    pub fn open(disk_number: u32) -> Result<Self> {
+    pub(crate) fn open(disk_number: u32) -> Result<Self> {
         let path = format!("\\\\.\\PhysicalDrive{}", disk_number);
         Self::open_by_path(&path)
     }
 
     /// Open a partition by drive letter for read-write access.
-    pub fn open_partition(drive_letter: char) -> Result<Self> {
-        let path = format!("\\\\.\\{}:", drive_letter);
+    pub(crate) fn open_partition(drive_letter: char) -> Result<Self> {
+        if !drive_letter.is_ascii_alphabetic() {
+            return Err(XfsWinfspError::InvalidArgument(format!(
+                "Partition must be one ASCII drive letter, got {drive_letter:?}"
+            )));
+        }
+        let path = format!("\\\\.\\{}:", drive_letter.to_ascii_uppercase());
         Self::open_by_path(&path)
     }
 
     /// Open a disk or partition by path for read-write access.
-    pub fn open_by_path(path: &str) -> Result<Self> {
+    pub(crate) fn open_by_path(path: &str) -> Result<Self> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(XfsWinfspError::InvalidArgument(
+                "Disk path must be non-empty and contain no NUL bytes".to_string(),
+            ));
+        }
         tracing::debug!("PhysicalDiskWriter::open_by_path: {}", path);
         let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
         use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 
-        // For physical disks, we need simpler flags
-        // FILE_FLAG_NO_BUFFERING requires sector-aligned I/O which can be problematic
+        // Buffered I/O accepts the ordinary, potentially unaligned VFS buffers.
         let flags = FILE_ATTRIBUTE_NORMAL.0;
 
-        // Use GENERIC_READ | GENERIC_WRITE (0x80000000 | 0x40000000 = 0xC0000000)
-        // This is different from FILE_GENERIC_READ/WRITE which include additional
-        // rights
+        // Use GENERIC_READ | GENERIC_WRITE (0x80000000 | 0x40000000 =
+        // 0xC0000000) This is different from FILE_GENERIC_READ/WRITE which
+        // include additional rights
         const GENERIC_READ: u32 = 0x80000000;
         const GENERIC_WRITE: u32 = 0x40000000;
         let access = GENERIC_READ | GENERIC_WRITE;
@@ -1013,7 +1223,16 @@ impl PhysicalDiskWriter {
             }
         };
 
-        let (size, sector_size) = PhysicalDiskReader::get_disk_geometry(handle);
+        let (size, sector_size) = match PhysicalDiskReader::get_disk_geometry(handle) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                use windows::Win32::Foundation::CloseHandle;
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return Err(error);
+            }
+        };
         tracing::info!(
             "PhysicalDiskWriter opened: size={}, sector_size={}",
             size,
@@ -1031,6 +1250,10 @@ impl PhysicalDiskWriter {
 
 impl DiskReader for PhysicalDiskWriter {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        validate_raw_io_args(offset, buffer.len())?;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut new_pos: i64 = 0;
@@ -1062,6 +1285,10 @@ impl DiskReader for PhysicalDiskWriter {
 
 impl DiskWriter for PhysicalDiskWriter {
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+        validate_raw_io_args(offset, data.len())?;
+        if data.is_empty() {
+            return Ok(0);
+        }
         let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut new_pos: i64 = 0;
@@ -1084,6 +1311,7 @@ impl DiskWriter for PhysicalDiskWriter {
     }
 
     fn flush_raw(&self) -> Result<()> {
+        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             FlushFileBuffers(self.handle).map_err(|e| {
                 XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))
@@ -1261,66 +1489,70 @@ pub struct PartitionInfo {
 
 /// Detect partitions on a disk (MBR or GPT).
 pub fn detect_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
-    let mut partitions = Vec::new();
+    let lba_size = checked_sector_size(reader.get_sector_size())?;
+    let lba_size_usize = usize::try_from(lba_size).map_err(|_| {
+        XfsWinfspError::InvalidArgument("Logical sector size does not fit usize".to_string())
+    })?;
 
     // Read the first logical sector (512 B legacy MBR or 4Kn).
-    let sector_size = reader.get_sector_size().max(512) as usize;
-    let mut boot_sector = vec![0u8; sector_size];
-    let read = reader.read_raw_at(0, &mut boot_sector)?;
-    if read < 512 {
-        return Err(XfsWinfspError::DiskError(
-            "Short read of partition boot sector".to_string(),
-        ));
-    }
+    let mut boot_sector = vec![0u8; lba_size_usize];
+    read_exact_at(reader, 0, &mut boot_sector)?;
 
-    // Check for GPT signature
-    if boot_sector.len() >= 512 {
-        // GPT has a protective MBR with signature 0x55AA at offset 510
-        let mbr_sig = u16::from_le_bytes([boot_sector[510], boot_sector[511]]);
-
-        if mbr_sig == 0xAA55 {
-            // Check if it's GPT (protective MBR has partition type 0xEE)
-            if boot_sector.len() >= 450 && boot_sector[450] == 0xEE {
-                // This is GPT - read GPT header from LBA 1
-                return read_gpt_partitions(reader);
-            } else {
-                // This is MBR
-                return read_mbr_partitions(reader, &boot_sector);
-            }
+    // GPT has a protective MBR with signature 0x55AA at offset 510 and an
+    // 0xEE entry. Once detected, any malformed GPT metadata is an error rather
+    // than a reason to silently interpret the disk as a raw filesystem.
+    let mbr_sig = u16::from_le_bytes([boot_sector[510], boot_sector[511]]);
+    if mbr_sig == 0xAA55 {
+        if boot_sector[450] == 0xEE {
+            return read_gpt_partitions(reader);
         }
+        return read_mbr_partitions(reader, &boot_sector, lba_size);
     }
 
-    Ok(partitions)
+    Ok(Vec::new())
 }
 
 /// Read MBR partition table.
-fn read_mbr_partitions(_reader: &dyn DiskReader, boot_sector: &[u8]) -> Result<Vec<PartitionInfo>> {
+fn read_mbr_partitions(
+    reader: &dyn DiskReader,
+    boot_sector: &[u8],
+    lba_size: u64,
+) -> Result<Vec<PartitionInfo>> {
     let mut partitions = Vec::new();
 
-    // MBR partition table starts at offset 446
+    // MBR partition table starts at offset 446.
     for i in 0..4 {
         let entry_offset = 446 + (i * 16);
-        if entry_offset + 16 > boot_sector.len() {
-            break;
-        }
-
         let entry = &boot_sector[entry_offset..entry_offset + 16];
         let partition_type = entry[4];
-
-        // Skip empty partitions
         if partition_type == 0 {
             continue;
         }
 
-        let lba_start = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as u64;
-        let sector_count = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as u64;
+        let lba_start = u64::from(u32::from_le_bytes([
+            entry[8], entry[9], entry[10], entry[11],
+        ]));
+        let sector_count = u64::from(u32::from_le_bytes([
+            entry[12], entry[13], entry[14], entry[15],
+        ]));
+        if lba_start == 0 || sector_count == 0 {
+            return Err(XfsWinfspError::DiskError(format!(
+                "Invalid MBR partition {i}: zero LBA or sector count"
+            )));
+        }
 
-        let offset = lba_start.checked_mul(512).ok_or_else(|| {
-            XfsWinfspError::InvalidArgument("MBR partition offset overflow".into())
-        })?;
+        let offset = lba_start
+            .checked_mul(lba_size)
+            .ok_or_else(|| XfsWinfspError::DiskError("MBR partition offset overflow".into()))?;
         let size = sector_count
-            .checked_mul(512)
-            .ok_or_else(|| XfsWinfspError::InvalidArgument("MBR partition size overflow".into()))?;
+            .checked_mul(lba_size)
+            .ok_or_else(|| XfsWinfspError::DiskError("MBR partition size overflow".into()))?;
+        offset
+            .checked_add(size)
+            .filter(|end| *end <= reader.total_size())
+            .ok_or_else(|| {
+                XfsWinfspError::DiskError(format!("MBR partition {i} extends beyond the disk"))
+            })?;
 
         partitions.push(PartitionInfo {
             offset,
@@ -1332,140 +1564,293 @@ fn read_mbr_partitions(_reader: &dyn DiskReader, boot_sector: &[u8]) -> Result<V
     Ok(partitions)
 }
 
-/// Read GPT partition table.
-fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
-    const GPT_MAX_ENTRIES: u32 = 128;
+const GPT_MAX_ENTRIES: u32 = 128;
+/// Bound untrusted entry-size/count multiplication before allocating. Normal
+/// GPTs use 16 KiB; 1 MiB still permits unusually large vendor tables.
+const GPT_MAX_TABLE_BYTES: usize = 1024 * 1024;
+const GPT_HEADER_SIZE: usize = 92;
 
-    let mut partitions = Vec::new();
-    // GPT LBAs are expressed in logical sectors, which can be 512 or 4096
-    // bytes (4Kn drives).
-    let lba_size = u64::from(reader.get_sector_size().max(512));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GptHeader {
+    revision: u32,
+    backup_lba: u64,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
+    disk_guid: [u8; 16],
+    partition_entry_lba: u64,
+    num_partitions: u32,
+    partition_entry_size: u32,
+    partition_entries_crc32: u32,
+}
 
-    // Read GPT header from LBA 1 (one logical sector).
-    let mut gpt_header = vec![0u8; lba_size as usize];
-    let header_read = reader.read_raw_at(lba_size, &mut gpt_header)?;
-    if header_read != gpt_header.len() {
+fn le_u32(buffer: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        buffer[offset..offset + 4]
+            .try_into()
+            .expect("validated GPT offset"),
+    )
+}
+
+fn le_u64(buffer: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        buffer[offset..offset + 8]
+            .try_into()
+            .expect("validated GPT offset"),
+    )
+}
+
+fn crc32_update(crc: u32, bytes: &[u8]) -> u32 {
+    let mut crc = crc;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    crc
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !crc32_update(!0, bytes)
+}
+
+fn gpt_header_crc32(header: &[u8], header_size: usize) -> u32 {
+    // HeaderCRC32 is calculated with its own field set to zero.
+    let mut crc = !0;
+    crc = crc32_update(crc, &header[..16]);
+    crc = crc32_update(crc, &[0; 4]);
+    crc = crc32_update(crc, &header[20..header_size]);
+    !crc
+}
+
+fn parse_gpt_header(
+    sector: &[u8],
+    expected_current_lba: u64,
+    expected_backup_lba: u64,
+) -> Result<GptHeader> {
+    if sector.len() < GPT_HEADER_SIZE || &sector[..8] != b"EFI PART" {
         return Err(XfsWinfspError::DiskError(
-            "Short read of GPT header".to_string(),
+            "Invalid GPT header signature or short header".to_string(),
         ));
     }
-
-    // Verify GPT signature "EFI PART"
-    if &gpt_header[0..8] != b"EFI PART" {
-        return Ok(partitions);
-    }
-
-    // HeaderSize must cover the fields we read, and fit the sector.
-    let header_size = u32::from_le_bytes([
-        gpt_header[12],
-        gpt_header[13],
-        gpt_header[14],
-        gpt_header[15],
-    ]);
-    if header_size < 92 || header_size as u64 > lba_size {
-        return Err(XfsWinfspError::InvalidArgument(
+    let header_size = le_u32(sector, 12) as usize;
+    if header_size < GPT_HEADER_SIZE || header_size > sector.len() {
+        return Err(XfsWinfspError::DiskError(
             "Invalid GPT header size".to_string(),
         ));
     }
-
-    // Get partition entry LBA and count, with strict bounds.
-    let partition_entry_lba = u64::from_le_bytes([
-        gpt_header[72],
-        gpt_header[73],
-        gpt_header[74],
-        gpt_header[75],
-        gpt_header[76],
-        gpt_header[77],
-        gpt_header[78],
-        gpt_header[79],
-    ]);
-
-    let num_partitions = u32::from_le_bytes([
-        gpt_header[80],
-        gpt_header[81],
-        gpt_header[82],
-        gpt_header[83],
-    ]);
-    if num_partitions > GPT_MAX_ENTRIES {
-        return Err(XfsWinfspError::InvalidArgument(
-            "GPT partition entry count is unreasonably large".to_string(),
+    let stored_header_crc = le_u32(sector, 16);
+    if gpt_header_crc32(sector, header_size) != stored_header_crc {
+        return Err(XfsWinfspError::DiskError(
+            "GPT header CRC32 mismatch".to_string(),
         ));
     }
 
-    let entry_size = u32::from_le_bytes([
-        gpt_header[84],
-        gpt_header[85],
-        gpt_header[86],
-        gpt_header[87],
-    ]);
-    // UEFI allows entry sizes >= 128; large values are legal but we only need
-    // the first 128 bytes of each entry.
-    if entry_size < 128 {
-        return Err(XfsWinfspError::InvalidArgument(
+    let revision = le_u32(sector, 8);
+    if revision != 0x0001_0000 {
+        return Err(XfsWinfspError::DiskError(format!(
+            "Unsupported GPT header revision 0x{revision:08x}"
+        )));
+    }
+    if le_u64(sector, 24) != expected_current_lba || le_u64(sector, 32) != expected_backup_lba {
+        return Err(XfsWinfspError::DiskError(
+            "GPT header current/backup LBA mismatch".to_string(),
+        ));
+    }
+
+    let num_partitions = le_u32(sector, 80);
+    let partition_entry_size = le_u32(sector, 84);
+    if num_partitions == 0 || num_partitions > GPT_MAX_ENTRIES {
+        return Err(XfsWinfspError::DiskError(
+            "GPT partition entry count is zero or unreasonably large".to_string(),
+        ));
+    }
+    if partition_entry_size < 128 || partition_entry_size % 8 != 0 {
+        return Err(XfsWinfspError::DiskError(
             "Invalid GPT partition entry size".to_string(),
         ));
     }
-
-    // Read partition entries.  Read exactly num_partitions * entry_size bytes,
-    // but cap the allocation at the GPT maximum (128 entries).
     let entries_bytes = (num_partitions as usize)
-        .checked_mul(entry_size as usize)
-        .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT entry table overflow".into()))?;
-    let entries_offset = partition_entry_lba
-        .checked_mul(lba_size)
-        .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT entry LBA overflow".into()))?;
-
-    let mut entries = vec![0u8; entries_bytes];
-    let entries_read = reader.read_raw_at(entries_offset, &mut entries)?;
-    if entries_read != entries_bytes {
+        .checked_mul(partition_entry_size as usize)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT entry table size overflow".into()))?;
+    if entries_bytes > GPT_MAX_TABLE_BYTES {
         return Err(XfsWinfspError::DiskError(
-            "Short read of GPT partition entries".to_string(),
+            "GPT partition entry table exceeds the allocation limit".to_string(),
         ));
     }
 
-    for i in 0..num_partitions as usize {
-        let entry_offset = i * entry_size as usize;
-        if entry_offset + 128 > entries.len() {
-            break;
-        }
+    let first_usable_lba = le_u64(sector, 40);
+    let last_usable_lba = le_u64(sector, 48);
+    let partition_entry_lba = le_u64(sector, 72);
+    if first_usable_lba < 2 || last_usable_lba < first_usable_lba || partition_entry_lba < 2 {
+        return Err(XfsWinfspError::DiskError(
+            "Invalid GPT usable-LBA or entry-LBA range".to_string(),
+        ));
+    }
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(&sector[56..72]);
+    if disk_guid.iter().all(|byte| *byte == 0) {
+        return Err(XfsWinfspError::DiskError(
+            "GPT disk GUID must not be zero".to_string(),
+        ));
+    }
 
+    Ok(GptHeader {
+        revision,
+        backup_lba: le_u64(sector, 32),
+        first_usable_lba,
+        last_usable_lba,
+        disk_guid,
+        partition_entry_lba,
+        num_partitions,
+        partition_entry_size,
+        partition_entries_crc32: le_u32(sector, 88),
+    })
+}
+
+/// Read and validate both GPT headers and both copies of the entry array.
+fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
+    let lba_size = checked_sector_size(reader.get_sector_size())?;
+    let lba_size_usize = usize::try_from(lba_size).map_err(|_| {
+        XfsWinfspError::InvalidArgument("Logical sector size does not fit usize".to_string())
+    })?;
+    let disk_size = reader.total_size();
+    let minimum_size = lba_size
+        .checked_mul(4)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT disk size overflow".into()))?;
+    if disk_size < minimum_size || disk_size % lba_size != 0 {
+        return Err(XfsWinfspError::DiskError(
+            "Disk size is too small or not a whole number of logical sectors".to_string(),
+        ));
+    }
+    let last_disk_lba = disk_size / lba_size - 1;
+
+    let mut primary_sector = vec![0u8; lba_size_usize];
+    read_exact_at(reader, lba_size, &mut primary_sector)?;
+    let primary = parse_gpt_header(&primary_sector, 1, last_disk_lba)?;
+    if primary.last_usable_lba >= primary.backup_lba {
+        return Err(XfsWinfspError::DiskError(
+            "GPT usable range overlaps the backup header".to_string(),
+        ));
+    }
+
+    let entries_bytes = (primary.num_partitions as usize)
+        .checked_mul(primary.partition_entry_size as usize)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT entry table size overflow".into()))?;
+    let entries_offset = primary
+        .partition_entry_lba
+        .checked_mul(lba_size)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT entry LBA overflow".into()))?;
+    let entries_end = entries_offset
+        .checked_add(entries_bytes as u64)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT entry table end overflow".into()))?;
+    let first_usable_offset = primary
+        .first_usable_lba
+        .checked_mul(lba_size)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT usable LBA overflow".into()))?;
+    if entries_offset < lba_size.checked_mul(2).unwrap_or(u64::MAX)
+        || entries_end > first_usable_offset
+        || entries_end > disk_size
+    {
+        return Err(XfsWinfspError::DiskError(
+            "GPT entry table overlaps headers, usable space, or the disk boundary".to_string(),
+        ));
+    }
+
+    let mut entries = vec![0u8; entries_bytes];
+    read_exact_at(reader, entries_offset, &mut entries)?;
+    if crc32(&entries) != primary.partition_entries_crc32 {
+        return Err(XfsWinfspError::DiskError(
+            "GPT partition entry CRC32 mismatch".to_string(),
+        ));
+    }
+
+    // Validate the backup header at the final LBA and its mirrored entry array.
+    let backup_offset = last_disk_lba
+        .checked_mul(lba_size)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT backup LBA overflow".into()))?;
+    let mut backup_sector = vec![0u8; lba_size_usize];
+    read_exact_at(reader, backup_offset, &mut backup_sector)?;
+    let backup = parse_gpt_header(&backup_sector, last_disk_lba, 1)?;
+    if backup.revision != primary.revision
+        || backup.disk_guid != primary.disk_guid
+        || backup.first_usable_lba != primary.first_usable_lba
+        || backup.last_usable_lba != primary.last_usable_lba
+        || backup.num_partitions != primary.num_partitions
+        || backup.partition_entry_size != primary.partition_entry_size
+        || backup.partition_entries_crc32 != primary.partition_entries_crc32
+    {
+        return Err(XfsWinfspError::DiskError(
+            "Primary and backup GPT headers disagree".to_string(),
+        ));
+    }
+    let backup_entries_offset = backup
+        .partition_entry_lba
+        .checked_mul(lba_size)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT backup entry LBA overflow".into()))?;
+    let backup_entries_end = backup_entries_offset
+        .checked_add(entries_bytes as u64)
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT backup entry end overflow".into()))?;
+    let last_usable_end = primary
+        .last_usable_lba
+        .checked_add(1)
+        .and_then(|lba| lba.checked_mul(lba_size))
+        .ok_or_else(|| XfsWinfspError::DiskError("GPT usable range overflow".into()))?;
+    if backup_entries_offset < last_usable_end || backup_entries_end > backup_offset {
+        return Err(XfsWinfspError::DiskError(
+            "GPT backup entry table overlaps usable space or its header".to_string(),
+        ));
+    }
+    let mut backup_entries = vec![0u8; entries_bytes];
+    read_exact_at(reader, backup_entries_offset, &mut backup_entries)?;
+    if crc32(&backup_entries) != backup.partition_entries_crc32 || backup_entries != entries {
+        return Err(XfsWinfspError::DiskError(
+            "Backup GPT partition entries failed CRC or mirror validation".to_string(),
+        ));
+    }
+
+    let mut partitions = Vec::with_capacity(primary.num_partitions as usize);
+    let entry_size = primary.partition_entry_size as usize;
+    for index in 0..primary.num_partitions as usize {
+        let entry_offset = index
+            .checked_mul(entry_size)
+            .ok_or_else(|| XfsWinfspError::DiskError("GPT entry offset overflow".into()))?;
         let entry = &entries[entry_offset..entry_offset + 128];
-
-        // Check if partition type GUID is all zeros (unused entry)
-        let is_empty = entry[0..16].iter().all(|&b| b == 0);
-        if is_empty {
+        if entry[..16].iter().all(|byte| *byte == 0) {
             continue;
         }
 
-        // Get first and last LBA
-        let first_lba = u64::from_le_bytes([
-            entry[32], entry[33], entry[34], entry[35], entry[36], entry[37], entry[38], entry[39],
-        ]);
-
-        let last_lba = u64::from_le_bytes([
-            entry[40], entry[41], entry[42], entry[43], entry[44], entry[45], entry[46], entry[47],
-        ]);
-        if last_lba < first_lba {
-            return Err(XfsWinfspError::InvalidArgument(
-                "GPT partition has last LBA before first LBA".to_string(),
-            ));
+        let first_lba = le_u64(entry, 32);
+        let last_lba = le_u64(entry, 40);
+        if first_lba < primary.first_usable_lba
+            || last_lba > primary.last_usable_lba
+            || last_lba < first_lba
+        {
+            return Err(XfsWinfspError::DiskError(format!(
+                "GPT partition {index} is outside the usable disk range"
+            )));
         }
-
-        let offset = first_lba.checked_mul(lba_size).ok_or_else(|| {
-            XfsWinfspError::InvalidArgument("GPT partition offset overflow".into())
-        })?;
-        let count = last_lba
-            .checked_sub(first_lba)
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT partition size overflow".into()))?;
-        let size = count
+        let offset = first_lba
             .checked_mul(lba_size)
-            .ok_or_else(|| XfsWinfspError::InvalidArgument("GPT partition size overflow".into()))?;
+            .ok_or_else(|| XfsWinfspError::DiskError("GPT partition offset overflow".into()))?;
+        let sector_count = last_lba
+            .checked_sub(first_lba)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| XfsWinfspError::DiskError("GPT partition size overflow".into()))?;
+        let size = sector_count
+            .checked_mul(lba_size)
+            .ok_or_else(|| XfsWinfspError::DiskError("GPT partition size overflow".into()))?;
+        offset
+            .checked_add(size)
+            .filter(|end| *end <= disk_size)
+            .ok_or_else(|| {
+                XfsWinfspError::DiskError(format!("GPT partition {index} extends beyond the disk"))
+            })?;
 
         partitions.push(PartitionInfo {
             offset,
             size,
-            partition_type: 0, // GPT doesn't use a simple type byte
+            partition_type: 0,
         });
     }
 
@@ -1474,8 +1859,8 @@ fn read_gpt_partitions(reader: &dyn DiskReader) -> Result<Vec<PartitionInfo>> {
 
 /// Try to open an XFS partition from a physical disk.
 /// If the disk has partitions, find and wrap the first XFS partition.
-pub fn open_disk_with_partitions(disk_number: u32) -> Result<Arc<dyn DiskReader>> {
-    let disk = Arc::new(PhysicalDiskReader::open(disk_number)?) as Arc<dyn DiskReader>;
+pub fn open_disk_with_partitions(disk_number: u32) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
+    let disk = Arc::new(PhysicalDiskReader::open(disk_number)?);
 
     // Try to detect partitions
     match detect_partitions(disk.as_ref()) {
@@ -1497,8 +1882,7 @@ pub fn open_disk_with_partitions(disk_number: u32) -> Result<Arc<dyn DiskReader>
                 );
 
                 let part_reader =
-                    Arc::new(PartitionReader::new(disk.clone(), part.offset, part.size))
-                        as Arc<dyn DiskReader>;
+                    Arc::new(PartitionReader::new(disk.clone(), part.offset, part.size));
 
                 // Check if this partition has XFS magic
                 if let Ok(buffer) = part_reader.read_unaligned(0, 4) {
@@ -1520,20 +1904,23 @@ pub fn open_disk_with_partitions(disk_number: u32) -> Result<Arc<dyn DiskReader>
             );
             Ok(disk)
         }
-        _ => {
-            // No partitions detected or error, try raw disk
+        // The guarded arm above handles every non-empty list, so this is the
+        // no-partition-table case.
+        Ok(_) => {
             tracing::debug!(
                 "No partition table detected on disk {}, using raw disk",
                 disk_number
             );
             Ok(disk)
         }
+        Err(error) => Err(error),
     }
 }
 
 /// Try to open an XFS partition from a physical disk with read-write access.
 /// If the disk has partitions, find and wrap the first XFS partition.
-pub fn open_disk_with_partitions_rw(
+#[allow(dead_code)]
+pub(crate) fn open_disk_with_partitions_rw(
     disk_number: u32,
 ) -> Result<(Arc<dyn DiskReader>, Arc<dyn DiskWriter>)> {
     let disk = Arc::new(PhysicalDiskWriter::open(disk_number)?);
@@ -1586,8 +1973,9 @@ pub fn open_disk_with_partitions_rw(
             let writer: Arc<dyn DiskWriter> = disk;
             Ok((reader, writer))
         }
-        _ => {
-            // No partitions detected or error, try raw disk
+        // The guarded arm above handles every non-empty list, so this is the
+        // no-partition-table case.
+        Ok(_) => {
             tracing::debug!(
                 "No partition table detected on disk {} (RW mode), using raw disk",
                 disk_number
@@ -1596,6 +1984,7 @@ pub fn open_disk_with_partitions_rw(
             let writer: Arc<dyn DiskWriter> = disk;
             Ok((reader, writer))
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -1603,10 +1992,343 @@ pub fn open_disk_with_partitions_rw(
 mod tests {
     use super::*;
 
+    struct MemoryDisk {
+        data: Mutex<Vec<u8>>,
+        sector_size: u32,
+        max_read: usize,
+    }
+
+    impl MemoryDisk {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: Mutex::new(data),
+                sector_size: 512,
+                max_read: usize::MAX,
+            }
+        }
+    }
+
+    impl DiskReader for MemoryDisk {
+        fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+            let offset = usize::try_from(offset).map_err(|_| {
+                XfsWinfspError::InvalidArgument("Test offset does not fit usize".to_string())
+            })?;
+            let data = self.data.lock().unwrap();
+            if offset >= data.len() || buffer.is_empty() {
+                return Ok(0);
+            }
+            let count = (data.len() - offset).min(buffer.len()).min(self.max_read);
+            buffer[..count].copy_from_slice(&data[offset..offset + count]);
+            Ok(count)
+        }
+
+        fn total_size(&self) -> u64 {
+            self.data.lock().unwrap().len() as u64
+        }
+
+        fn get_sector_size(&self) -> u32 {
+            self.sector_size
+        }
+    }
+
+    impl fs_abstraction::BlockDevice for MemoryDisk {
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> fs_abstraction::FsResult<usize> {
+            DiskReader::read_raw_at(self, offset, buffer)
+                .map_err(|_| fs_abstraction::FsError::DiskError)
+        }
+
+        fn size(&self) -> u64 {
+            DiskReader::total_size(self)
+        }
+
+        fn sector_size(&self) -> u32 {
+            DiskReader::get_sector_size(self)
+        }
+    }
+
+    struct MemoryWriter {
+        disk: MemoryDisk,
+        max_write: usize,
+    }
+
+    impl DiskReader for MemoryWriter {
+        fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+            self.disk.read_raw_at(offset, buffer)
+        }
+
+        fn total_size(&self) -> u64 {
+            self.disk.total_size()
+        }
+
+        fn get_sector_size(&self) -> u32 {
+            self.disk.get_sector_size()
+        }
+
+        fn supports_write(&self) -> bool {
+            true
+        }
+    }
+
+    impl DiskWriter for MemoryWriter {
+        fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+            let offset = usize::try_from(offset).map_err(|_| {
+                XfsWinfspError::InvalidArgument("Test offset does not fit usize".to_string())
+            })?;
+            let mut storage = self.disk.data.lock().unwrap();
+            if offset >= storage.len() || data.is_empty() {
+                return Ok(0);
+            }
+            let count = (storage.len() - offset).min(data.len()).min(self.max_write);
+            storage[offset..offset + count].copy_from_slice(&data[..count]);
+            Ok(count)
+        }
+    }
+
+    impl fs_abstraction::BlockDevice for MemoryWriter {
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> fs_abstraction::FsResult<usize> {
+            DiskReader::read_raw_at(self, offset, buffer)
+                .map_err(|_| fs_abstraction::FsError::DiskError)
+        }
+
+        fn write_at(&self, offset: u64, data: &[u8]) -> fs_abstraction::FsResult<usize> {
+            DiskWriter::write_raw_at(self, offset, data)
+                .map_err(|_| fs_abstraction::FsError::DiskError)
+        }
+
+        fn size(&self) -> u64 {
+            DiskReader::total_size(self)
+        }
+
+        fn sector_size(&self) -> u32 {
+            DiskReader::get_sector_size(self)
+        }
+    }
+
+    fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
+        buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(buffer: &mut [u8], offset: usize, value: u64) {
+        buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn refresh_header_crc(image: &mut [u8], lba: u64) {
+        let offset = lba as usize * 512;
+        let header_size = le_u32(image, offset + 12) as usize;
+        put_u32(image, offset + 16, 0);
+        let crc = crc32(&image[offset..offset + header_size]);
+        put_u32(image, offset + 16, crc);
+    }
+
+    fn write_gpt_header(
+        image: &mut [u8],
+        current_lba: u64,
+        backup_lba: u64,
+        entries_lba: u64,
+        first_usable_lba: u64,
+        last_usable_lba: u64,
+        num_entries: u32,
+        entry_size: u32,
+        entries_crc: u32,
+    ) {
+        let offset = current_lba as usize * 512;
+        let header = &mut image[offset..offset + 512];
+        header.fill(0);
+        header[..8].copy_from_slice(b"EFI PART");
+        put_u32(header, 8, 0x0001_0000);
+        put_u32(header, 12, GPT_HEADER_SIZE as u32);
+        put_u64(header, 24, current_lba);
+        put_u64(header, 32, backup_lba);
+        put_u64(header, 40, first_usable_lba);
+        put_u64(header, 48, last_usable_lba);
+        header[56] = 1; // non-zero disk GUID
+        put_u64(header, 72, entries_lba);
+        put_u32(header, 80, num_entries);
+        put_u32(header, 84, entry_size);
+        put_u32(header, 88, entries_crc);
+        let crc = crc32(&header[..GPT_HEADER_SIZE]);
+        put_u32(header, 16, crc);
+    }
+
+    fn valid_gpt_image() -> Vec<u8> {
+        const SECTORS: usize = 128;
+        let mut image = vec![0u8; SECTORS * 512];
+        image[510] = 0x55;
+        image[511] = 0xAA;
+        image[450] = 0xEE;
+
+        let mut entries = vec![0u8; 4 * 128];
+        entries[0] = 1; // non-zero partition type GUID
+        put_u64(&mut entries, 32, 16);
+        put_u64(&mut entries, 40, 31);
+        let entries_crc = crc32(&entries);
+        image[2 * 512..2 * 512 + entries.len()].copy_from_slice(&entries);
+        image[126 * 512..126 * 512 + entries.len()].copy_from_slice(&entries);
+
+        write_gpt_header(&mut image, 1, 127, 2, 6, 125, 4, 128, entries_crc);
+        write_gpt_header(&mut image, 127, 1, 126, 6, 125, 4, 128, entries_crc);
+        image
+    }
+
     #[test]
     fn test_xfs_magic() {
-        let magic_bytes = [0x58u8, 0x46, 0x53, 0x42];
-        let magic = u32::from_be_bytes(magic_bytes);
+        let magic = u32::from_be_bytes([0x58u8, 0x46, 0x53, 0x42]);
         assert_eq!(magic, 0x58465342);
+    }
+
+    #[test]
+    fn unaligned_write_rejects_short_read_without_modifying_data() {
+        let original = vec![0xA5; 32];
+        let writer = MemoryWriter {
+            disk: MemoryDisk::new(original.clone()),
+            max_write: usize::MAX,
+        };
+        let error = DiskWriter::write_unaligned(&writer, 3, b"abc").expect_err("short read");
+        assert!(error.to_string().contains("Short read"));
+        assert_eq!(*writer.disk.data.lock().unwrap(), original);
+    }
+
+    #[test]
+    fn unaligned_write_retries_partial_writes_and_preserves_sector_edges() {
+        let mut original = vec![0xA5; 1024];
+        original[3] = 0;
+        original[6] = 0;
+        let writer = MemoryWriter {
+            disk: MemoryDisk::new(original.clone()),
+            max_write: 7,
+        };
+
+        let written = DiskWriter::write_unaligned(&writer, 3, b"abc").unwrap();
+        assert_eq!(written, 3);
+        let data = writer.disk.data.lock().unwrap();
+        assert_eq!(&data[3..6], b"abc");
+        assert_eq!(&data[..3], &original[..3]);
+        assert_eq!(&data[6..], &original[6..]);
+    }
+
+    #[test]
+    fn unaligned_write_reports_zero_progress() {
+        let writer = MemoryWriter {
+            disk: MemoryDisk::new(vec![0; 512]),
+            max_write: 0,
+        };
+        let error = DiskWriter::write_unaligned(&writer, 0, b"x").expect_err("zero write");
+        assert!(error.to_string().contains("Short write"));
+    }
+
+    #[test]
+    fn positional_read_helper_retries_short_reads() {
+        let disk = MemoryDisk {
+            data: Mutex::new(vec![1, 2, 3, 4, 5]),
+            sector_size: 512,
+            max_read: 2,
+        };
+        let mut buffer = [0u8; 5];
+        read_exact_at(&disk, 0, &mut buffer).unwrap();
+        assert_eq!(buffer, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn unaligned_read_returns_available_prefix_at_eof() {
+        let disk = MemoryDisk::new(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(disk.read_unaligned(8, 4).unwrap(), vec![9, 10]);
+    }
+
+    #[test]
+    fn valid_gpt_is_accepted() {
+        let partitions = detect_partitions(&MemoryDisk::new(valid_gpt_image())).unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].offset, 16 * 512);
+        assert_eq!(partitions[0].size, 16 * 512);
+    }
+
+    #[test]
+    fn gpt_rejects_header_crc_corruption() {
+        let mut image = valid_gpt_image();
+        image[512 + 20] ^= 1;
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("bad header CRC");
+        assert!(error.to_string().contains("header CRC32"));
+    }
+
+    #[test]
+    fn gpt_rejects_entry_crc_corruption() {
+        let mut image = valid_gpt_image();
+        image[2 * 512 + 32] ^= 1;
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("bad entries CRC");
+        assert!(error.to_string().contains("entry CRC32"));
+    }
+
+    #[test]
+    fn gpt_rejects_missing_or_corrupt_backup_header() {
+        let mut image = valid_gpt_image();
+        image[127 * 512] = b'X';
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("bad backup header");
+        assert!(error.to_string().contains("GPT header"));
+    }
+
+    #[test]
+    fn gpt_rejects_excessive_entry_count_before_allocation() {
+        let mut image = valid_gpt_image();
+        put_u32(&mut image, 512 + 80, GPT_MAX_ENTRIES + 1);
+        refresh_header_crc(&mut image, 1);
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("excessive count");
+        assert!(error.to_string().contains("entry count"));
+    }
+
+    #[test]
+    fn gpt_rejects_excessive_entry_table_allocation() {
+        let mut image = valid_gpt_image();
+        put_u32(&mut image, 512 + 80, GPT_MAX_ENTRIES);
+        put_u32(&mut image, 512 + 84, u32::MAX - 7);
+        refresh_header_crc(&mut image, 1);
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("excessive allocation");
+        assert!(error.to_string().contains("allocation limit"));
+    }
+
+    #[test]
+    fn gpt_rejects_partition_outside_usable_disk_range() {
+        let mut image = valid_gpt_image();
+        for entries_lba in [2u64, 126u64] {
+            let offset = entries_lba as usize * 512;
+            put_u64(&mut image, offset + 40, 200);
+        }
+        let entries_crc = crc32(&image[2 * 512..3 * 512]);
+        for header_lba in [1u64, 127u64] {
+            let offset = header_lba as usize * 512;
+            put_u32(&mut image, offset + 88, entries_crc);
+            refresh_header_crc(&mut image, header_lba);
+        }
+        let error = detect_partitions(&MemoryDisk::new(image)).expect_err("out-of-range partition");
+        assert!(error.to_string().contains("outside the usable disk range"));
+    }
+
+    #[test]
+    fn gpt_rejects_invalid_logical_sector_size() {
+        let disk = MemoryDisk {
+            data: Mutex::new(valid_gpt_image()),
+            sector_size: 513,
+            max_read: usize::MAX,
+        };
+        assert!(detect_partitions(&disk).is_err());
+    }
+
+    #[test]
+    fn geometry_validation_never_invents_a_default() {
+        assert!(checked_sector_size(0).is_err());
+        assert!(checked_sector_size(513).is_err());
+        assert_eq!(checked_sector_size(512).unwrap(), 512);
+        assert_eq!(checked_sector_size(4096).unwrap(), 4096);
+    }
+
+    #[test]
+    fn crc32_matches_standard_check_vector() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn physical_disk_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PhysicalDiskReader>();
+        assert_send_sync::<PhysicalDiskWriter>();
     }
 }

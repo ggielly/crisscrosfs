@@ -36,7 +36,8 @@ pub fn detect_and_create(
         return Ok(Arc::new(XfsVfs::with_options(device, read_only)?));
     }
 
-    // ext4: superblock at offset 1024, magic at offset 0x38 (56) within superblock
+    // ext4: superblock at offset 1024, magic at offset 0x38 (56) within
+    // superblock
     if buffer.len() > 1082 {
         let magic = u16::from_le_bytes([buffer[1080], buffer[1081]]);
         if magic == EXT4_MAGIC {
@@ -58,8 +59,6 @@ pub fn detect_and_create(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
     struct MockBlockDevice {
@@ -107,15 +106,15 @@ mod tests {
         // magic (4)
         // block_size (4)
         // ...
-        // We need a valid block size for XfsVfs::new to pass basic validation if it
-        // parses more But detect_and_create currently only checks magic.
-        // However, XfsVfs::new calls Superblock::parse which does more validation.
-        // We need a minimally valid XFS superblock.
+        // We need a valid block size for XfsVfs::new to pass basic validation
+        // if it parses more But detect_and_create currently only checks magic.
+        // However, XfsVfs::new calls Superblock::parse which does more
+        // validation. We need a minimally valid XFS superblock.
         // Let's rely on the fact that detect_and_create checks magic FIRST.
-        // But wait, detect_and_create calls XfsVfs::new, which parses the superblock.
-        // So we need a valid superblock to avoid FsError::Corrupted.
-        // Copying a minimal valid header from xfs-rs tests would be best, or just
-        // mocking enough fields.
+        // But wait, detect_and_create calls XfsVfs::new, which parses the
+        // superblock. So we need a valid superblock to avoid
+        // FsError::Corrupted. Copying a minimal valid header from xfs-rs tests
+        // would be best, or just mocking enough fields.
 
         // Minimal valid V5 superblock fields matching xfs-rs parsing
         // magic: 0x58465342 (XFSB)
@@ -128,18 +127,20 @@ mod tests {
         // version: 5 (0x5)
 
         let block_size: u32 = 4096;
-        data[4..8].copy_from_slice(&block_size.to_be_bytes()); // blocksize is at 0x4
+        data[4..8].copy_from_slice(&block_size.to_be_bytes()); // blocksize is
+                                                               // at 0x4
 
         // Use version 5 (0xb4a4... crc at 0x24)
         // Actually, let's just create enough data for the parser to not crash.
         // The parser in xfs-rs validates magic, block size, etc.
-        // Let's try to mock just the magic for now. If it fails, we know we reached the
-        // parser. XfsVfs::new -> Superblock::parse.
+        // Let's try to mock just the magic for now. If it fails, we know we
+        // reached the parser. XfsVfs::new -> Superblock::parse.
 
         let device = Arc::new(MockBlockDevice::new(data));
 
-        // Calling detect_and_create. It might fail inside XfsVfs::new if the superblock
-        // is invalid, but it should NOT return "Unknown filesystem type".
+        // Calling detect_and_create. It might fail inside XfsVfs::new if the
+        // superblock is invalid, but it should NOT return "Unknown filesystem
+        // type".
         let result = detect_and_create(device, true);
 
         match result {

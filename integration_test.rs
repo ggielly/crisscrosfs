@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod integration_tests {
-    use xfs_rs::inode::Inode;
-    use xfs_rs::superblock::Superblock;
+    use xfs_rs::{inode::Inode, superblock::Superblock};
 
     #[test]
     fn test_superblock_and_inode_integration() {
@@ -34,7 +33,8 @@ mod integration_tests {
         // Create a minimal v2 local-format inode.
         let mut inode_buffer = vec![0u8; 256];
         inode_buffer[0..2].copy_from_slice(&xfs_rs::constants::XFS_DINODE_MAGIC.to_be_bytes());
-        inode_buffer[2..4].copy_from_slice(&0x81A4u16.to_be_bytes()); // regular file
+        inode_buffer[2..4].copy_from_slice(&0x81A4u16.to_be_bytes()); // regular
+                                                                      // file
         inode_buffer[4] = 2; // inode version
         inode_buffer[5] = xfs_rs::constants::XFS_DINODE_FMT_LOCAL;
         inode_buffer[0x38..0x40].copy_from_slice(&100u64.to_be_bytes()); // size

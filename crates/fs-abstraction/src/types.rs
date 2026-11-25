@@ -14,7 +14,7 @@ use std::time::SystemTime;
 /// File type enumeration.
 ///
 /// Maps to both Unix mode bits and Windows file attributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum VfsFileType {
     /// Regular file
@@ -32,6 +32,7 @@ pub enum VfsFileType {
     /// Unix domain socket
     Socket = 7,
     /// Unknown or unsupported type
+    #[default]
     Unknown = 0,
 }
 
@@ -77,12 +78,6 @@ impl VfsFileType {
     /// Check if this is a symbolic link.
     pub const fn is_symlink(self) -> bool {
         matches!(self, VfsFileType::Symlink)
-    }
-}
-
-impl Default for VfsFileType {
-    fn default() -> Self {
-        VfsFileType::Unknown
     }
 }
 

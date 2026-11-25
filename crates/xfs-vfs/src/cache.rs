@@ -19,26 +19,6 @@ pub const DEFAULT_BLOCK_CACHE_SIZE: usize = 1024;
 pub const DEFAULT_PATH_CACHE_SIZE: usize = 2048;
 pub const DEFAULT_DIR_CACHE_SIZE: usize = 512;
 
-/// Cache entry with timestamp for TTL
-#[derive(Clone)]
-pub struct CacheEntry<T> {
-    pub data: T,
-    pub timestamp: Instant,
-}
-
-impl<T> CacheEntry<T> {
-    pub fn new(data: T) -> Self {
-        Self {
-            data,
-            timestamp: Instant::now(),
-        }
-    }
-
-    pub fn is_expired(&self, ttl: Duration) -> bool {
-        self.timestamp.elapsed() > ttl
-    }
-}
-
 /// Cached inode data
 #[derive(Clone)]
 pub struct CachedInode {
@@ -169,13 +149,6 @@ impl XfsCache {
         cache.put(ino, CachedDirectory::new(entries));
     }
 
-    /// Invalidate a directory.
-    pub fn invalidate_directory(&self, ino: u64) {
-        self.dir_cache.write().pop(&ino);
-        // Also clear path cache since directory changed
-        self.path_cache.write().clear();
-    }
-
     /// Invalidate all caches.
     pub fn invalidate_all(&self) {
         self.inode_cache.write().clear();
@@ -183,29 +156,10 @@ impl XfsCache {
         self.path_cache.write().clear();
         self.dir_cache.write().clear();
     }
-
-    /// Get cache statistics.
-    pub fn stats(&self) -> CacheStats {
-        CacheStats {
-            inode_cache_size: self.inode_cache.read().len(),
-            block_cache_size: self.block_cache.read().len(),
-            path_cache_size: self.path_cache.read().len(),
-            dir_cache_size: self.dir_cache.read().len(),
-        }
-    }
 }
 
 impl Default for XfsCache {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Cache statistics.
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    pub inode_cache_size: usize,
-    pub block_cache_size: usize,
-    pub path_cache_size: usize,
-    pub dir_cache_size: usize,
 }

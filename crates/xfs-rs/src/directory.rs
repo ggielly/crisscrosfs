@@ -197,25 +197,25 @@ impl<'a> Iterator for ShortformDirIter<'a> {
         // 1 byte: ftype (v5 only, comes BEFORE inode)
         // 4 or 8 bytes: inode
 
-        if self.offset >= self.buffer.len() {
+        if self.buffer.len().saturating_sub(self.offset) < 3 {
             return Some(Err(FsError::BufferTooSmall));
         }
 
         let name_len = self.buffer[self.offset];
-        self.offset += 1;
-
-        // Skip 2-byte offset field
-        self.offset += 2;
-
-        // Read name
-        if self.offset + name_len as usize > self.buffer.len() {
-            return Some(Err(FsError::BufferTooSmall));
+        if name_len == 0 {
+            return Some(Err(FsError::Corrupted));
         }
+        self.offset = self.offset.saturating_add(3); // namelen + 2-byte offset
+
+        // Read name.
+        let name_end = match self.offset.checked_add(name_len as usize) {
+            Some(end) if end <= self.buffer.len() => end,
+            _ => return Some(Err(FsError::BufferTooSmall)),
+        };
 
         let mut name = [0u8; 256];
-        name[..name_len as usize]
-            .copy_from_slice(&self.buffer[self.offset..self.offset + name_len as usize]);
-        self.offset += name_len as usize;
+        name[..name_len as usize].copy_from_slice(&self.buffer[self.offset..name_end]);
+        self.offset = name_end;
 
         // Read ftype if present (comes BEFORE inode in XFS format)
         let file_type = if self.has_ftype {
@@ -229,11 +229,12 @@ impl<'a> Iterator for ShortformDirIter<'a> {
             DirFileType::Unknown
         };
 
-        // Read inode (after ftype)
+        // Read inode (after ftype).
         let inode_size = if self.use_64bit { 8 } else { 4 };
-        if self.offset + inode_size > self.buffer.len() {
-            return Some(Err(FsError::BufferTooSmall));
-        }
+        let inode_end = match self.offset.checked_add(inode_size) {
+            Some(end) if end <= self.buffer.len() => end,
+            _ => return Some(Err(FsError::BufferTooSmall)),
+        };
 
         let inode = if self.use_64bit {
             match self.buffer.read_be_u64(self.offset) {
@@ -246,7 +247,7 @@ impl<'a> Iterator for ShortformDirIter<'a> {
                 Err(e) => return Some(Err(e)),
             }
         };
-        self.offset += inode_size;
+        self.offset = inode_end;
 
         self.current += 1;
 
@@ -318,6 +319,9 @@ impl DataHeaderV5 {
     pub const SIZE: usize = 64;
 
     pub fn parse(buffer: &[u8]) -> FsResult<Self> {
+        if buffer.len() < Self::SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
         let magic = buffer.read_be_u32(0)?;
         let crc = buffer.read_be_u32(4)?;
         let block_no = buffer.read_be_u64(8)?;
@@ -435,6 +439,12 @@ impl BlockInfoV5 {
     pub const SIZE: usize = 56;
 
     pub fn parse(buffer: &[u8], offset: usize) -> FsResult<Self> {
+        let end = offset
+            .checked_add(Self::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if end > buffer.len() {
+            return Err(FsError::BufferTooSmall);
+        }
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&buffer[offset + 32..offset + 48]);
         Ok(Self {
@@ -456,15 +466,24 @@ pub struct DataDirIter<'a> {
     offset: usize,
     end_offset: usize,
     has_ftype: bool,
+    error: Option<FsError>,
 }
 
 impl<'a> DataDirIter<'a> {
     pub fn new(buffer: &'a [u8], header_size: usize, end_offset: usize, has_ftype: bool) -> Self {
+        let error = if end_offset > buffer.len() {
+            Some(FsError::BufferTooSmall)
+        } else if header_size > end_offset {
+            Some(FsError::Corrupted)
+        } else {
+            None
+        };
         Self {
             buffer,
             offset: header_size,
             end_offset,
             has_ftype,
+            error,
         }
     }
 }
@@ -473,58 +492,109 @@ impl<'a> Iterator for DataDirIter<'a> {
     type Item = FsResult<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(error) = self.error.take() {
+            self.offset = self.end_offset;
+            return Some(Err(error));
+        }
+
         while self.offset < self.end_offset {
-            // Check for unused entry (freetag = 0xFFFF)
+            let remaining = self.end_offset - self.offset;
+            if remaining < 4 {
+                self.offset = self.end_offset;
+                return Some(Err(FsError::Corrupted));
+            }
+
+            // Check for unused entry (freetag = 0xFFFF).
             let freetag = match self.buffer.read_be_u16(self.offset) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
 
             if freetag == 0xFFFF {
-                // Free space entry
                 let length = match self.buffer.read_be_u16(self.offset + 2) {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e)),
                 };
-                if length == 0 {
+                let length = length as usize;
+                // A free entry includes freetag, length and a final two-byte
+                // tag, is 8-byte aligned, and must end inside the data-entry
+                // region.  Its final tag stores this entry's starting offset.
+                if length < 8 || length % 8 != 0 || length > remaining {
+                    self.offset = self.end_offset;
                     return Some(Err(FsError::Corrupted));
                 }
-                self.offset += length as usize;
+                let start_offset = match u16::try_from(self.offset) {
+                    Ok(offset) => offset,
+                    Err(_) => {
+                        self.offset = self.end_offset;
+                        return Some(Err(FsError::Corrupted));
+                    }
+                };
+                let next_offset = self.offset + length;
+                if self.buffer.read_be_u16(next_offset - 2) != Ok(start_offset) {
+                    self.offset = self.end_offset;
+                    return Some(Err(FsError::Corrupted));
+                }
+                self.offset = next_offset;
                 continue;
             }
 
-            // Data entry
+            // Data entry: inumber(8), namelen(1), name, optional ftype, tag(2).
+            if remaining < 9 {
+                self.offset = self.end_offset;
+                return Some(Err(FsError::Corrupted));
+            }
             let inode = match self.buffer.read_be_u64(self.offset) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
             let name_len = self.buffer[self.offset + 8];
-            let name_offset = self.offset + 9;
-
-            if name_offset + name_len as usize > self.buffer.len() {
-                return Some(Err(FsError::BufferTooSmall));
+            if name_len == 0 {
+                self.offset = self.end_offset;
+                return Some(Err(FsError::Corrupted));
             }
+            let name_offset = self.offset + 9;
+            let name_end = match name_offset.checked_add(name_len as usize) {
+                Some(end) if end <= self.end_offset => end,
+                _ => {
+                    self.offset = self.end_offset;
+                    return Some(Err(FsError::Corrupted));
+                }
+            };
 
             let mut name = [0u8; 256];
-            name[..name_len as usize]
-                .copy_from_slice(&self.buffer[name_offset..name_offset + name_len as usize]);
+            name[..name_len as usize].copy_from_slice(&self.buffer[name_offset..name_end]);
 
             let file_type = if self.has_ftype {
-                let ft_offset = name_offset + name_len as usize;
-                if ft_offset >= self.buffer.len() {
-                    return Some(Err(FsError::BufferTooSmall));
+                if name_end >= self.end_offset {
+                    self.offset = self.end_offset;
+                    return Some(Err(FsError::Corrupted));
                 }
-                DirFileType::from_u8(self.buffer[ft_offset])
+                DirFileType::from_u8(self.buffer[name_end])
             } else {
                 DirFileType::Unknown
             };
 
-            // Calculate aligned size: inumber(8) + namelen(1) + name + ftype?(1) + tag(2)
             let entry_size = 8 + 1 + name_len as usize + if self.has_ftype { 1 } else { 0 } + 2;
             let aligned_size = (entry_size + 7) & !7;
+            if aligned_size > remaining {
+                self.offset = self.end_offset;
+                return Some(Err(FsError::Corrupted));
+            }
+            let start_offset = match u16::try_from(self.offset) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    self.offset = self.end_offset;
+                    return Some(Err(FsError::Corrupted));
+                }
+            };
+            let next_offset = self.offset + aligned_size;
+            if self.buffer.read_be_u16(next_offset - 2) != Ok(start_offset) {
+                self.offset = self.end_offset;
+                return Some(Err(FsError::Corrupted));
+            }
 
-            self.offset += aligned_size;
-
+            self.offset = next_offset;
             return Some(Ok(DirEntry {
                 inode,
                 file_type,
@@ -544,20 +614,44 @@ pub fn find_entry_block(
     has_ftype: bool,
     is_v5: bool,
 ) -> FsResult<DirEntry> {
-    let tail_offset = block_size as usize - BlockTail::SIZE;
-    if buffer.len() < block_size as usize {
+    let block_size = usize::try_from(block_size).map_err(|_| FsError::Corrupted)?;
+    if block_size < BlockTail::SIZE {
+        return Err(FsError::Corrupted);
+    }
+    if buffer.len() < block_size {
         return Err(FsError::BufferTooSmall);
     }
+    let expected_magic = if is_v5 {
+        XFS_DIR3_BLOCK_MAGIC
+    } else {
+        XFS_DIR2_BLOCK_MAGIC
+    };
+    if buffer.read_be_u32(0)? != expected_magic {
+        return Err(FsError::InvalidMagic);
+    }
+
+    let tail_offset = block_size - BlockTail::SIZE;
     let tail = BlockTail::parse(buffer, tail_offset)?;
+    if tail.stale > tail.count {
+        return Err(FsError::Corrupted);
+    }
 
     let header_size = if is_v5 {
         DataHeaderV5::SIZE
     } else {
         DataHeaderV4::SIZE
     };
+    if block_size < header_size + BlockTail::SIZE {
+        return Err(FsError::Corrupted);
+    }
 
-    // End offset for entries is start of leaf entries
-    let end_offset = tail_offset - (tail.count as usize * LeafEntry::SIZE);
+    // End offset for entries is the start of the leaf-entry array.
+    let leaf_bytes = (tail.count as usize)
+        .checked_mul(LeafEntry::SIZE)
+        .ok_or(FsError::ArithmeticOverflow)?;
+    let end_offset = tail_offset
+        .checked_sub(leaf_bytes)
+        .ok_or(FsError::Corrupted)?;
     if end_offset < header_size {
         return Err(FsError::Corrupted);
     }
@@ -580,18 +674,54 @@ pub fn parse_data_block<'a>(
     is_block_format: bool,
     block_size: u32,
 ) -> FsResult<DataDirIter<'a>> {
+    let block_size = usize::try_from(block_size).map_err(|_| FsError::Corrupted)?;
+    if buffer.len() < block_size {
+        return Err(FsError::BufferTooSmall);
+    }
+    if block_size < 4 {
+        return Err(FsError::Corrupted);
+    }
+
+    let expected_magic = match (is_block_format, is_v5) {
+        (true, false) => XFS_DIR2_BLOCK_MAGIC,
+        (true, true) => XFS_DIR3_BLOCK_MAGIC,
+        (false, false) => XFS_DIR2_DATA_MAGIC,
+        (false, true) => XFS_DIR3_DATA_MAGIC,
+    };
+    if buffer.read_be_u32(0)? != expected_magic {
+        return Err(FsError::InvalidMagic);
+    }
+
     let header_size = if is_v5 {
         DataHeaderV5::SIZE
     } else {
         DataHeaderV4::SIZE
     };
+    if block_size < header_size {
+        return Err(FsError::Corrupted);
+    }
 
     let end_offset = if is_block_format {
-        let tail_offset = block_size as usize - BlockTail::SIZE;
+        if block_size < header_size + BlockTail::SIZE {
+            return Err(FsError::Corrupted);
+        }
+        let tail_offset = block_size - BlockTail::SIZE;
         let tail = BlockTail::parse(buffer, tail_offset)?;
-        tail_offset - (tail.count as usize * LeafEntry::SIZE)
+        if tail.stale > tail.count {
+            return Err(FsError::Corrupted);
+        }
+        let leaf_bytes = (tail.count as usize)
+            .checked_mul(LeafEntry::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let end_offset = tail_offset
+            .checked_sub(leaf_bytes)
+            .ok_or(FsError::Corrupted)?;
+        if end_offset < header_size {
+            return Err(FsError::Corrupted);
+        }
+        end_offset
     } else {
-        buffer.len()
+        block_size
     };
 
     Ok(DataDirIter::new(buffer, header_size, end_offset, has_ftype))
@@ -603,4 +733,104 @@ pub fn validate_dir_block_magic(magic: u32) -> bool {
         magic,
         XFS_DIR2_BLOCK_MAGIC | XFS_DIR3_BLOCK_MAGIC | XFS_DIR2_DATA_MAGIC | XFS_DIR3_DATA_MAGIC
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dir_iter_rejects_zero_and_oversized_free_lengths() {
+        let mut buf = [0u8; 64];
+        buf[16..18].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        buf[18..20].copy_from_slice(&0u16.to_be_bytes());
+        let mut iter = DataDirIter::new(&buf, 16, 32, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+
+        buf[18..20].copy_from_slice(&24u16.to_be_bytes());
+        let mut iter = DataDirIter::new(&buf, 16, 32, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+    }
+
+    #[test]
+    fn data_dir_iter_keeps_entries_inside_the_data_region() {
+        let mut buf = [0u8; 64];
+        buf[24] = 20; // namelen extends beyond end_offset=32.
+        let mut iter = DataDirIter::new(&buf, 16, 32, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+
+        let mut iter = DataDirIter::new(&buf, 16, 8, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+    }
+
+    #[test]
+    fn free_entries_require_an_eight_byte_layout_and_matching_tag() {
+        let mut buf = [0u8; 32];
+        buf[16..18].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        buf[18..20].copy_from_slice(&8u16.to_be_bytes());
+        buf[22..24].copy_from_slice(&17u16.to_be_bytes()); // wrong starting
+                                                           // offset
+        let mut iter = DataDirIter::new(&buf, 16, 24, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+
+        buf[22..24].copy_from_slice(&16u16.to_be_bytes());
+        let mut iter = DataDirIter::new(&buf, 16, 24, false);
+        assert!(iter.next().is_none());
+
+        buf[18..20].copy_from_slice(&4u16.to_be_bytes());
+        let mut iter = DataDirIter::new(&buf, 16, 24, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+    }
+
+    #[test]
+    fn allocated_entries_require_a_matching_tag() {
+        let mut buf = [0u8; 64];
+        buf[16..24].copy_from_slice(&42u64.to_be_bytes());
+        buf[24] = 1;
+        buf[25] = b'x';
+        buf[30..32].copy_from_slice(&17u16.to_be_bytes()); // wrong starting
+                                                           // offset
+        let mut iter = DataDirIter::new(&buf, 16, 32, false);
+        assert!(matches!(iter.next(), Some(Err(FsError::Corrupted))));
+
+        buf[30..32].copy_from_slice(&16u16.to_be_bytes());
+        let mut iter = DataDirIter::new(&buf, 16, 32, false);
+        let entry = iter.next().unwrap().unwrap();
+        assert_eq!(entry.inode, 42);
+        assert_eq!(entry.name_bytes(), b"x");
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn shortform_truncation_is_reported_without_panicking() {
+        let header = [1u8, 0, 0, 0, 0, 1];
+        let (_, mut iter) = parse_shortform_directory(&header, false).unwrap();
+        assert!(matches!(iter.next(), Some(Err(FsError::BufferTooSmall))));
+    }
+
+    #[test]
+    fn dir3_crc_recalculation_is_big_endian() {
+        let mut buf = [0u8; DataHeaderV5::SIZE];
+        buf[0..4].copy_from_slice(&XFS_DIR3_DATA_MAGIC.to_be_bytes());
+        let crc = crate::crc::recalculate_crc_be(&mut buf, 4).unwrap();
+        let header = DataHeaderV5::parse(&buf).unwrap();
+        assert_eq!(header.crc, crc);
+        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), crc);
+    }
+
+    #[test]
+    fn data_block_parser_checks_size_magic_and_tail_bounds() {
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(&XFS_DIR2_BLOCK_MAGIC.to_be_bytes());
+        assert!(parse_data_block(&buf, false, false, true, 0).is_err());
+
+        buf[56..60].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_data_block(&buf, false, false, true, 64).is_err());
+
+        buf[0..4].copy_from_slice(&XFS_DIR3_BLOCK_MAGIC.to_be_bytes());
+        assert!(matches!(
+            parse_data_block(&buf, false, false, true, 64),
+            Err(FsError::InvalidMagic)
+        ));
+    }
 }

@@ -84,11 +84,12 @@ pub enum FsError {
     ArithmeticOverflow,
 
     /// Security violation (e.g., malicious metadata detected).
-    /// Maps to: STATUS_ACCESS_VIOLATION (0xC0000005)
+    /// Maps to: STATUS_ACCESS_DENIED (0xC0000022)
     SecurityViolation,
 
     /// Invalid data alignment.
-    /// Maps to: STATUS_DATATYPE_MISALIGNMENT (0x80000002)
+    /// Maps to: STATUS_INVALID_PARAMETER (0xC000000D). The similarly named
+    /// STATUS_DATATYPE_MISALIGNMENT is a warning and must not be used here.
     AlignmentError,
 
     // ─── Resource Errors ──────────────────────────────────────────────
@@ -114,7 +115,8 @@ pub enum FsError {
     InvalidUtf16,
 
     /// String is too long for target buffer.
-    /// Maps to: STATUS_BUFFER_OVERFLOW (0x80000005)
+    /// Maps to: STATUS_NAME_TOO_LONG (0xC0000106). STATUS_BUFFER_OVERFLOW is a
+    /// warning and must not be used for this failure.
     StringTooLong,
 
     // ─── Feature Errors ───────────────────────────────────────────────
@@ -184,14 +186,14 @@ impl FsError {
             FsError::InvalidPath => 0xC0000033_u32 as i32,
             FsError::PathTooLong => 0xC0000106_u32 as i32,
             FsError::ArithmeticOverflow => 0xC0000095_u32 as i32,
-            FsError::SecurityViolation => 0xC0000005_u32 as i32,
-            FsError::AlignmentError => 0x80000002_u32 as i32,
+            FsError::SecurityViolation => 0xC0000022_u32 as i32,
+            FsError::AlignmentError => 0xC000000D_u32 as i32,
             FsError::OutOfMemory => 0xC000009A_u32 as i32,
             FsError::NoSpace => 0xC000007F_u32 as i32,
             FsError::TooManyOpenFiles => 0xC000011F_u32 as i32,
             FsError::InvalidUtf8 => 0xC000000D_u32 as i32,
             FsError::InvalidUtf16 => 0xC000000D_u32 as i32,
-            FsError::StringTooLong => 0x80000005_u32 as i32,
+            FsError::StringTooLong => 0xC0000106_u32 as i32,
             FsError::NotImplemented => 0xC0000002_u32 as i32,
             FsError::NotSupported => 0xC00000BB_u32 as i32,
             FsError::ReadOnly => 0xC00000A2_u32 as i32,
@@ -270,5 +272,37 @@ impl FsError {
 impl fmt::Display for FsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_alignment_and_length_failures_are_ntstatus_errors() {
+        for error in [
+            FsError::AlignmentError,
+            FsError::StringTooLong,
+            FsError::SecurityViolation,
+        ] {
+            // NTSTATUS severity occupies the top two bits: 00=success,
+            // 01=information, 10=warning, 11=error.
+            assert_eq!(
+                (error.to_ntstatus() as u32) >> 30,
+                0b11,
+                "{error:?} is not an error-severity NTSTATUS"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_mappings_do_not_use_warning_codes() {
+        assert_eq!(FsError::AlignmentError.to_ntstatus(), 0xC000000D_u32 as i32);
+        assert_eq!(FsError::StringTooLong.to_ntstatus(), 0xC0000106_u32 as i32);
+        assert_eq!(
+            FsError::SecurityViolation.to_ntstatus(),
+            0xC0000022_u32 as i32
+        );
     }
 }

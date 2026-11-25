@@ -25,7 +25,8 @@ type SharedHost = Arc<Mutex<Option<FileSystemHost<VfsContext>>>>;
 
 /// Handle to a running mount. Dropping will stop the mount thread.
 pub struct MountHandle {
-    /// Shared access to the WinFsp host; `stop` takes ownership to drive shutdown.
+    /// Shared access to the WinFsp host; `stop` takes ownership to drive
+    /// shutdown.
     host: SharedHost,
     /// Channel used only to tell the background thread it can exit after the
     /// host has been stopped.  The thread itself does no WinFsp teardown.
@@ -72,7 +73,8 @@ impl MountHandle {
             }
         }
         // Now that WinFsp is stopped, tell the background thread it can exit.
-        // The thread is blocked on stop_rx.recv() doing nothing; this unblocks it.
+        // The thread is blocked on stop_rx.recv() doing nothing; this unblocks
+        // it.
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -97,6 +99,7 @@ impl Drop for MountHandle {
 /// # Arguments
 /// * `mount_point` - Drive letter (e.g., "X:") or UNC path for the mount
 /// * `fs` - Arc-wrapped VfsFileSystem providing filesystem operations
+/// * `debug_enabled` - Enable WinFsp transaction debug output when true
 ///
 /// # Returns
 /// A `MountHandle` that can be used to stop the mount, or an error.
@@ -129,36 +132,53 @@ pub fn start_mount(
 
             // Derive volume geometry/serial from the filesystem instead of
             // hardcoding values that are identical for every mounted volume.
-            let vol_info = fs.get_volume_info().ok();
+            let vol_info = match fs.get_volume_info() {
+                Ok(info) => Some(info),
+                Err(error) => {
+                    warn!(
+                        "Cannot read volume info; using default geometry: {:?}",
+                        error
+                    );
+                    None
+                }
+            };
             let volume_label = vol_info
                 .as_ref()
                 .and_then(|v| v.volume_label.clone())
                 .unwrap_or_else(|| "VFS Volume".to_string());
-            let block_size = vol_info
-                .as_ref()
-                .map(|v| v.block_size)
-                .filter(|b| b.is_power_of_two())
-                .unwrap_or(4096);
-            let sector_size = block_size.clamp(512, 4096) as u16;
-            let volume_serial = vol_info
-                .as_ref()
-                .and_then(|v| v.uuid)
-                .map(|uuid| u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]))
-                .filter(|serial| *serial != 0)
-                .unwrap_or(0x58465342); // "XFSB"
+            let block_size = vol_info.as_ref().map_or(4096, |v| v.block_size);
+            let (sector_size, sectors_per_allocation_unit) = volume_geometry(block_size);
+            if block_size != u32::from(sector_size) * u32::from(sectors_per_allocation_unit) {
+                warn!(
+                    "Invalid XFS block size {}; using 4096-byte allocation units",
+                    block_size
+                );
+            }
+            let volume_serial = volume_serial_number(vol_info.as_ref().and_then(|v| v.uuid));
 
-            // Build context using the new generic VfsContext
-            let ctx = VfsContext::new(fs.clone(), volume_label);
-
-            let is_read_only = fs.capabilities().read_only;
+            // Build context using the generic VfsContext. The mount root is
+            // also the confinement boundary for absolute symlink targets.
+            let ctx = match VfsContext::new(fs.clone(), volume_label, mount_point_owned.clone()) {
+                Ok(ctx) => ctx,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(XfsWinfspError::from(error)));
+                    return;
+                }
+            };
 
             // Configure volume parameters
             let mut volume_params = VolumeParams::default();
             volume_params.filesystem_name(fs.fs_type());
             volume_params.volume_serial_number(volume_serial);
             volume_params.sector_size(sector_size);
-            volume_params.sectors_per_allocation_unit(1);
-            volume_params.read_only_volume(is_read_only);
+            volume_params.sectors_per_allocation_unit(sectors_per_allocation_unit);
+            // The XFS write path is incomplete. Never advertise or enable RW,
+            // even if a different VFS implementation reports writable
+            // capabilities.
+            volume_params.read_only_volume(true);
+            volume_params.reparse_points(true);
+            // ACL modification/persistence is not implemented by the glue.
+            volume_params.persistent_acls(false);
             volume_params.case_sensitive_search(true);
             volume_params.case_preserved_names(true);
             volume_params.unicode_on_disk(true);
@@ -167,8 +187,9 @@ pub fn start_mount(
             volume_params.post_cleanup_when_modified_only(true);
 
             debug!(
-                "FileSystemHost VolumeParams configured (sector_size={}, serial=0x{:08X})",
-                sector_size, volume_serial
+                "FileSystemHost VolumeParams configured (sector_size={}, \
+                 sectors_per_allocation_unit={}, serial=0x{:08X})",
+                sector_size, sectors_per_allocation_unit, volume_serial
             );
 
             // Only enable WinFsp tracing when the caller asked for it.
@@ -193,10 +214,12 @@ pub fn start_mount(
 
                     info!("Filesystem mounted at {}", mount_point_owned);
 
-                    // Start the WinFsp dispatcher.  FspFileSystemStartDispatcher spawns
-                    // worker threads and returns immediately — it is NOT blocking.
-                    // The dispatcher runs autonomously until FspFileSystemStopDispatcher
-                    // is called, which happens in MountHandle::stop() / Drop, not here.
+                    // Start the WinFsp dispatcher.
+                    // FspFileSystemStartDispatcher spawns worker threads and
+                    // returns immediately — it is NOT blocking. The dispatcher
+                    // runs autonomously until FspFileSystemStopDispatcher
+                    // is called, which happens in MountHandle::stop() / Drop,
+                    // not here.
                     if let Err(e) = host.start() {
                         let err_msg = format!("Dispatcher start failed: {:?}", e);
                         error!("{}", err_msg);
@@ -204,9 +227,9 @@ pub fn start_mount(
                         return;
                     }
 
-                    // Hand the live host to the shared Arc so MountHandle can stop it.
-                    // This must happen before signalling ready so the handle is usable
-                    // as soon as the caller receives it.
+                    // Hand the live host to the shared Arc so MountHandle can
+                    // stop it. This must happen before signalling ready so the
+                    // handle is usable as soon as the caller receives it.
                     {
                         let mut guard = host_arc_for_thread.lock().unwrap();
                         *guard = Some(host);
@@ -215,8 +238,9 @@ pub fn start_mount(
                     info!("WinFsp dispatcher running for {}", mount_point_owned);
                     let _ = ready_tx.send(Ok(()));
 
-                    // Wait for MountHandle::stop() / Drop to stop the host and then
-                    // send this signal.  The thread has no more WinFsp work to do.
+                    // Wait for MountHandle::stop() / Drop to stop the host and
+                    // then send this signal.  The thread has no more WinFsp
+                    // work to do.
                     let _ = stop_rx.recv();
 
                     info!("Mount thread exiting for {}", mount_point_owned);
@@ -271,5 +295,55 @@ impl Default for XfsMountOptions {
             debug: false,
             label_override: None,
         }
+    }
+}
+
+/// Derive WinFsp geometry so the allocation unit equals the XFS block size.
+/// WinFsp's sector size remains the conventional 512 bytes; larger XFS blocks
+/// are represented by SectorsPerAllocationUnit rather than being clamped.
+fn volume_geometry(block_size: u32) -> (u16, u16) {
+    if (512..=65_536).contains(&block_size) && block_size.is_power_of_two() {
+        (512, (block_size / 512) as u16)
+    } else {
+        (512, 8) // safe 4096-byte fallback
+    }
+}
+
+fn volume_serial_number(uuid: Option<[u8; 16]>) -> u32 {
+    uuid.map(|uuid| u32::from_be_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]))
+        .filter(|serial| *serial != 0)
+        .unwrap_or(0x58465342) // "XFSB"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_uses_xfs_block_size_as_allocation_unit() {
+        for block_size in [512, 1024, 4096, 8192, 65_536] {
+            let (sector_size, sectors_per_unit) = volume_geometry(block_size);
+            assert_eq!(sector_size, 512);
+            assert_eq!(
+                u32::from(sector_size) * u32::from(sectors_per_unit),
+                block_size
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_geometry_falls_back_without_clamping_valid_blocks() {
+        for block_size in [0, 513, 4095, 65_537, u32::MAX] {
+            assert_eq!(volume_geometry(block_size), (512, 8));
+        }
+    }
+
+    #[test]
+    fn serial_is_derived_from_uuid_with_nonzero_fallback() {
+        let mut uuid = [0u8; 16];
+        uuid[..4].copy_from_slice(&0x1234_ABCD_u32.to_be_bytes());
+        assert_eq!(volume_serial_number(Some(uuid)), 0x1234_ABCD);
+        assert_eq!(volume_serial_number(None), 0x58465342);
+        assert_eq!(volume_serial_number(Some([0u8; 16])), 0x58465342);
     }
 }

@@ -4,9 +4,6 @@
 //! It's located at the beginning of each Allocation Group (AG), with the
 //! primary copy in AG 0.
 
-#[cfg(feature = "alloc")]
-extern crate alloc;
-
 use fs_abstraction::{safe_math::CheckedSliceOps, FsError, FsResult};
 
 use crate::constants::*;
@@ -172,6 +169,15 @@ impl Superblock {
         let realtime_bitmap_blocks = local_slice.read_be_u32(0x05C)?;
         let log_blocks = local_slice.read_be_u32(0x060)?;
         let version = local_slice.read_be_u16(0x064)?;
+        let version_num = version & 0x000F;
+        if version_num != XFS_SB_VERSION_4 && version_num != XFS_SB_VERSION_5 {
+            return Err(FsError::UnsupportedVersion);
+        }
+        let is_v5_version = version_num == XFS_SB_VERSION_5;
+        if is_v5_version && buffer.len() < XFS_SB_SIZE_V5 {
+            return Err(FsError::BufferTooSmall);
+        }
+
         let sector_size = local_slice.read_be_u16(0x066)?;
         let inode_size = local_slice.read_be_u16(0x068)?;
         let inodes_per_block = local_slice.read_be_u16(0x06A)?;
@@ -194,11 +200,12 @@ impl Superblock {
         let free_realtime_extents = local_slice.read_be_u64(0x098)?;
         let features2 = local_slice.read_be_u32(0x0C8)?;
 
-        // Parse v5 fields if present.  The version nibble (not the whole
-        // versionnum word, which contains v4 feature flags) determines v5.
-        let is_v5_version = (version & 0x000F) >= XFS_SB_VERSION_5;
+        // The version nibble (not the whole versionnum word, which contains
+        // v4 feature flags) determines the v5 layout.  Its full fixed-size
+        // structure must be present; a truncated v5 superblock is not a v4
+        // superblock with optional fields.
         let (features_compat, features_ro_compat, features_incompat, features_log_incompat) =
-            if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
+            if is_v5_version {
                 (
                     local_slice.read_be_u32(0x0D0)?,
                     local_slice.read_be_u32(0x0D4)?,
@@ -209,33 +216,33 @@ impl Superblock {
                 (0, 0, 0, 0)
             };
 
-        let crc = if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
-            // XFS stores metadata CRC fields as little-endian __le32.
+        // XFS stores the superblock CRC as little-endian __le32.
+        let crc = if is_v5_version {
             local_slice.read_le_u32(0x0E0)?
         } else {
             0
         };
 
-        let sparse_inode_align = if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
+        let sparse_inode_align = if is_v5_version {
             local_slice.read_be_u32(0x0E4)?
         } else {
             0
         };
 
-        let project_quota_inode = if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
+        let project_quota_inode = if is_v5_version {
             local_slice.read_be_u64(0x0E8)?
         } else {
             0
         };
 
-        let lsn = if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
+        let lsn = if is_v5_version {
             local_slice.read_be_u64(0x0F0)?
         } else {
             0
         };
 
         let mut meta_uuid = [0u8; 16];
-        if is_v5_version && buffer.len() >= XFS_SB_SIZE_V5 {
+        if is_v5_version {
             meta_uuid.copy_from_slice(&local[0x0F8..0x108]);
         }
 
@@ -334,20 +341,35 @@ impl Superblock {
         {
             return Err(FsError::Corrupted);
         }
+        if self.realtime_extent_log >= 32 {
+            return Err(FsError::Corrupted);
+        }
+        if self.realtime_extents != 0 && (1u64 << self.realtime_extent_log) != self.realtime_extents
+        {
+            return Err(FsError::Corrupted);
+        }
 
-        // Check AG geometry
+        // Check AG geometry.
         if self.ag_count == 0 || self.ag_blocks == 0 || self.total_blocks == 0 {
             return Err(FsError::Corrupted);
         }
         if self.ag_block_log >= 32 || (1u64 << self.ag_block_log) < u64::from(self.ag_blocks) {
             return Err(FsError::Corrupted);
         }
+        if self.ag_block_log > 0 && (1u64 << (self.ag_block_log - 1)) >= u64::from(self.ag_blocks) {
+            return Err(FsError::Corrupted);
+        }
 
-        // The AGs must cover the filesystem.
+        // All but the last AG have `ag_blocks` blocks.  The last AG may be
+        // shorter, but it must contain at least one block and the AGs must not
+        // cover more than one full extra AG.
         let covered = (self.ag_blocks as u64)
             .checked_mul(self.ag_count as u64)
             .ok_or(FsError::ArithmeticOverflow)?;
-        if self.total_blocks > covered {
+        let before_last_ag = (self.ag_blocks as u64)
+            .checked_mul(u64::from(self.ag_count - 1))
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if self.total_blocks <= before_last_ag || self.total_blocks > covered {
             return Err(FsError::Corrupted);
         }
 
@@ -363,17 +385,18 @@ impl Superblock {
         }
 
         // Reject incompatible features we do not understand rather than
-        // parsing them with the wrong on-disk layout.
+        // parsing them with the wrong on-disk layout.  In particular, NREXT64
+        // changes the inode extent-counter fields and is not implemented by
+        // this parser yet.
         let known_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE
             | XFS_SB_FEAT_INCOMPAT_SPINODES
             | XFS_SB_FEAT_INCOMPAT_META_UUID
-            | XFS_SB_FEAT_INCOMPAT_BIGTIME
-            | XFS_SB_FEAT_INCOMPAT_NREXT64;
+            | XFS_SB_FEAT_INCOMPAT_BIGTIME;
         if self.is_v5() && (self.features_incompat & !known_incompat) != 0 {
             return Err(FsError::NotSupported);
         }
 
-        // Check version
+        // Check the version nibble exactly; high bits are v4 feature flags.
         let version_num = self.version & 0x000F;
         if version_num != XFS_SB_VERSION_4 && version_num != XFS_SB_VERSION_5 {
             return Err(FsError::UnsupportedVersion);
@@ -386,7 +409,6 @@ impl Superblock {
     ///
     /// `raw` must contain at least `sector_size` bytes: XFS computes the
     /// superblock CRC over one sector, with the CRC field itself zeroed.
-    #[cfg(feature = "alloc")]
     pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
         if !self.is_v5() {
             return Ok(());
@@ -397,18 +419,12 @@ impl Superblock {
             return Err(FsError::BufferTooSmall);
         }
 
-        let mut copy = alloc::vec::Vec::from(&raw[..sector_size]);
-        copy[0xE0..0xE4].fill(0);
-        let calculated = crate::crc::xfs_crc32c(&copy);
-        if calculated != self.crc {
-            return Err(FsError::Corrupted);
-        }
-        Ok(())
+        crate::crc::verify_crc32c_field(&raw[..sector_size], 0xE0, self.crc, true)
     }
 
     /// Returns `true` if this is a v5 filesystem.
     pub fn is_v5(&self) -> bool {
-        (self.version & 0x000F) >= XFS_SB_VERSION_5
+        (self.version & 0x000F) == XFS_SB_VERSION_5
     }
 
     /// Returns `true` if the filesystem has file type in directory entries.
@@ -563,6 +579,8 @@ impl Superblock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn test_parse_too_small() {
@@ -647,6 +665,104 @@ mod tests {
         buf5[0x064..0x066].copy_from_slice(&5u16.to_be_bytes());
         let sb = Superblock::parse(&buf5).unwrap();
         assert!(sb.is_v5());
+    }
+
+    fn valid_superblock_buffer(version: u16, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        buf[0..4].copy_from_slice(&XFS_SB_MAGIC.to_be_bytes());
+        buf[4..8].copy_from_slice(&4096u32.to_be_bytes());
+        buf[0x008..0x010].copy_from_slice(&1024u64.to_be_bytes());
+        buf[0x054..0x058].copy_from_slice(&1024u32.to_be_bytes());
+        buf[0x058..0x05C].copy_from_slice(&1u32.to_be_bytes());
+        buf[0x064..0x066].copy_from_slice(&version.to_be_bytes());
+        buf[0x066..0x068].copy_from_slice(&512u16.to_be_bytes());
+        buf[0x068..0x06A].copy_from_slice(&256u16.to_be_bytes());
+        buf[0x06A..0x06C].copy_from_slice(&16u16.to_be_bytes());
+        buf[0x078] = 12;
+        buf[0x079] = 9;
+        buf[0x07A] = 8;
+        buf[0x07B] = 4;
+        buf[0x07C] = 10;
+        buf
+    }
+
+    #[test]
+    fn v5_requires_the_complete_fixed_header() {
+        let buf = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V4);
+        assert!(matches!(
+            Superblock::parse(&buf),
+            Err(FsError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn version_is_checked_by_nibble() {
+        let buf = valid_superblock_buffer(
+            XFS_SB_VERSION_4 | XFS_SB_VERSION_MOREBITSBIT,
+            XFS_SB_SIZE_V4,
+        );
+        assert!(Superblock::parse(&buf).is_ok());
+
+        let buf = valid_superblock_buffer(6, XFS_SB_SIZE_V4);
+        assert!(matches!(
+            Superblock::parse(&buf),
+            Err(FsError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_log_fields() {
+        for offset in [0x078, 0x079, 0x07A, 0x07B, 0x07C, 0x07D] {
+            let mut buf = valid_superblock_buffer(XFS_SB_VERSION_4, XFS_SB_SIZE_V4);
+            buf[offset] = 32;
+            assert!(matches!(Superblock::parse(&buf), Err(FsError::Corrupted)));
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_ag_coverage() {
+        let mut buf = valid_superblock_buffer(XFS_SB_VERSION_4, XFS_SB_SIZE_V4);
+        buf[0x058..0x05C].copy_from_slice(&2u32.to_be_bytes());
+        buf[0x008..0x010].copy_from_slice(&1024u64.to_be_bytes());
+        assert!(matches!(Superblock::parse(&buf), Err(FsError::Corrupted)));
+
+        buf[0x008..0x010].copy_from_slice(&2049u64.to_be_bytes());
+        assert!(matches!(Superblock::parse(&buf), Err(FsError::Corrupted)));
+
+        // A shorter final AG is valid.
+        buf[0x008..0x010].copy_from_slice(&1500u64.to_be_bytes());
+        assert!(Superblock::parse(&buf).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_incompatible_features() {
+        for feature in [1 << 30, XFS_SB_FEAT_INCOMPAT_NREXT64] {
+            let mut buf = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
+            buf[0x0D8..0x0DC].copy_from_slice(&feature.to_be_bytes());
+            assert!(matches!(
+                Superblock::parse(&buf),
+                Err(FsError::NotSupported)
+            ));
+        }
+    }
+
+    #[test]
+    fn v5_crc_covers_exactly_one_sector() {
+        let mut buf = valid_superblock_buffer(XFS_SB_VERSION_5, 1024);
+        for byte in &mut buf[512..] {
+            *byte = 0xA5;
+        }
+        let crc = crate::crc::xfs_crc32c(&buf[..512]);
+        buf[0xE0..0xE4].copy_from_slice(&crc.to_le_bytes());
+
+        let sb = Superblock::parse(&buf).unwrap();
+        assert!(sb.verify_crc(&buf).is_ok());
+
+        let mut corrupted = buf;
+        corrupted[512] ^= 1;
+        assert!(sb.verify_crc(&corrupted).is_ok());
+        corrupted[20] ^= 1;
+        assert!(matches!(sb.verify_crc(&corrupted), Err(FsError::Corrupted)));
     }
 
     #[test]

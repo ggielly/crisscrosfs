@@ -50,6 +50,33 @@ Write-Host "Running xfs-mount (release)..." -ForegroundColor Cyan
 ."target\release\xfs-mount.exe"
 '''
 
+[tasks.test]
+description = "Run all workspace tests"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+cargo test --workspace --all-targets
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+'''
+
+[tasks.clippy]
+description = "Run strict Clippy checks"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+cargo clippy --workspace --all-targets -- -D warnings
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+'''
+
+[tasks.fmt]
+description = "Check Rust formatting"
+script_runner = "powershell"
+script_extension = "ps1"
+script = '''
+cargo fmt --all -- --check
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+'''
+
 # ============================================================================
 # Help
 # ============================================================================
@@ -68,6 +95,9 @@ Write-Host "  cargo make              - Build fs-winfsp-glue (debug)"
 Write-Host "  cargo make release      - Build fs-winfsp-glue (release)"
 Write-Host "  cargo make run          - Run xfs-mount (debug)"
 Write-Host "  cargo make run-release  - Run xfs-mount (release)"
+Write-Host "  cargo make test         - Run all tests"
+Write-Host "  cargo make clippy       - Run strict Clippy"
+Write-Host "  cargo make fmt          - Check formatting"
 Write-Host ""
 Write-Host "Help:" -ForegroundColor Yellow
 Write-Host "  cargo make help         - Show this help message"

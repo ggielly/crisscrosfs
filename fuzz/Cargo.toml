@@ -1,19 +1,11 @@
 [package]
-name = "xfs-rs-fuzz"
-version = "0.0.0"
+name = "crisscrosfs-fuzz"
+version = "0.1.0"
 edition = "2021"
 publish = false
 
-[package.metadata]
-cargo-fuzz = true
+[workspace]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-xfs-rs = { path = "..", features = ["std"] }
-
-[[bin]]
-name = "superblock"
-path = "fuzz_targets/superblock.rs"
-test = false
-doc = false
-bench = false
+xfs-rs = { path = "../crates/xfs-rs", features = ["std"] }

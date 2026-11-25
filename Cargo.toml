@@ -15,27 +15,7 @@ exclude = ["fuzz"]
 version = "0.1.0"
 edition = "2021"
 license = "GPLv3"
-repository = "https://github.com/user/crisscrosfs"
-authors = ["Guillaume Gielly"]
-
 [workspace.dependencies]
-# Internal crates
-fs-abstraction = { path = "crates/fs-abstraction" }
-xfs-rs = { path = "crates/xfs-rs" }
-xfs-vfs = { path = "crates/xfs-vfs" }
-fs-winfsp-glue = { path = "crates/fs-winfsp-glue" }
-
-# User-mode dependencies
-anyhow = "1.0"
-thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs"] }
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.9.8"
-windows = "0.58"
-
 # Benchmark dependencies
 criterion = "0.5"
 
