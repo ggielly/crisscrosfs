@@ -31,3 +31,6 @@ QWEN.md
 
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md
+
+# Large local-only XFS test image (regenerate on an XFS host)
+test-images/xfs-300M.img*
