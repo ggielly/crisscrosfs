@@ -25,6 +25,9 @@ QWEN.md
 
 .vs
 .claude
+.cocoindex_code
+.vscode
+.github
 
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md

@@ -64,6 +64,7 @@ pub mod file_context;
 pub mod log_colorizer;
 pub mod mount;
 pub mod path;
+pub mod security;
 pub mod service;
 pub mod transactional;
 pub mod volume;

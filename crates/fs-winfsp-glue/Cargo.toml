@@ -30,6 +30,7 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_Services",
     "Win32_System_Console",
+    "Win32_System_Threading",
 ] }
 
 # Error handling & logging

@@ -4,7 +4,7 @@
 //! callbacks and the generic `VfsFileSystem` trait.
 
 use std::{
-    ffi::OsStr,
+    ffi::{c_void, OsStr},
     sync::{atomic::AtomicU64, Arc},
 };
 
@@ -21,6 +21,8 @@ use winfsp::{
     },
     FspError, U16CStr,
 };
+
+use crate::security::AclMapper;
 
 // Windows file attributes constants
 const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
@@ -60,12 +62,43 @@ pub struct VfsContext {
     pub fs: Arc<dyn VfsFileSystem>,
     /// Volume label.
     pub volume_label: String,
+    /// POSIX mode/uid/gid → Windows security descriptor mapper.
+    acl_mapper: AclMapper,
 }
 
 impl VfsContext {
     /// Create a new VFS context.
     pub fn new(fs: Arc<dyn VfsFileSystem>, volume_label: String) -> Self {
-        Self { fs, volume_label }
+        Self {
+            fs,
+            volume_label,
+            acl_mapper: AclMapper::new(),
+        }
+    }
+
+    /// Copy a self-relative security descriptor into the WinFsp buffer (if
+    /// provided) and return its length.
+    fn copy_security_descriptor(
+        &self,
+        sd: &[u8],
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        let length = sd.len() as u64;
+        if let Some(buffer) = security_descriptor {
+            if buffer.len() < sd.len() {
+                return Err(FspError::NTSTATUS(FsError::BufferTooSmall.to_ntstatus()));
+            }
+            // SAFETY: WinFsp guarantees the buffer points to at least
+            // `buffer.len()` writable bytes of c_void storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sd.as_ptr(),
+                    buffer.as_mut_ptr() as *mut u8,
+                    sd.len(),
+                );
+            }
+        }
+        Ok(length)
     }
 
     /// Helper: Map VfsFileInfo to WinFsp FileInfo.
@@ -109,7 +142,7 @@ impl FileSystemContext for VfsContext {
     fn get_security_by_name(
         &self,
         file_name: &U16CStr,
-        _security_descriptor: Option<&mut [std::ffi::c_void]>,
+        security_descriptor: Option<&mut [std::ffi::c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let name = file_name.to_string_lossy();
@@ -126,9 +159,12 @@ impl FileSystemContext for VfsContext {
                         attributes |= FILE_ATTRIBUTE_READONLY;
                     }
 
+                    let sd = self.acl_mapper.security_descriptor(&info);
+                    let length = self.copy_security_descriptor(&sd, security_descriptor)?;
+
                     Ok(FileSecurity {
                         reparse: info.file_type == VfsFileType::Symlink,
-                        sz_security_descriptor: 0,
+                        sz_security_descriptor: length,
                         attributes,
                     })
                 }
@@ -170,6 +206,16 @@ impl FileSystemContext for VfsContext {
 
     fn close(&self, _context: Self::FileContext) {
         // No-op for now, VfsFileHandle will drop.
+    }
+
+    fn get_security(
+        &self,
+        context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> winfsp::Result<u64> {
+        let info = self.fs.stat(context.inode).map_err(|e| self.map_error(e))?;
+        let sd = self.acl_mapper.security_descriptor(&info);
+        self.copy_security_descriptor(&sd, security_descriptor)
     }
 
     fn get_file_info(

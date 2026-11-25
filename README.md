@@ -72,10 +72,16 @@ parser.
 
 - The driver is read-only.  Write entry points return an error at the API
   boundary, not only in the CLI.
-- XFS POSIX mode/uid/gid are **not** mapped to Windows security descriptors.
-  WinFsp does not enforce per-file XFS permissions; the mounted volume is
-  readable by users who can access the mount point.  Do not mount untrusted
-  XFS images on multi-user systems without an external access restriction.
+- XFS POSIX permissions are mapped to Windows security descriptors:
+  - uid 0 → `NT AUTHORITY\SYSTEM`, any other uid → the user running the mount;
+  - gid 0 → `BUILTIN\Administrators`, any other gid → `Authenticated Users`;
+  - the `other` triad applies to `Everyone`;
+  - read/write/execute map to the corresponding Windows generic rights
+    (`FILE_GENERIC_READ/WRITE/EXECUTE`, plus `FILE_DELETE_CHILD` on writable
+    directories).
+  Because Windows has no general uid/gid directory, non-root IDs are collapsed
+  onto those principals.  Do not rely on this mapping for strict multi-user
+  isolation of untrusted XFS images.
 - The service runs as LocalSystem and mounts volumes read-only.
 
 ## License
