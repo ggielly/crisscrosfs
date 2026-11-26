@@ -108,6 +108,15 @@ pub trait VfsFileSystem: Send + Sync {
         Ok(())
     }
 
+    /// Flush and place the filesystem in a clean shutdown state.
+    ///
+    /// Read-only filesystems normally need only [`Self::sync`]. Writable
+    /// backends may override this to write an unmount record after all pending
+    /// metadata is durable.
+    fn shutdown(&self) -> FsResult<()> {
+        self.sync()
+    }
+
     // =========================================================================
     // Inode Operations
     // =========================================================================
@@ -405,6 +414,15 @@ pub trait BlockDevice: Send + Sync {
     /// Returns the sector size (typically 512 or 4096).
     fn sector_size(&self) -> u32 {
         512
+    }
+
+    /// Whether this device implements writable positional I/O.
+    ///
+    /// The default is `false`; read-only devices must not be passed to a
+    /// writable filesystem constructor. Implementations that override
+    /// `write_at` should also override this capability query.
+    fn supports_write(&self) -> bool {
+        false
     }
 
     /// Flushes any cached writes to the device.

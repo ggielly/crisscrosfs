@@ -43,16 +43,22 @@
 //! // let entries = xfs.readdir(root)?;
 //! ```
 
+mod allocator;
 mod cache;
 mod directory;
 mod error;
 mod filesystem;
 mod inode;
+mod inode_allocator;
+mod inode_write;
 mod io;
+mod journal;
 mod read_ops;
+mod transaction;
+mod writer;
 
-// allocator, journal and write_ops are intentionally not compiled.  The VFS is
-// structurally read-only and must not contain an accidental write path.
+// The legacy write_ops module remains uncompiled. The active transactional
+// implementation is writer.rs; read_only constructors never expose it.
 
 pub use error::XfsVfsError;
 pub use filesystem::XfsVfs;

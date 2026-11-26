@@ -2,7 +2,10 @@
 //!
 //! This module implements the `VfsFileSystem` trait for XFS.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use fs_abstraction::{
     BlockDevice,
@@ -14,15 +17,20 @@ use fs_abstraction::{
     VfsFileSystem,
     VfsVolumeInfo,
 };
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, trace};
 use xfs_rs::{Inode, Superblock};
 
 use crate::{
+    allocator::BlockAllocator,
     cache::XfsCache,
     directory::{find_entry_by_name, parse_directory_entries},
     inode::{inode_to_file_info, is_directory, is_symlink},
+    inode_allocator::InodeAllocator,
     io::{filesystem_size, read_exact_at},
+    journal::Journal,
     read_ops::{read_file_data, read_symlink_target},
+    writer::WriteContext,
 };
 
 /// XFS Virtual File System implementation.
@@ -43,6 +51,16 @@ pub struct XfsVfs {
 
     /// Cache manager
     cache: XfsCache,
+
+    /// Serializes readers against metadata mutations.
+    operation_lock: RwLock<()>,
+
+    /// Real XFS journal, present only for writable instances.
+    journal: Option<Mutex<Journal>>,
+
+    /// Cached superblock free-space counters updated after each transaction.
+    free_blocks: AtomicU64,
+    free_inodes: AtomicU64,
 }
 
 impl XfsVfs {
@@ -61,11 +79,13 @@ impl XfsVfs {
 
     /// Create a new XFS VFS instance with options.
     ///
-    /// Writable instances are intentionally unsupported: the allocator and
-    /// journal are incomplete, so `read_only == false` is rejected before any
-    /// filesystem I/O.  There is no writer handle in [`Self`].
+    /// Writable construction requires a writable device and a valid internal
+    /// XFS log. Recovery completes before the instance is returned. Unsupported
+    /// metadata features and directory geometries fail with
+    /// [`FsError::NotSupported`] or [`FsError::NotImplemented`] before the
+    /// transaction is committed.
     pub fn with_options(device: Arc<dyn BlockDevice>, read_only: bool) -> FsResult<Self> {
-        if !read_only {
+        if !read_only && !device.supports_write() {
             return Err(FsError::ReadOnly);
         }
 
@@ -89,6 +109,9 @@ impl XfsVfs {
             buf
         };
         let superblock = Superblock::parse(&sb_buf).map_err(|_| FsError::Corrupted)?;
+        if superblock.in_progress != 0 {
+            return Err(FsError::NotSupported);
+        }
 
         // Verify v5 CRC over the full logical sector, not just the probe.
         if superblock.is_v5() {
@@ -99,9 +122,49 @@ impl XfsVfs {
         if filesystem_size > device_size {
             return Err(FsError::Corrupted);
         }
+        if !read_only {
+            let quota_flags = sb_buf.get(0xB8..0xBA).ok_or(FsError::BufferTooSmall)?;
+            let quota_offsets: &[usize] = if superblock.is_v5() {
+                &[0xA0, 0xA8, 0xE8]
+            } else {
+                &[0xA0, 0xA8, 0xB0]
+            };
+            let mut quotas_enabled = false;
+            for offset in quota_offsets {
+                let raw = sb_buf
+                    .get(*offset..*offset + 8)
+                    .ok_or(FsError::BufferTooSmall)?;
+                let ino = u64::from_be_bytes(raw.try_into().map_err(|_| FsError::Corrupted)?);
+                if ino != 0 && ino != u64::MAX {
+                    quotas_enabled = true;
+                    break;
+                }
+            }
+            if superblock.realtime_blocks != 0
+                || superblock.features_log_incompat != 0
+                || quotas_enabled
+                || quota_flags.iter().any(|byte| *byte != 0)
+            {
+                return Err(FsError::NotSupported);
+            }
+        }
+
+        let journal = if read_only {
+            None
+        } else {
+            let mut journal = Journal::new(device.clone(), superblock.clone())?;
+            journal.recover()?;
+            Some(Mutex::new(journal))
+        };
 
         let mut capabilities = FsCapabilities::xfs();
-        capabilities.read_only = true;
+        capabilities.read_only = read_only;
+        if !read_only {
+            // Attribute-fork mutations are not implemented by the writer.
+            capabilities.supports_xattr = false;
+        }
+        let free_blocks = AtomicU64::new(superblock.free_blocks);
+        let free_inodes = AtomicU64::new(superblock.free_inodes);
 
         Ok(Self {
             device,
@@ -109,6 +172,10 @@ impl XfsVfs {
             filesystem_size,
             capabilities,
             cache: XfsCache::new(),
+            operation_lock: RwLock::new(()),
+            journal,
+            free_blocks,
+            free_inodes,
         })
     }
 
@@ -130,6 +197,76 @@ impl XfsVfs {
     /// Check if filesystem uses bigtime format for timestamps.
     pub fn has_bigtime(&self) -> bool {
         self.superblock.has_bigtime()
+    }
+
+    fn refresh_superblock_counters(&self) -> FsResult<()> {
+        let mut raw = vec![0u8; self.superblock.sector_size as usize];
+        read_exact_at(self.device.as_ref(), 0, &mut raw, self.filesystem_size)?;
+        let sb = Superblock::parse(&raw).map_err(|_| FsError::Corrupted)?;
+        if sb.is_v5() {
+            sb.verify_crc(&raw)?;
+        }
+        self.free_blocks.store(sb.free_blocks, Ordering::Release);
+        self.free_inodes.store(sb.free_inodes, Ordering::Release);
+        Ok(())
+    }
+
+    /// Flush all pending writes. Read-only instances perform no device I/O.
+    pub fn sync(&self) -> FsResult<()> {
+        let _guard = self.operation_lock.write();
+        if self.capabilities.read_only {
+            return Ok(());
+        }
+        self.device.flush().map_err(|_| FsError::DiskError)
+    }
+
+    /// Append a clean unmount record after all metadata is durable.
+    pub fn shutdown(&self) -> FsResult<()> {
+        let _guard = self.operation_lock.write();
+        if self.capabilities.read_only {
+            return Ok(());
+        }
+        if let Some(journal) = &self.journal {
+            journal.lock().shutdown()?;
+        }
+        self.device.flush().map_err(|_| FsError::DiskError)
+    }
+
+    fn mutate_with_writer<T>(
+        &self,
+        operation: impl FnOnce(&mut WriteContext<'_>) -> FsResult<T>,
+    ) -> FsResult<T> {
+        let _guard = self.operation_lock.write();
+        if self.capabilities.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        let journal = self.journal.as_ref().ok_or(FsError::ReadOnly)?;
+        let mut journal = journal.lock();
+        if journal.is_poisoned() {
+            return Err(FsError::ReadOnly);
+        }
+        let allocator = BlockAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let inode_allocator = InodeAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let mut writer = WriteContext {
+            device: self.device.clone(),
+            superblock: self.superblock.clone(),
+            filesystem_size: self.filesystem_size,
+            journal: &mut journal,
+            allocator,
+            inode_allocator,
+            block_overlay: Default::default(),
+            data_rollback: Default::default(),
+        };
+        let result = operation(&mut writer);
+        drop(writer);
+        drop(journal);
+        self.cache.invalidate_all();
+        if result.is_ok() {
+            if let Err(error) = self.refresh_superblock_counters() {
+                debug!(%error, "failed to refresh superblock counters after mutation");
+            }
+        }
+        result
     }
 
     /// Read an inode from disk or cache.
@@ -287,6 +424,14 @@ impl VfsFileSystem for XfsVfs {
         "xfs"
     }
 
+    fn sync(&self) -> FsResult<()> {
+        XfsVfs::sync(self)
+    }
+
+    fn shutdown(&self) -> FsResult<()> {
+        XfsVfs::shutdown(self)
+    }
+
     fn capabilities(&self) -> &FsCapabilities {
         &self.capabilities
     }
@@ -296,14 +441,27 @@ impl VfsFileSystem for XfsVfs {
     }
 
     fn get_volume_info(&self) -> FsResult<VfsVolumeInfo> {
+        let _guard = self.operation_lock.read();
         let sb = &self.superblock;
         let block_size = sb.block_size as u64;
         let total_blocks = sb.total_blocks;
 
         // Free blocks from AG free block info (simplified).  Validate the
         // counters before exposing byte counts to callers.
-        let free_blocks = sb.free_blocks;
-        if free_blocks > total_blocks || sb.free_inodes > sb.inode_count {
+        let free_blocks = self.free_blocks.load(Ordering::Acquire);
+        let free_inodes = self.free_inodes.load(Ordering::Acquire);
+        let inode_shift = u32::from(sb.ag_block_log) + u32::from(sb.inode_per_block_log);
+        let inodes_per_ag = 1u64
+            .checked_shl(inode_shift)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let total_inodes = u64::from(sb.ag_count)
+            .checked_mul(inodes_per_ag)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if free_blocks > total_blocks
+            || free_inodes > total_inodes
+            || sb.inode_count > total_inodes
+            || free_inodes > total_inodes - sb.inode_count
+        {
             return Err(FsError::Corrupted);
         }
         let free_bytes = free_blocks
@@ -314,8 +472,8 @@ impl VfsFileSystem for XfsVfs {
             total_bytes: self.filesystem_size,
             free_bytes,
             available_bytes: free_bytes,
-            total_inodes: sb.inode_count,
-            free_inodes: sb.free_inodes,
+            total_inodes,
+            free_inodes,
             block_size: sb.block_size,
             max_filename_len: 255,
             fs_type: "xfs".to_string(),
@@ -334,6 +492,7 @@ impl VfsFileSystem for XfsVfs {
     }
 
     fn stat(&self, ino: u64) -> FsResult<VfsFileInfo> {
+        let _guard = self.operation_lock.read();
         let inode = self.read_inode_internal(ino)?;
         inode_to_file_info(
             ino,
@@ -345,13 +504,22 @@ impl VfsFileSystem for XfsVfs {
     }
 
     fn lookup(&self, parent_ino: u64, name: &str) -> FsResult<VfsFileInfo> {
+        let _guard = self.operation_lock.read();
         debug!("lookup: parent={}, name='{}'", parent_ino, name);
         let child_ino = self.lookup_internal(parent_ino, name)?;
         trace!("lookup found ino: {}", child_ino);
-        self.stat(child_ino)
+        let inode = self.read_inode_internal(child_ino)?;
+        inode_to_file_info(
+            child_ino,
+            &inode,
+            self.block_size(),
+            self.has_bigtime(),
+            self.filesystem_size,
+        )
     }
 
     fn resolve_path(&self, path: &str) -> FsResult<u64> {
+        let _guard = self.operation_lock.read();
         debug!("resolve_path: '{}'", path);
         // Normalize path
         let normalized = path.replace('\\', "/").trim_start_matches('/').to_string();
@@ -405,6 +573,7 @@ impl VfsFileSystem for XfsVfs {
     }
 
     fn read(&self, ino: u64, offset: u64, buf: &mut [u8]) -> FsResult<usize> {
+        let _guard = self.operation_lock.read();
         let inode = self.read_inode_internal(ino)?;
 
         if is_directory(&inode) {
@@ -423,10 +592,12 @@ impl VfsFileSystem for XfsVfs {
     }
 
     fn readdir(&self, ino: u64) -> FsResult<Vec<VfsDirEntry>> {
+        let _guard = self.operation_lock.read();
         self.read_directory_internal(ino)
     }
 
     fn readlink(&self, ino: u64) -> FsResult<String> {
+        let _guard = self.operation_lock.read();
         let inode = self.read_inode_internal(ino)?;
 
         if !is_symlink(&inode) {
@@ -442,81 +613,146 @@ impl VfsFileSystem for XfsVfs {
         )
     }
 
-    // The VFS is structurally read-only.  These overrides make the guarantee
-    // explicit even if the trait defaults change later.
+    // Writable mutations are serialized and journaled. Unsupported metadata
+    // features fail explicitly; read-only instances continue to return
+    // ReadOnly.
     fn invalidate_inode(&self, ino: u64) {
+        let _guard = self.operation_lock.write();
         self.cache.invalidate_inode(ino);
     }
 
-    fn write(&self, _ino: u64, _offset: u64, _buf: &[u8]) -> FsResult<usize> {
-        Err(FsError::ReadOnly)
+    fn write(&self, ino: u64, offset: u64, data: &[u8]) -> FsResult<usize> {
+        let _guard = self.operation_lock.write();
+        if self.capabilities.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        let journal = self.journal.as_ref().ok_or(FsError::ReadOnly)?;
+        let mut journal = journal.lock();
+        if journal.is_poisoned() {
+            return Err(FsError::ReadOnly);
+        }
+        let allocator = BlockAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let inode_allocator = InodeAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let mut writer = WriteContext {
+            device: self.device.clone(),
+            superblock: self.superblock.clone(),
+            filesystem_size: self.filesystem_size,
+            journal: &mut journal,
+            allocator,
+            inode_allocator,
+            block_overlay: Default::default(),
+            data_rollback: Default::default(),
+        };
+        let result = writer.write_data(ino, offset, data);
+        drop(writer);
+        drop(journal);
+        self.cache.invalidate_all();
+        if result.is_ok() {
+            if let Err(error) = self.refresh_superblock_counters() {
+                debug!(%error, "failed to refresh superblock counters after mutation");
+            }
+        }
+        result
     }
 
     fn create_file(
         &self,
-        _parent_ino: u64,
-        _name: &str,
-        _mode: u32,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
     ) -> FsResult<fs_abstraction::VfsFileInfo> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| writer.create_file(parent_ino, name, mode))
     }
 
     fn create_directory(
         &self,
-        _parent_ino: u64,
-        _name: &str,
-        _mode: u32,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
     ) -> FsResult<fs_abstraction::VfsFileInfo> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| writer.create_directory(parent_ino, name, mode))
     }
 
     fn create_symlink(
         &self,
-        _parent_ino: u64,
-        _name: &str,
-        _target: &str,
+        parent_ino: u64,
+        name: &str,
+        target: &str,
     ) -> FsResult<fs_abstraction::VfsFileInfo> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| writer.create_symlink(parent_ino, name, target))
     }
 
     fn link(
         &self,
-        _target_ino: u64,
-        _parent_ino: u64,
-        _name: &str,
+        target_ino: u64,
+        parent_ino: u64,
+        name: &str,
     ) -> FsResult<fs_abstraction::VfsFileInfo> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| writer.link_inode(target_ino, parent_ino, name))
     }
 
-    fn set_size(&self, _ino: u64, _size: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    fn set_size(&self, ino: u64, size: u64) -> FsResult<()> {
+        let _guard = self.operation_lock.write();
+        if self.capabilities.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        let journal = self.journal.as_ref().ok_or(FsError::ReadOnly)?;
+        let mut journal = journal.lock();
+        if journal.is_poisoned() {
+            return Err(FsError::ReadOnly);
+        }
+        let allocator = BlockAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let inode_allocator = InodeAllocator::new(self.device.clone(), self.superblock.clone())?;
+        let mut writer = WriteContext {
+            device: self.device.clone(),
+            superblock: self.superblock.clone(),
+            filesystem_size: self.filesystem_size,
+            journal: &mut journal,
+            allocator,
+            inode_allocator,
+            block_overlay: Default::default(),
+            data_rollback: Default::default(),
+        };
+        let result = writer.set_size(ino, size);
+        drop(writer);
+        drop(journal);
+        self.cache.invalidate_all();
+        if result.is_ok() {
+            if let Err(error) = self.refresh_superblock_counters() {
+                debug!(%error, "failed to refresh superblock counters after mutation");
+            }
+        }
+        result
     }
 
     fn set_times(
         &self,
-        _ino: u64,
-        _atime: Option<fs_abstraction::VfsTimestamp>,
-        _mtime: Option<fs_abstraction::VfsTimestamp>,
+        ino: u64,
+        atime: Option<fs_abstraction::VfsTimestamp>,
+        mtime: Option<fs_abstraction::VfsTimestamp>,
     ) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| writer.set_times(ino, atime, mtime))
     }
 
     fn rename(
         &self,
-        _old_parent: u64,
-        _old_name: &str,
-        _new_parent: u64,
-        _new_name: &str,
-        _flags: fs_abstraction::RenameFlags,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: fs_abstraction::RenameFlags,
     ) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+        self.mutate_with_writer(|writer| {
+            writer.rename_inode(old_parent, old_name, new_parent, new_name, flags)
+        })
     }
 
-    fn unlink(&self, _parent_ino: u64, _name: &str, _target_ino: u64) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+    fn unlink(&self, parent_ino: u64, name: &str, target_ino: u64) -> FsResult<()> {
+        self.mutate_with_writer(|writer| writer.unlink_inode(parent_ino, name, target_ino))
     }
 
     fn invalidate_all_caches(&self) {
+        let _guard = self.operation_lock.write();
         self.cache.invalidate_all();
     }
 }
@@ -539,6 +775,7 @@ mod tests {
         max_read: std::sync::atomic::AtomicUsize,
         read_calls: std::sync::atomic::AtomicUsize,
         write_calls: std::sync::atomic::AtomicUsize,
+        writable: bool,
     }
 
     impl InMemoryDevice {
@@ -548,6 +785,7 @@ mod tests {
                 max_read: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 read_calls: std::sync::atomic::AtomicUsize::new(0),
                 write_calls: std::sync::atomic::AtomicUsize::new(0),
+                writable: true,
             }
         }
 
@@ -592,6 +830,10 @@ mod tests {
 
         fn size(&self) -> u64 {
             self.data.read().unwrap().len() as u64
+        }
+
+        fn supports_write(&self) -> bool {
+            self.writable
         }
     }
 
@@ -741,15 +983,24 @@ mod tests {
     }
 
     #[test]
-    fn writable_construction_is_refused_before_io() {
+    fn writable_construction_checks_device_and_internal_log() {
         use std::sync::atomic::Ordering;
+
+        let mut read_only_device = InMemoryDevice::new(minimal_image());
+        read_only_device.writable = false;
+        let read_only_device = Arc::new(read_only_device);
+        assert!(matches!(
+            XfsVfs::with_options(read_only_device.clone(), false),
+            Err(FsError::ReadOnly)
+        ));
+        assert_eq!(read_only_device.read_calls.load(Ordering::SeqCst), 0);
 
         let device = Arc::new(InMemoryDevice::new(minimal_image()));
         assert!(matches!(
             XfsVfs::with_options(device.clone(), false),
-            Err(FsError::ReadOnly)
+            Err(FsError::NotSupported)
         ));
-        assert_eq!(device.read_calls.load(Ordering::SeqCst), 0);
+        assert!(device.read_calls.load(Ordering::SeqCst) > 0);
         assert_eq!(device.write_calls.load(Ordering::SeqCst), 0);
     }
 

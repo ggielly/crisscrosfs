@@ -432,6 +432,7 @@ impl WriteOperations {
                     data,
                     &new_entry,
                     parent_inode,
+                    self.is_v5,
                     self.sb_data.has_ftype(),
                     max_size,
                 ) {
@@ -552,7 +553,12 @@ impl WriteOperations {
         match &parent.data_fork {
             DataFork::Local(data) => {
                 let new_data =
-                    remove_shortform_entry(data, name.as_bytes(), self.sb_data.has_ftype())
+                    remove_shortform_entry(
+                        data,
+                        name.as_bytes(),
+                        self.is_v5,
+                        self.sb_data.has_ftype(),
+                    )
                         .map_err(|_| XfsVfsError::Vfs(FsError::NotFound))?;
                 parent.data_fork = DataFork::Local(new_data.clone());
                 parent.core.size = new_data.len() as u64;
@@ -686,6 +692,7 @@ impl WriteOperations {
                     data,
                     &new_entry,
                     new_parent,
+                    self.is_v5,
                     self.sb_data.has_ftype(),
                     max_size,
                 )
