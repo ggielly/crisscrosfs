@@ -63,7 +63,7 @@ impl AllocRec {
 pub struct AllocKey {
     /// For BNO: start block. For CNT: block count.
     pub key1: u32,
-    /// For BNO: unused (0). For CNT: start block (secondary sort).
+    /// For BNO: block count. For CNT: start block (secondary sort).
     pub key2: u32,
 }
 
@@ -94,7 +94,7 @@ impl AllocKey {
     pub fn from_bno_rec(rec: &AllocRec) -> Self {
         Self {
             key1: rec.start_block,
-            key2: 0,
+            key2: rec.block_count,
         }
     }
 

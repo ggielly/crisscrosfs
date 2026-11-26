@@ -310,8 +310,8 @@ pub struct BtreeBlockShort {
     pub left_sibling: u32,
     /// Right sibling block (AG-relative).
     pub right_sibling: u32,
-    /// Block number (v5, AG-relative).
-    pub block_no: u32,
+    /// Disk address in 512-byte basic-block units (v5).
+    pub block_no: u64,
     /// Log sequence number (v5).
     pub lsn: u64,
     /// UUID (v5).
@@ -358,7 +358,7 @@ impl BtreeBlockShort {
         let (block_no, lsn, uuid, owner, crc) = if is_v5 {
             // Short (AG) btree block: blkno at 0x10, lsn at 0x18,
             // uuid at 0x20..0x30, owner at 0x30, crc (LE) at 0x34.
-            let block_no = buffer.read_be_u32(16)?;
+            let block_no = buffer.read_be_u64(16)?;
             let lsn = buffer.read_be_u64(24)?;
             let mut uuid = [0u8; 16];
             uuid.copy_from_slice(&buffer[32..48]);

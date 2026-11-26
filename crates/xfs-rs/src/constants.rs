@@ -35,6 +35,18 @@ pub const XFS_DIR2_LEAF_MAGIC: u16 = 0xD2F1;
 /// Magic number for v3 directory leaf.
 pub const XFS_DIR3_LEAF_MAGIC: u16 = 0x3DF1;
 
+/// Magic number for a directory LEAFN block in a node-format directory.
+pub const XFS_DIR2_LEAFN_MAGIC: u16 = 0xD2FF;
+
+/// Magic number for a v3 directory LEAFN block.
+pub const XFS_DIR3_LEAFN_MAGIC: u16 = 0x3DFF;
+
+/// Magic number for a directory DA node.
+pub const XFS_DIR2_NODE_MAGIC: u16 = 0xFEBE;
+
+/// Magic number for a v3 directory DA node.
+pub const XFS_DIR3_NODE_MAGIC: u16 = 0x3EBE;
+
 /// Magic number for directory free index.
 pub const XFS_DIR2_FREE_MAGIC: u32 = 0x58443246; // "XD2F"
 
@@ -70,6 +82,9 @@ pub const XFS_FIBT_MAGIC: u32 = 0x46494254; // "FIBT"
 
 /// Magic number for v5 free inode B+tree.
 pub const XFS_FIBT_CRC_MAGIC: u32 = 0x46494233; // "FIB3"
+
+/// Magic number for the v5 reference-count B+tree.
+pub const XFS_REFCOUNT_CRC_MAGIC: u32 = 0x5233_4643; // "R3FC"
 
 // ─── Sizes ────────────────────────────────────────────────────────────────
 

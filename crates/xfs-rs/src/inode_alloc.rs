@@ -37,11 +37,15 @@ impl InodeBtreeRec {
             return Err(FsError::BufferTooSmall);
         }
 
-        Ok(Self {
+        let record = Self {
             start_ino: buffer.read_be_u32(0)?,
             free_count: buffer.read_be_u32(4)?,
             free_bitmap: buffer.read_be_u64(8)?,
-        })
+        };
+        if record.free_count != record.free_bitmap.count_ones() {
+            return Err(FsError::Corrupted);
+        }
+        Ok(record)
     }
 
     /// Serialize to bytes.
@@ -53,35 +57,30 @@ impl InodeBtreeRec {
         buf
     }
 
-    /// Check if a specific inode in the chunk is free.
-    pub fn is_inode_free(&self, index: u32) -> bool {
-        if index >= XFS_INODES_PER_CHUNK {
-            return false;
-        }
-        (self.free_bitmap & (1u64 << index)) != 0
+    fn bit_for_index(index: u32) -> Option<u64> {
+        (index < XFS_INODES_PER_CHUNK).then(|| 1u64 << (63 - index))
     }
 
-    /// Get the first free inode in this chunk.
+    /// Check if a specific inode in the chunk is free.
+    pub fn is_inode_free(&self, index: u32) -> bool {
+        Self::bit_for_index(index).is_some_and(|mask| self.free_bitmap & mask != 0)
+    }
+
+    /// Get the first (lowest-numbered) free inode in this chunk.
     pub fn first_free_inode(&self) -> Option<u32> {
-        if self.free_count == 0 {
+        if self.free_count == 0 || self.free_bitmap == 0 {
             return None;
         }
-        // Find first set bit
-        let trailing = self.free_bitmap.trailing_zeros();
-        if trailing < 64 {
-            Some(self.start_ino + trailing)
-        } else {
-            None
-        }
+        let index = self.free_bitmap.leading_zeros();
+        self.start_ino.checked_add(index)
     }
 
     /// Mark an inode as allocated (clear the free bit).
     pub fn allocate_inode(&mut self, index: u32) -> bool {
-        if index >= XFS_INODES_PER_CHUNK {
+        let Some(mask) = Self::bit_for_index(index) else {
             return false;
-        }
-        let mask = 1u64 << index;
-        if (self.free_bitmap & mask) == 0 {
+        };
+        if self.free_bitmap & mask == 0 {
             return false; // Already allocated
         }
         self.free_bitmap &= !mask;
@@ -91,12 +90,112 @@ impl InodeBtreeRec {
 
     /// Mark an inode as free (set the free bit).
     pub fn free_inode(&mut self, index: u32) -> bool {
-        if index >= XFS_INODES_PER_CHUNK {
+        let Some(mask) = Self::bit_for_index(index) else {
+            return false;
+        };
+        if self.free_bitmap & mask != 0 {
+            return false; // Already free
+        }
+        self.free_bitmap |= mask;
+        self.free_count = self.free_count.saturating_add(1);
+        true
+    }
+}
+
+/// Sparse inode B+tree record (`XFS_SB_FEAT_INCOMPAT_SPINODES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseInodeBtreeRec {
+    pub start_ino: u32,
+    /// Each bit marks four physically absent inodes.
+    pub holemask: u16,
+    pub inode_count: u8,
+    pub free_count: u8,
+    pub free_bitmap: u64,
+}
+
+impl SparseInodeBtreeRec {
+    const INODES_PER_HOLEMASK_BIT: u32 = 4;
+    pub const SIZE: usize = 16;
+
+    pub fn parse(buffer: &[u8]) -> FsResult<Self> {
+        if buffer.len() < Self::SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
+        let record = Self {
+            start_ino: buffer.read_be_u32(0)?,
+            holemask: buffer.read_be_u16(4)?,
+            inode_count: buffer[6],
+            free_count: buffer[7],
+            free_bitmap: buffer.read_be_u64(8)?,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buffer = [0u8; Self::SIZE];
+        buffer[0..4].copy_from_slice(&self.start_ino.to_be_bytes());
+        buffer[4..6].copy_from_slice(&self.holemask.to_be_bytes());
+        buffer[6] = self.inode_count;
+        buffer[7] = self.free_count;
+        buffer[8..16].copy_from_slice(&self.free_bitmap.to_be_bytes());
+        buffer
+    }
+
+    pub fn validate(&self) -> FsResult<()> {
+        let holes = self.expanded_holes();
+        let physical = !holes;
+        if self.inode_count != physical.count_ones() as u8
+            || self.free_bitmap & holes != holes
+            || self.free_count != (self.free_bitmap & physical).count_ones() as u8
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
+    fn expanded_holes(&self) -> u64 {
+        let mut holes = 0u64;
+        for bit in 0..16 {
+            if self.holemask & (1 << bit) != 0 {
+                holes |= ((1u64 << Self::INODES_PER_HOLEMASK_BIT) - 1)
+                    << (60 - bit * Self::INODES_PER_HOLEMASK_BIT);
+            }
+        }
+        holes
+    }
+
+    fn bit_for_index(index: u32) -> Option<u64> {
+        (index < 64).then(|| 1u64 << (63 - index))
+    }
+
+    pub fn first_free_inode(&self) -> Option<u32> {
+        let available = self.free_bitmap & !self.expanded_holes();
+        if self.free_count == 0 || available == 0 {
+            return None;
+        }
+        let index = available.leading_zeros();
+        self.start_ino.checked_add(index)
+    }
+
+    pub fn allocate_inode(&mut self, index: u32) -> bool {
+        let Some(mask) = Self::bit_for_index(index) else {
+            return false;
+        };
+        if self.expanded_holes() & mask != 0 || self.free_bitmap & mask == 0 {
             return false;
         }
-        let mask = 1u64 << index;
-        if (self.free_bitmap & mask) != 0 {
-            return false; // Already free
+        self.free_bitmap &= !mask;
+        self.free_count = self.free_count.saturating_sub(1);
+        true
+    }
+
+    pub fn free_inode(&mut self, index: u32) -> bool {
+        let Some(mask) = Self::bit_for_index(index) else {
+            return false;
+        };
+        if self.expanded_holes() & mask != 0 || self.free_bitmap & mask != 0 {
+            return false;
         }
         self.free_bitmap |= mask;
         self.free_count = self.free_count.saturating_add(1);
@@ -307,6 +406,29 @@ pub fn read_inode_btree_records(
     Ok(records)
 }
 
+/// Read sparse inode B+tree records from a leaf block.
+pub fn read_sparse_inode_btree_records(
+    buffer: &[u8],
+    header: &InodeBtreeBlock,
+    is_v5: bool,
+) -> FsResult<Vec<SparseInodeBtreeRec>> {
+    if !header.is_leaf() {
+        return Err(FsError::InvalidBlockType);
+    }
+    header.verify_crc(buffer)?;
+    let header_size = header.header_size(is_v5);
+    let max_recs = (buffer.len() - header_size) / SparseInodeBtreeRec::SIZE;
+    if header.num_recs as usize > max_recs {
+        return Err(FsError::Corrupted);
+    }
+    let mut records = Vec::with_capacity(header.num_recs as usize);
+    for index in 0..header.num_recs as usize {
+        let offset = header_size + index * SparseInodeBtreeRec::SIZE;
+        records.push(SparseInodeBtreeRec::parse(&buffer[offset..])?);
+    }
+    Ok(records)
+}
+
 /// Find a free inode in the FIBT.
 ///
 /// Returns (chunk_record, inode_index_in_chunk) if found.
@@ -373,16 +495,34 @@ pub fn write_inode_btree_records(
     records: &[InodeBtreeRec],
     is_v5: bool,
 ) -> FsResult<()> {
+    let parsed = InodeBtreeBlock::parse(buffer, is_v5)?;
+    if parsed.magic != header.magic {
+        return Err(FsError::InvalidMagic);
+    }
+    if records.len() > u16::MAX as usize {
+        return Err(FsError::Corrupted);
+    }
     let header_size = header.header_size(is_v5);
+    let records_size = records
+        .len()
+        .checked_mul(InodeBtreeRec::SIZE)
+        .ok_or(FsError::ArithmeticOverflow)?;
+    let records_end = header_size
+        .checked_add(records_size)
+        .ok_or(FsError::ArithmeticOverflow)?;
+    if records_end > buffer.len() {
+        return Err(FsError::BufferTooSmall);
+    }
 
     for (i, rec) in records.iter().enumerate() {
         let rec_offset = header_size + i * InodeBtreeRec::SIZE;
-        if rec_offset + InodeBtreeRec::SIZE > buffer.len() {
-            return Err(FsError::BufferTooSmall);
-        }
         buffer[rec_offset..rec_offset + InodeBtreeRec::SIZE].copy_from_slice(&rec.to_bytes());
     }
-
+    buffer[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+    if is_v5 {
+        crate::crc::recalculate_crc_le(buffer, InodeBtreeBlock::CRC_OFFSET_V5)
+            .ok_or(FsError::BufferTooSmall)?;
+    }
     Ok(())
 }
 
@@ -405,7 +545,7 @@ pub fn split_inode_number(ino: u64, ag_block_log: u8, inode_per_block_log: u8) -
     (ag_num, ag_ino)
 }
 
-/// Create a new empty inode core with default values.
+/// Create a new empty inode core with default values and legacy timestamps.
 pub fn create_empty_inode_core(
     mode: u16,
     uid: u32,
@@ -416,10 +556,40 @@ pub fn create_empty_inode_core(
 ) -> crate::InodeCore {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+        .unwrap_or_default();
+    create_empty_inode_core_at(
+        mode,
+        uid,
+        gid,
+        version,
+        ino,
+        uuid,
+        false,
+        now.as_secs().min(i32::MAX as u64) as i64,
+        now.subsec_nanos(),
+    )
+    .expect("current time fits legacy XFS timestamps")
+}
 
-    crate::InodeCore {
+/// Create an empty inode core with explicit timestamp encoding.
+///
+/// `uuid` must be the filesystem metadata UUID on v5 filesystems.  Bigtime is
+/// recorded both in the timestamp words and in `di_flags2`, as required by the
+/// on-disk format.
+#[allow(clippy::too_many_arguments)]
+pub fn create_empty_inode_core_at(
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    version: u8,
+    ino: u64,
+    uuid: &[u8; 16],
+    has_bigtime: bool,
+    unix_seconds: i64,
+    nanoseconds: u32,
+) -> FsResult<crate::InodeCore> {
+    let (sec, nsec) = crate::InodeCore::unix_to_timestamp(unix_seconds, nanoseconds, has_bigtime)?;
+    Ok(crate::InodeCore {
         magic: XFS_DINODE_MAGIC,
         mode,
         version,
@@ -430,12 +600,12 @@ pub fn create_empty_inode_core(
         nlink: 1,
         projid_lo: 0,
         projid_hi: 0,
-        atime_sec: now,
-        atime_nsec: 0,
-        mtime_sec: now,
-        mtime_nsec: 0,
-        ctime_sec: now,
-        ctime_nsec: 0,
+        atime_sec: sec,
+        atime_nsec: nsec,
+        mtime_sec: sec,
+        mtime_nsec: nsec,
+        ctime_sec: sec,
+        ctime_nsec: nsec,
         size: 0,
         nblocks: 0,
         extsize: 0,
@@ -451,13 +621,13 @@ pub fn create_empty_inode_core(
         crc: 0,
         changecount: 1,
         lsn: 0,
-        flags2: 0,
+        flags2: if has_bigtime { 1 << 3 } else { 0 },
         cowextsize: 0,
-        crtime_sec: now,
-        crtime_nsec: 0,
+        crtime_sec: sec,
+        crtime_nsec: nsec,
         ino,
         uuid: *uuid,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -476,9 +646,9 @@ mod tests {
         let rec = InodeBtreeRec::parse(&buf).unwrap();
         assert_eq!(rec.start_ino, 100);
         assert_eq!(rec.free_count, 5);
-        assert!(rec.is_inode_free(0));
-        assert!(rec.is_inode_free(4));
-        assert!(!rec.is_inode_free(5));
+        assert!(rec.is_inode_free(59));
+        assert!(rec.is_inode_free(63));
+        assert!(!rec.is_inode_free(58));
     }
 
     #[test]
@@ -527,6 +697,45 @@ mod tests {
     }
 
     #[test]
+    fn inode_btree_write_is_atomic_and_updates_count_crc() {
+        let mut buf = vec![0u8; 512];
+        buf[0..4].copy_from_slice(&XFS_IBT_CRC_MAGIC.to_be_bytes());
+        let crc =
+            crate::crc::xfs_crc32c_with_zeroed_field(&buf, InodeBtreeBlock::CRC_OFFSET_V5).unwrap();
+        buf[InodeBtreeBlock::CRC_OFFSET_V5..InodeBtreeBlock::CRC_OFFSET_V5 + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+        let header = InodeBtreeBlock::parse(&buf, true).unwrap();
+        let original = buf.clone();
+        let too_many = vec![
+            InodeBtreeRec {
+                start_ino: 0,
+                free_count: 0,
+                free_bitmap: 0,
+            };
+            100
+        ];
+        assert!(matches!(
+            write_inode_btree_records(&mut buf, &header, &too_many, true),
+            Err(FsError::BufferTooSmall)
+        ));
+        assert_eq!(buf, original);
+
+        let records = [InodeBtreeRec {
+            start_ino: 64,
+            free_count: 1,
+            free_bitmap: 1,
+        }];
+        write_inode_btree_records(&mut buf, &header, &records, true).unwrap();
+        let updated = InodeBtreeBlock::parse(&buf, true).unwrap();
+        assert_eq!(updated.num_recs, 1);
+        assert!(updated.verify_crc(&buf).is_ok());
+        assert_eq!(
+            read_inode_btree_records(&buf, &updated, true).unwrap(),
+            records
+        );
+    }
+
+    #[test]
     fn inode_btree_does_not_silently_truncate_records() {
         let mut buf = [0u8; InodeBtreeBlock::V4_SIZE];
         buf[0..4].copy_from_slice(&XFS_IBT_MAGIC.to_be_bytes());
@@ -536,6 +745,45 @@ mod tests {
             read_inode_btree_records(&buf, &header, false),
             Err(FsError::Corrupted)
         ));
+    }
+
+    #[test]
+    fn empty_inode_core_encodes_bigtime_and_metadata_uuid() {
+        let uuid = [0xA5; 16];
+        let core = create_empty_inode_core_at(
+            0o100644,
+            0,
+            0,
+            3,
+            123,
+            &uuid,
+            true,
+            1_700_000_000,
+            123_456_789,
+        )
+        .unwrap();
+        assert_eq!(core.flags2 & (1 << 3), 1 << 3);
+        assert_eq!(core.uuid, uuid);
+        assert_eq!(core.mtime(true), (1_700_000_000, 123_456_789));
+    }
+
+    #[test]
+    fn sparse_inode_record_skips_physical_holes() {
+        let mut record = SparseInodeBtreeRec {
+            start_ino: 64,
+            holemask: 1 << 2, // inodes 8..11 are absent
+            inode_count: 60,
+            free_count: 60,
+            // Hole bits are set in ir_free even though they are not physical.
+            free_bitmap: u64::MAX,
+        };
+        record.validate().unwrap();
+        assert_eq!(record.first_free_inode(), Some(64));
+        assert!(record.allocate_inode(0));
+        assert!(!record.allocate_inode(8));
+        assert!(!record.free_inode(8));
+        let raw = record.to_bytes();
+        assert_eq!(SparseInodeBtreeRec::parse(&raw).unwrap(), record);
     }
 
     #[test]

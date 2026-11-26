@@ -57,7 +57,7 @@ pub struct AgFreeHeader {
     pub refcount_level: u32,
     /// Log sequence number (v5).
     pub lsn: u64,
-    /// CRC of the AGF sector (v5, big-endian).
+    /// CRC of the AGF sector (v5, little-endian).
     pub crc: u32,
 }
 
@@ -122,8 +122,7 @@ impl AgFreeHeader {
             agf.refcount_root = buffer.read_be_u32(0x58)?;
             agf.refcount_level = buffer.read_be_u32(0x5C)?;
             agf.lsn = buffer.read_be_u64(0xD0)?;
-            // Unlike superblock/inode/btree CRCs, AGF CRC fields are __be32.
-            agf.crc = buffer.read_be_u32(Self::CRC_OFFSET_V5)?;
+            agf.crc = buffer.read_le_u32(Self::CRC_OFFSET_V5)?;
         }
 
         Ok(agf)
@@ -134,7 +133,7 @@ impl AgFreeHeader {
         if raw.len() < 512 {
             return Err(FsError::BufferTooSmall);
         }
-        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, false)
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
 
     /// Serialize the legacy AGF header fields.
@@ -151,7 +150,7 @@ impl AgFreeHeader {
     /// Serialize a complete 512-byte AGF sector, including v5 fields.
     ///
     /// The stored CRC is serialized as-is; callers changing metadata must
-    /// recalculate it with [`crate::crc::recalculate_crc_be`] before writing.
+    /// recalculate it with [`crate::crc::recalculate_crc_le`] before writing.
     pub fn to_sector_bytes(&self) -> Vec<u8> {
         let mut buf = vec![0u8; 512];
         self.write_common_fields(&mut buf);
@@ -161,8 +160,25 @@ impl AgFreeHeader {
         buf[0x58..0x5C].copy_from_slice(&self.refcount_root.to_be_bytes());
         buf[0x5C..0x60].copy_from_slice(&self.refcount_level.to_be_bytes());
         buf[0xD0..0xD8].copy_from_slice(&self.lsn.to_be_bytes());
-        buf[Self::CRC_OFFSET_V5..Self::CRC_OFFSET_V5 + 4].copy_from_slice(&self.crc.to_be_bytes());
+        buf[Self::CRC_OFFSET_V5..Self::CRC_OFFSET_V5 + 4].copy_from_slice(&self.crc.to_le_bytes());
         buf
+    }
+
+    /// Apply this header to an existing logical sector, preserving bytes beyond
+    /// the fixed 512-byte structure and recalculating the v5 CRC over the full
+    /// sector.
+    pub fn apply_to_sector(&self, raw: &[u8], is_v5: bool) -> FsResult<Vec<u8>> {
+        if raw.len() < 512 {
+            return Err(FsError::BufferTooSmall);
+        }
+        let mut buf = raw.to_vec();
+        let sector = self.to_sector_bytes();
+        buf[..512].copy_from_slice(&sector);
+        if is_v5 {
+            crate::crc::recalculate_crc_le(&mut buf, Self::CRC_OFFSET_V5)
+                .ok_or(FsError::BufferTooSmall)?;
+        }
+        Ok(buf)
     }
 
     fn write_common_fields(&self, buf: &mut [u8]) {
@@ -222,6 +238,10 @@ pub struct AgInodeHeader {
     pub free_inode_root: u32,
     /// Free inode B+tree level (v5).
     pub free_inode_level: u32,
+    /// Number of inode B+tree blocks (v5, INOBTCNT).
+    pub inode_btree_blocks: u32,
+    /// Number of free-inode B+tree blocks (v5, INOBTCNT).
+    pub free_inode_btree_blocks: u32,
 }
 
 impl AgInodeHeader {
@@ -272,16 +292,22 @@ impl AgInodeHeader {
             uuid: [0u8; 16],
             free_inode_root: 0,
             free_inode_level: 0,
+            inode_btree_blocks: 0,
+            free_inode_btree_blocks: 0,
         };
 
-        // V5 layout: uuid at 0x128, crc (__be32) at 0x138,
+        // V5 layout: uuid at 0x128, crc (__le32) at 0x138,
         // lsn at 0x140, finobt root/level at 0x148/0x14C.
         if buffer.len() >= Self::SIZE_V5 {
             agi.uuid.copy_from_slice(&buffer[0x128..0x138]);
-            agi.crc = buffer.read_be_u32(Self::CRC_OFFSET_V5)?;
+            agi.crc = buffer.read_le_u32(Self::CRC_OFFSET_V5)?;
             agi.lsn = buffer.read_be_u64(0x140)?;
             agi.free_inode_root = buffer.read_be_u32(0x148)?;
             agi.free_inode_level = buffer.read_be_u32(0x14C)?;
+        }
+        if buffer.len() >= 0x158 {
+            agi.inode_btree_blocks = buffer.read_be_u32(0x150)?;
+            agi.free_inode_btree_blocks = buffer.read_be_u32(0x154)?;
         }
 
         Ok(agi)
@@ -292,7 +318,23 @@ impl AgInodeHeader {
         if raw.len() < Self::SIZE {
             return Err(FsError::BufferTooSmall);
         }
-        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, false)
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
+    }
+
+    /// Apply this header to an existing logical sector and recalculate the v5
+    /// CRC over the complete sector.
+    pub fn apply_to_sector(&self, raw: &[u8], is_v5: bool) -> FsResult<Vec<u8>> {
+        if raw.len() < 512 {
+            return Err(FsError::BufferTooSmall);
+        }
+        let mut buf = raw.to_vec();
+        let sector = self.to_bytes();
+        buf[..512].copy_from_slice(&sector);
+        if is_v5 {
+            crate::crc::recalculate_crc_le(&mut buf, Self::CRC_OFFSET_V5)
+                .ok_or(FsError::BufferTooSmall)?;
+        }
+        Ok(buf)
     }
 
     /// Serialize AGI header to bytes.
@@ -313,13 +355,125 @@ impl AgInodeHeader {
             buf[0x028 + i * 4..0x02C + i * 4].copy_from_slice(&self.unlinked[i].to_be_bytes());
         }
 
-        // V5 layout (uuid at 0x128, crc __be32 at 0x138, lsn at 0x140).
+        // V5 layout (uuid at 0x128, crc __le32 at 0x138, lsn at 0x140).
         buf[0x128..0x138].copy_from_slice(&self.uuid);
-        buf[Self::CRC_OFFSET_V5..Self::CRC_OFFSET_V5 + 4].copy_from_slice(&self.crc.to_be_bytes());
+        buf[Self::CRC_OFFSET_V5..Self::CRC_OFFSET_V5 + 4].copy_from_slice(&self.crc.to_le_bytes());
         buf[0x140..0x148].copy_from_slice(&self.lsn.to_be_bytes());
         buf[0x148..0x14C].copy_from_slice(&self.free_inode_root.to_be_bytes());
         buf[0x14C..0x150].copy_from_slice(&self.free_inode_level.to_be_bytes());
+        buf[0x150..0x154].copy_from_slice(&self.inode_btree_blocks.to_be_bytes());
+        buf[0x154..0x158].copy_from_slice(&self.free_inode_btree_blocks.to_be_bytes());
         buf
+    }
+}
+
+/// Allocation Group free list (AGFL).
+#[derive(Debug, Clone)]
+pub struct AgFreeList {
+    pub magic: u32,
+    pub seq_number: u32,
+    pub uuid: [u8; 16],
+    pub lsn: u64,
+    pub crc: u32,
+    pub entries: Vec<u32>,
+}
+
+impl AgFreeList {
+    pub const CRC_OFFSET_V5: usize = 32;
+    pub const HEADER_SIZE_V4: usize = 0;
+    pub const HEADER_SIZE_V5: usize = 36;
+
+    pub fn parse(buffer: &[u8], is_v5: bool) -> FsResult<Self> {
+        let header_size = if is_v5 {
+            Self::HEADER_SIZE_V5
+        } else {
+            Self::HEADER_SIZE_V4
+        };
+        if buffer.len() < header_size {
+            return Err(FsError::BufferTooSmall);
+        }
+        let (magic, seq_number, uuid, lsn, crc) = if is_v5 {
+            let magic = buffer.read_be_u32(0)?;
+            if magic != XFS_AGFL_MAGIC {
+                return Err(FsError::InvalidMagic);
+            }
+            let seq_number = buffer.read_be_u32(4)?;
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(&buffer[8..24]);
+            (
+                magic,
+                seq_number,
+                uuid,
+                buffer.read_be_u64(24)?,
+                buffer.read_le_u32(Self::CRC_OFFSET_V5)?,
+            )
+        } else {
+            (0, 0, [0u8; 16], 0, 0)
+        };
+        let entry_bytes = buffer.len() - header_size;
+        if entry_bytes % 4 != 0 {
+            return Err(FsError::Corrupted);
+        }
+        let mut entries = Vec::with_capacity(entry_bytes / 4);
+        for offset in (header_size..buffer.len()).step_by(4) {
+            entries.push(buffer.read_be_u32(offset)?);
+        }
+        let agfl = Self {
+            magic,
+            seq_number,
+            uuid,
+            lsn,
+            crc,
+            entries,
+        };
+        if is_v5 {
+            agfl.verify_crc(buffer)?;
+        }
+        Ok(agfl)
+    }
+
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if raw.len() < Self::HEADER_SIZE_V5 {
+            return Err(FsError::BufferTooSmall);
+        }
+        crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
+    }
+
+    pub fn to_bytes(&self, sector_size: usize, is_v5: bool) -> FsResult<Vec<u8>> {
+        let header_size = if is_v5 {
+            Self::HEADER_SIZE_V5
+        } else {
+            Self::HEADER_SIZE_V4
+        };
+        let needed = header_size
+            .checked_add(
+                self.entries
+                    .len()
+                    .checked_mul(4)
+                    .ok_or(FsError::ArithmeticOverflow)?,
+            )
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if sector_size < needed || sector_size % 4 != 0 {
+            return Err(FsError::BufferTooSmall);
+        }
+        let mut buffer = vec![0u8; sector_size];
+        if is_v5 {
+            buffer[0..4].copy_from_slice(&self.magic.to_be_bytes());
+            buffer[4..8].copy_from_slice(&self.seq_number.to_be_bytes());
+            buffer[8..24].copy_from_slice(&self.uuid);
+            buffer[24..32].copy_from_slice(&self.lsn.to_be_bytes());
+            buffer[Self::CRC_OFFSET_V5..Self::CRC_OFFSET_V5 + 4]
+                .copy_from_slice(&self.crc.to_le_bytes());
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            let offset = header_size + index * 4;
+            buffer[offset..offset + 4].copy_from_slice(&entry.to_be_bytes());
+        }
+        if is_v5 {
+            crate::crc::recalculate_crc_le(&mut buffer, Self::CRC_OFFSET_V5)
+                .ok_or(FsError::BufferTooSmall)?;
+        }
+        Ok(buffer)
     }
 }
 
@@ -381,10 +535,12 @@ mod tests {
         buf[0x000..0x004].copy_from_slice(&XFS_AGI_MAGIC.to_be_bytes());
         buf[0x004..0x008].copy_from_slice(&1u32.to_be_bytes());
         buf[0x128..0x138].copy_from_slice(&[0xAA; 16]); // uuid
-        buf[0x138..0x13C].copy_from_slice(&0x11223344u32.to_be_bytes()); // crc
+        buf[0x138..0x13C].copy_from_slice(&0x11223344u32.to_le_bytes()); // crc
         buf[0x140..0x148].copy_from_slice(&99u64.to_be_bytes()); // lsn
         buf[0x148..0x14C].copy_from_slice(&6u32.to_be_bytes()); // finobt root
         buf[0x14C..0x150].copy_from_slice(&2u32.to_be_bytes()); // finobt level
+        buf[0x150..0x154].copy_from_slice(&13u32.to_be_bytes()); // inobt blocks
+        buf[0x154..0x158].copy_from_slice(&14u32.to_be_bytes()); // finobt blocks
 
         let agi = AgInodeHeader::parse(&buf).unwrap();
         assert_eq!(agi.uuid, [0xAA; 16]);
@@ -392,6 +548,9 @@ mod tests {
         assert_eq!(agi.lsn, 99);
         assert_eq!(agi.free_inode_root, 6);
         assert_eq!(agi.free_inode_level, 2);
+        assert_eq!(agi.inode_btree_blocks, 13);
+        assert_eq!(agi.free_inode_btree_blocks, 14);
+        assert_eq!(&agi.to_bytes()[0x150..0x158], &buf[0x150..0x158]);
     }
 
     #[test]
@@ -406,7 +565,7 @@ mod tests {
         buf[0x58..0x5C].copy_from_slice(&13u32.to_be_bytes());
         buf[0x5C..0x60].copy_from_slice(&14u32.to_be_bytes());
         buf[0xD0..0xD8].copy_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
-        let crc = crate::crc::recalculate_crc_be(&mut buf, AgFreeHeader::CRC_OFFSET_V5).unwrap();
+        let crc = crate::crc::recalculate_crc_le(&mut buf, AgFreeHeader::CRC_OFFSET_V5).unwrap();
 
         let agf = AgFreeHeader::parse(&buf).unwrap();
         assert_eq!(agf.rmap_level, 3);
@@ -419,6 +578,14 @@ mod tests {
         assert_eq!(agf.crc, crc);
         assert_eq!(agf.to_sector_bytes(), buf);
         assert!(agf.verify_crc(&buf).is_ok());
+        let mut sector = buf.clone();
+        sector.resize(1024, 0xA5);
+        let updated = agf.apply_to_sector(&sector, true).unwrap();
+        assert_eq!(&updated[512..], &[0xA5; 512]);
+        assert!(AgFreeHeader::parse(&updated)
+            .unwrap()
+            .verify_crc(&updated)
+            .is_ok());
 
         let mut corrupted = buf;
         corrupted[0x40] ^= 1;
@@ -429,16 +596,24 @@ mod tests {
     }
 
     #[test]
-    fn agi_v5_crc_is_big_endian_at_0x138() {
+    fn agi_v5_crc_is_little_endian_at_0x138() {
         let mut buf = vec![0u8; 512];
         buf[0..4].copy_from_slice(&XFS_AGI_MAGIC.to_be_bytes());
         buf[4..8].copy_from_slice(&1u32.to_be_bytes());
         buf[0x128..0x138].copy_from_slice(&[0xA5; 16]);
-        let crc = crate::crc::recalculate_crc_be(&mut buf, AgInodeHeader::CRC_OFFSET_V5).unwrap();
+        let crc = crate::crc::recalculate_crc_le(&mut buf, AgInodeHeader::CRC_OFFSET_V5).unwrap();
 
         let agi = AgInodeHeader::parse(&buf).unwrap();
         assert_eq!(agi.crc, crc);
         assert!(agi.verify_crc(&buf).is_ok());
+        let mut sector = buf.clone();
+        sector.resize(1024, 0x5A);
+        let updated = agi.apply_to_sector(&sector, true).unwrap();
+        assert_eq!(&updated[512..], &[0x5A; 512]);
+        assert!(AgInodeHeader::parse(&updated)
+            .unwrap()
+            .verify_crc(&updated)
+            .is_ok());
 
         let mut corrupted = buf;
         corrupted[0x128] ^= 1;
@@ -446,6 +621,34 @@ mod tests {
             agi.verify_crc(&corrupted),
             Err(FsError::Corrupted)
         ));
+    }
+
+    #[test]
+    fn agfl_round_trips_v4_and_v5_entries() {
+        for is_v5 in [false, true] {
+            let agfl = AgFreeList {
+                magic: XFS_AGFL_MAGIC,
+                seq_number: 7,
+                uuid: [0xA5; 16],
+                lsn: 99,
+                crc: 0,
+                entries: vec![11, 22, 33],
+            };
+            let raw = agfl.to_bytes(512, is_v5).unwrap();
+            let parsed = AgFreeList::parse(&raw, is_v5).unwrap();
+            assert_eq!(&parsed.entries[..agfl.entries.len()], &agfl.entries);
+            assert_eq!(parsed.entries.len(), 512 / 4 - if is_v5 { 9 } else { 0 });
+            if is_v5 {
+                assert_eq!(parsed.seq_number, 7);
+                assert!(parsed.verify_crc(&raw).is_ok());
+                let mut corrupted = raw;
+                corrupted[100] ^= 1;
+                assert!(matches!(
+                    AgFreeList::parse(&corrupted, true),
+                    Err(FsError::Corrupted)
+                ));
+            }
+        }
     }
 
     #[test]

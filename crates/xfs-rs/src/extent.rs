@@ -107,6 +107,24 @@ impl Extent {
         buffer
     }
 
+    /// Serialize the extent after validating every packed field.
+    ///
+    /// Unlike [`Self::to_bytes`], this never silently truncates a value that
+    /// cannot be represented by the 128-bit on-disk record.
+    pub fn to_bytes_checked(&self) -> FsResult<[u8; Self::SIZE]> {
+        const FILE_OFFSET_MAX: u64 = 0x003F_FFFF_FFFF_FFFF;
+        const START_BLOCK_MAX: u64 = 0x000F_FFFF_FFFF_FFFF;
+        const BLOCK_COUNT_MAX: u32 = 0x001F_FFFF;
+        if self.file_offset > FILE_OFFSET_MAX
+            || self.start_block > START_BLOCK_MAX
+            || self.block_count == 0
+            || self.block_count > BLOCK_COUNT_MAX
+        {
+            return Err(FsError::InvalidArgument);
+        }
+        Ok(self.to_bytes())
+    }
+
     /// Returns the end file offset (exclusive).
     pub fn file_end(&self) -> FsResult<u64> {
         self.file_offset.checked_add_offset(self.block_count as u64)
@@ -266,6 +284,40 @@ mod tests {
         assert_eq!(extent.translate(105).unwrap(), 205);
         // Try to translate an invalid block
         assert!(extent.translate(150).is_err());
+    }
+
+    #[test]
+    fn checked_serialization_rejects_unrepresentable_fields() {
+        let valid = Extent {
+            file_offset: 0,
+            start_block: 1,
+            block_count: 1,
+            is_unwritten: false,
+        };
+        assert_eq!(valid.to_bytes_checked().unwrap(), valid.to_bytes());
+        for invalid in [
+            Extent {
+                block_count: 0,
+                ..valid
+            },
+            Extent {
+                file_offset: 1 << 54,
+                ..valid
+            },
+            Extent {
+                start_block: 1 << 52,
+                ..valid
+            },
+            Extent {
+                block_count: (1 << 21) + 1,
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                invalid.to_bytes_checked(),
+                Err(FsError::InvalidArgument)
+            ));
+        }
     }
 
     #[test]

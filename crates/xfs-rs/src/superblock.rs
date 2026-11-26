@@ -4,6 +4,9 @@
 //! It's located at the beginning of each Allocation Group (AG), with the
 //! primary copy in AG 0.
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
 use fs_abstraction::{safe_math::CheckedSliceOps, FsError, FsResult};
 
 use crate::constants::*;
@@ -91,6 +94,15 @@ pub struct Superblock {
     pub free_blocks: u64,
     /// Free realtime extent count.
     pub free_realtime_extents: u64,
+
+    /// Directory block size log2 relative to the filesystem block size.
+    pub dir_block_log: u8,
+    /// Log sector size log2.
+    pub log_sector_log: u8,
+    /// Log sector size in bytes.
+    pub log_sector_size: u16,
+    /// Log stripe unit in basic blocks.
+    pub log_unit: u32,
 
     // ─── V4 Extended Features (offset 0x0C8) ───────────────────────────
     /// v4 `sb_features2` flags (e.g. ftype).
@@ -198,6 +210,10 @@ impl Superblock {
         let free_inodes = local_slice.read_be_u64(0x088)?;
         let free_blocks = local_slice.read_be_u64(0x090)?;
         let free_realtime_extents = local_slice.read_be_u64(0x098)?;
+        let dir_block_log = local[0x0C0];
+        let log_sector_log = local[0x0C1];
+        let log_sector_size = local_slice.read_be_u16(0x0C2)?;
+        let log_unit = local_slice.read_be_u32(0x0C4)?;
         let features2 = local_slice.read_be_u32(0x0C8)?;
 
         // The version nibble (not the whole versionnum word, which contains
@@ -279,6 +295,10 @@ impl Superblock {
             free_inodes,
             free_blocks,
             free_realtime_extents,
+            dir_block_log,
+            log_sector_log,
+            log_sector_size,
+            log_unit,
             features2,
             features_compat,
             features_ro_compat,
@@ -306,6 +326,22 @@ impl Superblock {
 
         // Check log2 fields are consistent with the values they describe.
         if self.block_log >= 32 || (1u64 << self.block_log) != u64::from(self.block_size) {
+            return Err(FsError::Corrupted);
+        }
+        if self.dir_block_log > self.block_log {
+            return Err(FsError::Corrupted);
+        }
+        if self.log_sector_size != 0
+            && (!self.log_sector_size.is_power_of_two()
+                || self.log_sector_size < 512
+                || u32::from(self.log_sector_size) > self.block_size)
+        {
+            return Err(FsError::Corrupted);
+        }
+        if self.log_sector_size != 0
+            && (self.log_sector_log >= 32
+                || (1u32 << self.log_sector_log) != u32::from(self.log_sector_size))
+        {
             return Err(FsError::Corrupted);
         }
 
@@ -425,6 +461,36 @@ impl Superblock {
     /// Returns `true` if this is a v5 filesystem.
     pub fn is_v5(&self) -> bool {
         (self.version & 0x000F) == XFS_SB_VERSION_5
+    }
+
+    /// UUID stored in v5 metadata structures. Filesystems without the
+    /// META_UUID feature use the primary filesystem UUID.
+    pub fn metadata_uuid(&self) -> [u8; 16] {
+        if self.features_incompat & XFS_SB_FEAT_INCOMPAT_META_UUID != 0 {
+            self.meta_uuid
+        } else {
+            self.uuid
+        }
+    }
+
+    /// Directory block size in bytes.
+    pub fn directory_block_size(&self) -> FsResult<u32> {
+        let multiplier = 1u32
+            .checked_shl(u32::from(self.dir_block_log))
+            .ok_or(FsError::ArithmeticOverflow)?;
+        self.block_size
+            .checked_mul(multiplier)
+            .ok_or(FsError::ArithmeticOverflow)
+    }
+
+    /// Effective log sector size; zero in the superblock means the filesystem
+    /// sector size for log-v2 filesystems.
+    pub fn effective_log_sector_size(&self) -> u32 {
+        if self.log_sector_size == 0 {
+            u32::from(self.sector_size)
+        } else {
+            u32::from(self.log_sector_size)
+        }
     }
 
     /// Returns `true` if the filesystem has file type in directory entries.
@@ -557,7 +623,11 @@ impl Superblock {
         buf[0x098..0x0A0].copy_from_slice(&self.free_realtime_extents.to_be_bytes());
         buf[0x0C8..0x0CC].copy_from_slice(&self.features2.to_be_bytes());
 
-        // Skip some v4 fields at 0xA0-0xC7 that we didn't parse
+        // Preserve the v4 fields that are not represented by this struct.
+        buf[0x0C0] = self.dir_block_log;
+        buf[0x0C1] = self.log_sector_log;
+        buf[0x0C2..0x0C4].copy_from_slice(&self.log_sector_size.to_be_bytes());
+        buf[0x0C4..0x0C8].copy_from_slice(&self.log_unit.to_be_bytes());
 
         // V5 fields
         if self.is_v5() {
@@ -573,6 +643,31 @@ impl Superblock {
         }
 
         buf
+    }
+
+    /// Apply the parsed superblock fields to an existing sector while
+    /// preserving fields this parser does not yet decode.
+    ///
+    /// XFS uses the otherwise undocumented v4 range `0xA0..0xC8` for quota and
+    /// implementation-specific state.  Zeroing that range during a counter
+    /// update would silently change filesystem policy, so writers must patch
+    /// only the fields represented by [`Self`].
+    #[cfg(feature = "alloc")]
+    pub fn apply_to_sector(&self, raw: &[u8]) -> FsResult<Vec<u8>> {
+        let sector_size = usize::from(self.sector_size);
+        if raw.len() < sector_size || sector_size < XFS_SB_SIZE_V4 {
+            return Err(FsError::BufferTooSmall);
+        }
+        let encoded = self.to_bytes();
+        let mut sector = raw[..sector_size].to_vec();
+        sector[..0xA0].copy_from_slice(&encoded[..0xA0]);
+        sector[0xC0..0xC8].copy_from_slice(&encoded[0xC0..0xC8]);
+        sector[0xC8..0xCC].copy_from_slice(&encoded[0xC8..0xCC]);
+        if self.is_v5() {
+            sector[0xD0..0x108].copy_from_slice(&encoded[0xD0..0x108]);
+            crate::crc::recalculate_crc_le(&mut sector, 0xE0).ok_or(FsError::BufferTooSmall)?;
+        }
+        Ok(sector)
     }
 }
 
@@ -763,6 +858,23 @@ mod tests {
         assert!(sb.verify_crc(&corrupted).is_ok());
         corrupted[20] ^= 1;
         assert!(matches!(sb.verify_crc(&corrupted), Err(FsError::Corrupted)));
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn applying_to_sector_preserves_unparsed_v4_fields() {
+        let mut raw = valid_superblock_buffer(XFS_SB_VERSION_5, 512);
+        raw[0xA0..0xC0].fill(0x5A);
+        let mut sb = Superblock::parse(&raw).unwrap();
+        sb.free_blocks = 77;
+        sb.free_inodes = 11;
+
+        let sector = sb.apply_to_sector(&raw).unwrap();
+        assert_eq!(&sector[0xA0..0xC8], &raw[0xA0..0xC8]);
+        let updated = Superblock::parse(&sector).unwrap();
+        assert_eq!(updated.free_blocks, 77);
+        assert_eq!(updated.free_inodes, 11);
+        assert!(updated.verify_crc(&sector).is_ok());
     }
 
     #[test]

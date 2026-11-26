@@ -9,11 +9,28 @@ use fs_abstraction::{safe_math::CheckedSliceOps, FsError, FsResult};
 
 use crate::constants::*;
 
-/// Calculate XFS directory hash for a name.
+/// Calculate the canonical XFS directory hash for a name.
+///
+/// XFS consumes complete groups of four bytes with the canonical
+/// `b0<<21 ^ b1<<14 ^ b2<<7 ^ b3` word and rotates the running hash left by
+/// 28 bits. A final partial group rotates by seven bits per byte and uses the
+/// same 21/14/7/0 byte positions.
 pub fn dir2_hash(name: &[u8]) -> u32 {
     let mut hash = 0u32;
-    for &c in name {
-        hash = (c as u32).wrapping_add(hash.rotate_left(7) ^ hash);
+    let (chunks, remainder) = name.as_chunks::<4>();
+    for chunk in chunks {
+        let word = (u32::from(chunk[0]) << 21)
+            ^ (u32::from(chunk[1]) << 14)
+            ^ (u32::from(chunk[2]) << 7)
+            ^ u32::from(chunk[3]);
+        hash = hash.rotate_left(28) ^ word;
+    }
+    if !remainder.is_empty() {
+        let mut word = 0u32;
+        for (index, byte) in remainder.iter().enumerate() {
+            word ^= u32::from(*byte) << (21 - index * 7);
+        }
+        hash = hash.rotate_left(7 * remainder.len() as u32) ^ word;
     }
     hash
 }
@@ -323,7 +340,7 @@ impl DataHeaderV5 {
             return Err(FsError::BufferTooSmall);
         }
         let magic = buffer.read_be_u32(0)?;
-        let crc = buffer.read_be_u32(4)?;
+        let crc = buffer.read_le_u32(4)?;
         let block_no = buffer.read_be_u64(8)?;
         let lsn = buffer.read_be_u64(16)?;
         let mut uuid = [0u8; 16];
@@ -740,6 +757,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_hash_matches_xfs_word_algorithm() {
+        for (name, expected) in [
+            ("", 0x0000_0000),
+            (".", 0x05C0_0000),
+            ("..", 0x05CB_8000),
+            ("a", 0x0C20_0000),
+            ("ab", 0x0C38_8000),
+            ("abc", 0x0C38_B180),
+            ("abcd", 0x0C38_B1E4),
+            ("hello.txt", 0x9396_8F66),
+        ] {
+            assert_eq!(dir2_hash(name.as_bytes()), expected, "{name:?}");
+        }
+    }
+
+    #[test]
     fn data_dir_iter_rejects_zero_and_oversized_free_lengths() {
         let mut buf = [0u8; 64];
         buf[16..18].copy_from_slice(&0xFFFFu16.to_be_bytes());
@@ -809,13 +842,13 @@ mod tests {
     }
 
     #[test]
-    fn dir3_crc_recalculation_is_big_endian() {
+    fn dir3_crc_recalculation_is_little_endian() {
         let mut buf = [0u8; DataHeaderV5::SIZE];
         buf[0..4].copy_from_slice(&XFS_DIR3_DATA_MAGIC.to_be_bytes());
-        let crc = crate::crc::recalculate_crc_be(&mut buf, 4).unwrap();
+        let crc = crate::crc::recalculate_crc_le(&mut buf, 4).unwrap();
         let header = DataHeaderV5::parse(&buf).unwrap();
         assert_eq!(header.crc, crc);
-        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), crc);
+        assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), crc);
     }
 
     #[test]
