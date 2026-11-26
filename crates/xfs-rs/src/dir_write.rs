@@ -319,7 +319,10 @@ pub fn remove_shortform_entry(
     // Update header
     let new_header = ShortformHeader {
         count: new_count,
-        i8count: if use_64bit { new_count } else { 0 },
+        // i8count is also the on-disk selector for the 8-byte header/inode
+        // layout.  Keep it nonzero for an empty directory when the parent inode
+        // itself requires 64 bits, otherwise reparsing would truncate `..`.
+        i8count: if use_64bit { 1 } else { 0 },
         parent: header.parent,
     };
     let header_bytes = serialize_shortform_header(&new_header, use_64bit);
@@ -547,6 +550,19 @@ mod tests {
         assert_eq!(header.count, 1);
         assert_eq!(header.i8count, 1);
         assert_eq!(header.parent, 456);
+    }
+
+    #[test]
+    fn removing_last_entry_preserves_a_64_bit_parent() {
+        let parent = 0x1_0000_0000u64;
+        let entry = NewDirEntry::new(b"only", 7, DirFileType::RegularFile);
+        let data = add_shortform_entry(&[], &entry, parent, true, 256).unwrap();
+        let emptied = remove_shortform_entry(&data, b"only", true).unwrap();
+
+        let header = ShortformHeader::parse(&emptied).unwrap();
+        assert_eq!(header.count, 0);
+        assert_eq!(header.parent, parent);
+        assert_eq!(header.i8count, 1);
     }
 
     #[test]
