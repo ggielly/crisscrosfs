@@ -4,7 +4,8 @@
 //! Windows security descriptor.  There is no general uid/gid → Windows account
 //! directory on Windows, so identities are mapped explicitly:
 //!
-//! * uid 0 → `NT AUTHORITY\SYSTEM`
+//! * uid 0 → the account that mounted a writable volume, or `NT
+//!   AUTHORITY\SYSTEM` for read-only volumes
 //! * gid 0 → `BUILTIN\Administrators`
 //! * other ids → only SIDs listed in the optional `XFS_ACL_MAP` TOML file
 //! * an unmapped uid produces an empty DACL (fail closed)
@@ -24,6 +25,11 @@
 //! Windows DACL would otherwise union every matching allow ACE.  Explicit deny
 //! ACEs subtract group/other rights from the owner and other rights from the
 //! group, reproducing POSIX class precedence for mapped identities.
+//!
+//! A writable image is owned by whoever mounted it: images are normally
+//! created by root with 0755/0644 modes, and mapping uid 0 to `SYSTEM` would
+//! leave the interactive user with the world bits only, i.e. a readable but
+//! unwritable volume.  This mirrors the `-o uid=` behaviour of FUSE mounts.
 //!
 //! Read-only mounts never grant write or delete rights.  Sticky directories do
 //! not receive `FILE_DELETE_CHILD`; setuid/setgid have no Windows ACL
@@ -320,9 +326,20 @@ impl AclMapper {
     /// Root is always mapped.  Non-root ids are only granted access through
     /// explicit mappings; token lookup failure therefore cannot broaden access.
     pub fn new(read_only: bool) -> Self {
-        let mut uid_map = BTreeMap::from([(0, system_sid())]);
-        let mut gid_map = BTreeMap::from([(0, administrators_sid())]);
         let current_user = current_user_sid();
+
+        // Ownership of the volume follows the mount: root-owned inodes are
+        // attributed to the account performing a writable mount so it gets the
+        // POSIX owner class, and to SYSTEM for read-only mounts (which cannot
+        // write anyway) or when the token lookup fails.
+        let root_sid = if read_only {
+            system_sid()
+        } else {
+            current_user.clone().unwrap_or_else(system_sid)
+        };
+
+        let mut uid_map = BTreeMap::from([(0, root_sid)]);
+        let mut gid_map = BTreeMap::from([(0, administrators_sid())]);
 
         if let Some(config) = load_acl_config() {
             apply_config_map(config.uids, &mut uid_map, current_user.as_deref(), "uid");
@@ -614,6 +631,33 @@ mod tests {
         assert_eq!(ace_type(&sd, 3), ACCESS_DENIED_ACE_TYPE);
         assert_eq!(ace_sid(&sd, 3), group);
         assert_eq!(ace_mask(&sd, 3), FILE_GENERIC_EXECUTE & !FILE_GENERIC_READ);
+    }
+
+    fn owner_sid(sd: &[u8]) -> Vec<u8> {
+        let offset = u32::from_le_bytes([sd[4], sd[5], sd[6], sd[7]]) as usize;
+        let length = sd[offset + 1] as usize * 4 + 8;
+        sd[offset..offset + length].to_vec()
+    }
+
+    #[test]
+    fn writable_mounts_attribute_root_inodes_to_the_mounting_account() {
+        let Some(current_user) = current_user_sid() else {
+            return;
+        };
+        let regular_file = info(0o100644, 0, 0, VfsFileType::RegularFile);
+
+        let writable = AclMapper::new(false);
+        assert_eq!(
+            owner_sid(&writable.security_descriptor(&regular_file)),
+            current_user,
+            "a writable mount must give the mounting account the POSIX owner class"
+        );
+
+        let read_only = AclMapper::new(true);
+        assert_eq!(
+            owner_sid(&read_only.security_descriptor(&regular_file)),
+            system_sid()
+        );
     }
 
     #[test]

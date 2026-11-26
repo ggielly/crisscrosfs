@@ -79,9 +79,16 @@ The writer fails closed rather than silently producing incomplete metadata:
 - Realtime or quota-enabled filesystems and RMAP-backed allocation groups are rejected.
 - REFCOUNBT is validated as a single leaf; shared and CoW staging extents are rejected, and refcount records are not mutated.
 - Directory rebuilding supports one LEAF1 or one DA-node level with one free-index block. Larger node trees fail with `NotSupported`.
-- A transaction must fit in one 32 KiB log record; log wrap/checkpointing and multi-record continuation are not implemented.
+- A transaction must fit in one 32 KiB log record; multi-record continuation is not implemented. Records wrap to the beginning of the log with a new cycle number when they do not fit.
 - Extended-attribute mutation is not implemented, but existing attribute-fork bytes are preserved when inodes are rewritten; unlinking an inode with attribute extents is rejected rather than leaking those blocks.
 - Real WinFsp mount/unmount and Linux `xfs_repair` validation are still required before release.
+
+### Log and crash recovery
+
+- Transactions are appended to the real XFS internal log and replayed by the next writable mount; the tail is checkpointed synchronously, so already-applied records are never replayed over reused data.
+- A record whose header frames correctly but is larger than one 32 KiB in-core buffer (Linux `logbsize` can reach 256 KiB) is reported as `NotSupported` instead of being skipped, so a committed transaction is never silently dropped.
+- Read-only mounts never replay the log. When the log still holds committed transactions the driver warns that recent changes are not visible, the equivalent of Linux `norecovery`; mount read-write to replay them.
+- Writable mounts log a warning: the writer is experimental, so keep a backup of the image and validate it with `xfs_repair` afterwards.
 
 ## Desktop GUI
 
@@ -102,6 +109,10 @@ The tray icon offers *Show CrissCrossFS*, *Unmount all* and *Exit*. The GUI and 
 CLI share the same mount layer, so a volume mounted from the GUI behaves exactly
 like one mounted with `crisscrossfs mount`.
 
+With **Read-write** ticked on an image file, the XFS root owner is mapped to
+your Windows account: files created on Linux by root become editable from
+Explorer, while the POSIX group/world bits still apply to other accounts.
+
 ## Windows service
 
 ```powershell
@@ -117,7 +128,11 @@ The service is registered as **CrissCrossFS Service** (`CrissCrossFSService`) an
 
 XFS `mode`/`uid`/`gid` are mapped to a protected Windows DACL:
 
-- uid 0 → `NT AUTHORITY\SYSTEM`; gid 0 → `BUILTIN\Administrators`.
+- uid 0 → the account that mounted a **writable** volume, so the person who
+  mounted the image gets the POSIX owner class (images are normally created by
+  root with 0755/0644 modes, which would otherwise be read-only for everyone);
+  read-only mounts map uid 0 to `NT AUTHORITY\SYSTEM`. gid 0 →
+  `BUILTIN\Administrators` in both cases.
 - Non-root IDs are **not guessed**. They must be listed in an optional
   `XFS_ACL_MAP` TOML file; an unmapped uid gets an empty DACL (fail closed).
 - Owner/group/other rights use explicit deny ACEs to reproduce POSIX class
@@ -142,8 +157,9 @@ $env:XFS_ACL_MAP = "C:\path\to\xfs-acl.toml"
 crisscrossfs.exe mount --image C:\images\disk.img --mount-point X:
 ```
 
-Without this file only root-owned entries are accessible. This conservative
-default prevents an XFS gid from silently granting access to every authenticated
+Without this file only root-owned entries are accessible, and non-root inodes
+stay invisible (empty DACL) until they are mapped. This conservative default
+prevents an XFS gid from silently granting access to every authenticated
 Windows user.
 
 ## Tests

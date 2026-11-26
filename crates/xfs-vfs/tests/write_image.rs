@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use fs_abstraction::{BlockDevice, FsError, FsResult, VfsFileSystem};
+use fs_abstraction::{BlockDevice, FsError, FsResult, VfsFileSystem, VfsFileType};
 use xfs_rs::btree::BlockReader;
 use xfs_vfs::XfsVfs;
 
@@ -483,4 +483,42 @@ fn writable_image_overwrites_inline_and_extent_files_and_recovers_cleanly() {
         created.ino
     );
     assert_eq!(reopened.readlink(symlink.ino).unwrap(), "new.txt");
+}
+
+/// The fixture root contains `special.fifo`. Creating entries there used to
+/// fail with `NotSupported` because POSIX "other" file types had no mapping to
+/// the on-disk directory ftype byte that the duplicate-name scan needs.
+#[test]
+fn creating_entries_in_the_root_preserves_non_file_directory_types() {
+    let Some(fixture) = fixture_path() else {
+        eprintln!("real XFS fixture unavailable; skipping");
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+
+    let device = Arc::new(FileDevice::open(temp.path()).unwrap());
+    let fs = XfsVfs::with_options(device.clone(), false).expect("writable XFS mount");
+    let root = resolve(&fs, "/");
+
+    let created = fs.create_file(root, "root-created.txt", 0o644).unwrap();
+    fs.write(created.ino, 0, b"root\n").unwrap();
+    assert_eq!(read_all(&fs, created.ino, 5), b"root\n");
+    assert_eq!(fs.resolve_path("/root-created.txt").unwrap(), created.ino);
+
+    let directory = fs.create_directory(root, "root-dir", 0o755).unwrap();
+    assert!(fs.stat(directory.ino).unwrap().is_dir());
+
+    let fifo = resolve(&fs, "/special.fifo");
+    assert_eq!(fs.stat(fifo).unwrap().file_type, VfsFileType::Fifo);
+    assert_eq!(fs.resolve_path("/special.fifo").unwrap(), fifo);
+
+    fs.shutdown().unwrap();
+    drop(fs);
+
+    let reopened = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert_eq!(read_all(&reopened, created.ino, 5), b"root\n");
+    assert!(reopened.stat(directory.ino).unwrap().is_dir());
+    let fifo = resolve(&reopened, "/special.fifo");
+    assert_eq!(reopened.stat(fifo).unwrap().file_type, VfsFileType::Fifo);
 }

@@ -40,7 +40,6 @@ use crate::{
 };
 
 /// Mutable writer context. The caller holds the filesystem-wide write lock.
-#[allow(dead_code)]
 pub(crate) struct WriteContext<'a> {
     pub device: Arc<dyn BlockDevice>,
     pub superblock: Superblock,
@@ -1192,11 +1191,15 @@ impl WriteContext<'_> {
                     name: entry.name.as_bytes().to_vec(),
                     inode: entry.ino,
                     file_type: match entry.file_type {
+                        fs_abstraction::VfsFileType::RegularFile => DirFileType::RegularFile,
                         fs_abstraction::VfsFileType::Directory => DirFileType::Directory,
                         fs_abstraction::VfsFileType::Symlink => DirFileType::SymbolicLink,
-                        fs_abstraction::VfsFileType::RegularFile => DirFileType::RegularFile,
-                        _ if !self.superblock.has_ftype() => DirFileType::Unknown,
-                        _ => return Err(FsError::NotSupported),
+                        fs_abstraction::VfsFileType::BlockDevice => DirFileType::BlockDevice,
+                        fs_abstraction::VfsFileType::CharDevice => DirFileType::CharDevice,
+                        fs_abstraction::VfsFileType::Fifo => DirFileType::Fifo,
+                        fs_abstraction::VfsFileType::Socket => DirFileType::Socket,
+                        // v4 directories store no ftype byte.
+                        fs_abstraction::VfsFileType::Unknown => DirFileType::Unknown,
                     },
                 })
             })
@@ -1702,9 +1705,9 @@ impl WriteContext<'_> {
         {
             return Err(FsError::Corrupted);
         }
-        sb.free_blocks = free_blocks as u64;
-        sb.free_inodes = free_inodes as u64;
-        sb.inode_count = allocated_inodes as u64;
+        sb.free_blocks = u64::try_from(free_blocks).map_err(|_| FsError::Corrupted)?;
+        sb.free_inodes = u64::try_from(free_inodes).map_err(|_| FsError::Corrupted)?;
+        sb.inode_count = u64::try_from(allocated_inodes).map_err(|_| FsError::Corrupted)?;
         let raw = sb.apply_to_sector(&raw)?;
         batch.stage(
             self.device.as_ref(),

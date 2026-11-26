@@ -32,6 +32,9 @@ use crate::io::{read_exact_at, write_exact_at};
 
 const BASIC_BLOCK_SIZE: u64 = 512;
 const DEFAULT_ICLOG_SIZE: u32 = 32 * 1024;
+/// Largest log record this implementation understands: one 32 KiB in-core log
+/// buffer plus the 512-byte record header.
+const MAX_RECORD_BYTES: u32 = XLOG_HEADER_SIZE as u32 + DEFAULT_ICLOG_SIZE;
 
 #[derive(Debug)]
 struct PositionedRecord {
@@ -160,11 +163,9 @@ impl Journal {
         }
         self.device.flush().map_err(|_| FsError::DiskError)?;
 
-        self.cycle = last.header.h_cycle;
-        self.head_block = Self::block_after(&last.header, self.log_basic_blocks);
-        if self.head_block == 0 {
-            self.cycle = self.cycle.wrapping_add(1);
-        }
+        let next = Self::lsn_after(&last.header, self.log_basic_blocks);
+        self.cycle = (next >> 32) as u32;
+        self.head_block = next as u32;
         self.prev_block = last.block;
         self.tail_lsn = tail_lsn;
         self.iclog_size = last.header.h_size;
@@ -198,31 +199,27 @@ impl Journal {
             items,
             inode_items,
         };
-        let record = encode_transaction(
-            &tx,
-            self.cycle,
-            self.head_block,
-            self.prev_block,
-            self.tail_lsn,
-            self.superblock.uuid,
-            self.iclog_size,
-            Self::native_format(),
-            tid,
-        )?;
+        let build = |cycle: u32, block: u32| {
+            encode_transaction(
+                &tx,
+                cycle,
+                block,
+                self.prev_block,
+                self.tail_lsn,
+                self.superblock.uuid,
+                self.iclog_size,
+                Self::native_format(),
+                tid,
+            )
+        };
+        let (cycle, start_block, record) = self.frame_record(build)?;
         let record_blocks = u32::try_from(record.len() as u64 / BASIC_BLOCK_SIZE)
             .map_err(|_| FsError::ArithmeticOverflow)?;
-        if self
-            .head_block
-            .checked_add(record_blocks)
-            .is_none_or(|end| end > self.log_basic_blocks)
-        {
-            return Err(FsError::NoSpace);
-        }
 
-        let lsn = (u64::from(self.cycle) << 32) | u64::from(self.head_block);
+        let lsn = (u64::from(cycle) << 32) | u64::from(start_block);
         let offset = self
             .log_start_bytes
-            .checked_add(u64::from(self.head_block) * BASIC_BLOCK_SIZE)
+            .checked_add(u64::from(start_block) * BASIC_BLOCK_SIZE)
             .ok_or(FsError::ArithmeticOverflow)?;
         if let Err(error) =
             write_exact_at(self.device.as_ref(), offset, &record, self.filesystem_size)
@@ -244,15 +241,7 @@ impl Journal {
             return Err(FsError::DiskError);
         }
 
-        let next_block = self.head_block + record_blocks;
-        self.tail_lsn = if next_block == self.log_basic_blocks {
-            u64::from(self.cycle.wrapping_add(1)) << 32
-        } else {
-            (u64::from(self.cycle) << 32) | u64::from(next_block)
-        };
-        self.prev_block = self.head_block;
-        self.head_block = next_block;
-        self.next_tid = tid.wrapping_add(1);
+        self.advance(cycle, start_block, record_blocks, tid);
         Ok(lsn)
     }
 
@@ -264,39 +253,73 @@ impl Journal {
         }
         self.device.flush().map_err(|_| FsError::DiskError)?;
         let tid = self.next_tid;
-        let record = encode_unmount_record(
-            self.cycle,
-            self.head_block,
-            self.prev_block,
-            self.tail_lsn,
-            self.superblock.uuid,
-            self.iclog_size,
-            Self::native_format(),
-            tid,
-        )?;
+        let build = |cycle: u32, block: u32| {
+            encode_unmount_record(
+                cycle,
+                block,
+                self.prev_block,
+                self.tail_lsn,
+                self.superblock.uuid,
+                self.iclog_size,
+                Self::native_format(),
+                tid,
+            )
+        };
+        let (cycle, start_block, record) = self.frame_record(build)?;
         let record_blocks = u32::try_from(record.len() as u64 / BASIC_BLOCK_SIZE)
             .map_err(|_| FsError::ArithmeticOverflow)?;
-        if self
-            .head_block
-            .checked_add(record_blocks)
-            .is_none_or(|end| end > self.log_basic_blocks)
-        {
-            return Err(FsError::NoSpace);
-        }
         let offset = self
             .log_start_bytes
-            .checked_add(u64::from(self.head_block) * BASIC_BLOCK_SIZE)
+            .checked_add(u64::from(start_block) * BASIC_BLOCK_SIZE)
             .ok_or(FsError::ArithmeticOverflow)?;
         write_exact_at(self.device.as_ref(), offset, &record, self.filesystem_size)?;
         self.device.flush().map_err(|_| FsError::DiskError)?;
-        self.tail_lsn = Self::lsn_after(
-            &decode_record_header(&record, self.superblock.uuid)?,
-            self.log_basic_blocks,
-        );
-        self.prev_block = self.head_block;
-        self.head_block += record_blocks;
-        self.next_tid = tid.wrapping_add(1);
+        self.advance(cycle, start_block, record_blocks, tid);
         Ok(())
+    }
+
+    /// Encode a record at the current head, wrapping to block 0 of the next
+    /// cycle when it would run past the end of the log.
+    fn frame_record(
+        &self,
+        build: impl Fn(u32, u32) -> FsResult<Vec<u8>>,
+    ) -> FsResult<(u32, u32, Vec<u8>)> {
+        let record = build(self.cycle, self.head_block)?;
+        let record_blocks = u32::try_from(record.len() as u64 / BASIC_BLOCK_SIZE)
+            .map_err(|_| FsError::ArithmeticOverflow)?;
+        if record_blocks == 0 || record_blocks > self.log_basic_blocks {
+            return Err(FsError::NoSpace);
+        }
+        if u64::from(self.head_block) + u64::from(record_blocks) <= u64::from(self.log_basic_blocks)
+        {
+            return Ok((self.cycle, self.head_block, record));
+        }
+
+        // The record does not fit in the remaining space: start over at the
+        // beginning of the log with the next cycle number. A wrapping cycle of
+        // 0 or of the header magic would make the record look erased.
+        let cycle = self.cycle.wrapping_add(1);
+        if cycle == 0 || cycle == XLOG_HEADER_MAGIC {
+            return Err(FsError::NotSupported);
+        }
+        Ok((cycle, 0, build(cycle, 0)?))
+    }
+
+    /// Account for a durable record and move the head past it.
+    fn advance(&mut self, cycle: u32, start_block: u32, record_blocks: u32, tid: u32) {
+        let end = u64::from(start_block) + u64::from(record_blocks);
+        if end >= u64::from(self.log_basic_blocks) {
+            self.cycle = cycle.wrapping_add(1);
+            self.head_block = 0;
+        } else {
+            self.cycle = cycle;
+            self.head_block = end as u32;
+        }
+        self.prev_block = start_block;
+        // The tail is checkpointed synchronously to the head, so everything
+        // before it is already durable and may be reclaimed.
+        self.tail_lsn = (u64::from(self.cycle) << 32) | u64::from(self.head_block);
+        self.next_tid = tid.wrapping_add(1);
     }
 
     pub(crate) fn current_lsn(&self) -> u64 {
@@ -311,9 +334,20 @@ impl Journal {
         }
     }
 
+    /// Walk the log from its first block and collect the records that frame
+    /// correctly.
+    ///
+    /// Records are framed by `h_len` (the payload length) plus their 512-byte
+    /// header, so the walk jumps from one record to the next instead of probing
+    /// every basic block. A torn write cannot start a record: such blocks are
+    /// skipped. A well-framed header that this implementation cannot decode is
+    /// an error when it is the newest record, because silently dropping it
+    /// would report a committed transaction as clean.
     fn scan(&self) -> FsResult<Vec<PositionedRecord>> {
         let mut records = Vec::new();
-        for block in 0..self.log_basic_blocks {
+        let mut newest_unsupported: Option<(u32, u32)> = None;
+        let mut block = 0u32;
+        while block < self.log_basic_blocks {
             let offset = self
                 .log_start_bytes
                 .checked_add(u64::from(block) * BASIC_BLOCK_SIZE)
@@ -332,27 +366,41 @@ impl Journal {
                 || cycle == 0
                 || cycle == XLOG_HEADER_MAGIC
             {
+                block += 1;
                 continue;
             }
+
             let payload_len = u32::from_be_bytes([prefix[12], prefix[13], prefix[14], prefix[15]]);
-            if payload_len == 0 || payload_len > 32 * 1024 {
-                continue;
-            }
-            let total = u64::from(XLOG_HEADER_SIZE as u32)
-                .checked_add(u64::from(payload_len))
-                .ok_or(FsError::ArithmeticOverflow)?;
-            if total > self.log_size_bytes
-                || u64::from(block)
-                    .checked_add(total / BASIC_BLOCK_SIZE)
-                    .is_none_or(|end| end > u64::from(self.log_basic_blocks))
+            // A record is one 512-byte header plus `payload_len` bytes, a whole
+            // number of basic blocks, and must fit before the end of the log.
+            let record_blocks = 1 + payload_len / BASIC_BLOCK_SIZE as u32;
+            if payload_len == 0
+                || !payload_len.is_multiple_of(BASIC_BLOCK_SIZE as u32)
+                || u64::from(block) + u64::from(record_blocks) > u64::from(self.log_basic_blocks)
             {
+                block += 1;
                 continue;
             }
-            let mut raw = vec![0u8; total as usize];
+            let record_len = XLOG_HEADER_SIZE as u32 + payload_len;
+
+            if record_len > MAX_RECORD_BYTES {
+                if newest_unsupported.is_none_or(|(seen_cycle, seen_block)| {
+                    (cycle, block) > (seen_cycle, seen_block)
+                }) {
+                    newest_unsupported = Some((cycle, block));
+                }
+                block += record_blocks;
+                continue;
+            }
+
+            let mut raw = vec![0u8; record_len as usize];
             read_exact_at(self.device.as_ref(), offset, &mut raw, self.filesystem_size)?;
             let header = match decode_record_header(&raw, self.superblock.uuid) {
                 Ok(header) => header,
-                Err(_) => continue,
+                Err(_) => {
+                    block += 1;
+                    continue;
+                }
             };
             let decoded = if header.h_fmt == Self::native_format() {
                 decode_record(&raw, self.superblock.uuid).ok()
@@ -364,9 +412,38 @@ impl Journal {
                 header,
                 decoded,
             });
+
+            block += record_blocks;
         }
+
         records.sort_by_key(|record| (record.header.h_cycle, record.block));
+        if let Some((cycle, block)) = newest_unsupported {
+            let newer_than_records = records
+                .last()
+                .is_none_or(|last| (cycle, block) > (last.header.h_cycle, last.block));
+            if newer_than_records {
+                return Err(FsError::NotSupported);
+            }
+        }
         Ok(records)
+    }
+
+    /// Whether the log holds transactions that a mount must replay.
+    ///
+    /// Used to warn on read-only mounts, which never replay the log.
+    pub(crate) fn log_needs_replay(&self) -> FsResult<bool> {
+        let records = self.scan()?;
+        let Some(last) = records.last() else {
+            return Ok(false);
+        };
+        let current: Vec<_> = records
+            .iter()
+            .filter(|record| record.header.h_cycle == last.header.h_cycle)
+            .collect();
+        let last_unmount = current
+            .iter()
+            .rposition(|record| record.decoded.as_ref().is_some_and(|item| item.unmount));
+        Ok(current.len() > last_unmount.map_or(0, |index| index + 1))
     }
 
     fn apply_items(
@@ -413,12 +490,14 @@ impl Journal {
     }
 
     fn block_after(header: &LogRecordHeader, log_blocks: u32) -> u32 {
-        let blocks = header.h_len / XLOG_HEADER_SIZE as u32;
-        let end = header.h_lsn as u32 + blocks;
-        if end >= log_blocks {
+        // A record is one 512-byte header block followed by `h_len` payload
+        // bytes; `h_len` itself excludes the header.
+        let blocks = 1 + header.h_len.div_ceil(BASIC_BLOCK_SIZE as u32);
+        let end = u64::from(header.h_lsn as u32) + u64::from(blocks);
+        if end >= u64::from(log_blocks) {
             0
         } else {
-            end
+            end as u32
         }
     }
 
@@ -616,6 +695,170 @@ mod tests {
             xfs_rs::DataFork::Extents(extents) => assert_eq!(extents, vec![extent]),
             other => panic!("unexpected data fork: {other:?}"),
         }
+    }
+
+    fn commit_record(tid: u32, block: u32, target: u64, byte: u8, prev_block: u32) -> Vec<u8> {
+        encode_transaction(
+            &LogTransaction {
+                tid,
+                items: vec![LogBufferItem {
+                    block_num: target,
+                    data: vec![byte; 512],
+                    buffer_type: LogBufferType::Btree,
+                    inode_buffer: false,
+                    dirty_chunks: Vec::new(),
+                }],
+                inode_items: Vec::new(),
+            },
+            1,
+            block,
+            prev_block,
+            0,
+            [0xA5; 16],
+            DEFAULT_ICLOG_SIZE,
+            XLOG_FMT_LINUX_LE,
+            tid,
+        )
+        .unwrap()
+    }
+
+    /// Every remount must resume exactly after the last record. An off-by-one
+    /// head position overwrites the previous record and recovery then drops its
+    /// transaction.
+    #[test]
+    fn successive_remounts_append_without_overlapping_records() {
+        let device = Device::new();
+        let superblock = superblock();
+        let log_start = Journal::new(device.clone(), superblock.clone())
+            .unwrap()
+            .log_start_bytes;
+
+        let seed = commit_record(1, 0, 20, 0xAA, u32::MAX);
+        write_exact_at(device.as_ref(), log_start, &seed, device.size()).unwrap();
+
+        let mut previous_head = None;
+        for round in 0..3u8 {
+            let mut journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+            journal.recover().unwrap();
+            if let Some((cycle, block)) = previous_head {
+                assert_eq!(
+                    (journal.cycle, journal.head_block),
+                    (cycle, block),
+                    "recovery must resume exactly after the last record, not inside it"
+                );
+            }
+            let record = 21 + u64::from(round);
+            journal
+                .commit(
+                    vec![LogBufferItem {
+                        block_num: record,
+                        data: vec![0x40 + round; 512],
+                        buffer_type: LogBufferType::Btree,
+                        inode_buffer: false,
+                        dirty_chunks: Vec::new(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap();
+            previous_head = Some((journal.cycle, journal.head_block));
+            // Dropped without shutdown(), like a crash.
+        }
+
+        let mut reopened = Journal::new(device.clone(), superblock).unwrap();
+        reopened.recover().unwrap();
+        let data = device.data.lock().unwrap();
+        assert_eq!(&data[20 * 512..21 * 512], &[0xAA; 512]);
+        for round in 0..3u8 {
+            let record = (21 + u64::from(round)) as usize * 512;
+            assert_eq!(&data[record..record + 512], &[0x40 + round; 512]);
+        }
+    }
+
+    #[test]
+    fn commit_wraps_to_the_next_cycle_at_the_end_of_the_log() {
+        let device = Device::new();
+        let superblock = superblock();
+        let mut journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+
+        journal.cycle = 7;
+        journal.head_block = journal.log_basic_blocks - 1;
+        journal.prev_block = u32::MAX;
+        journal.tail_lsn = (7u64 << 32) | u64::from(journal.log_basic_blocks - 1);
+
+        let lsn = journal
+            .commit(
+                vec![LogBufferItem {
+                    block_num: 30,
+                    data: vec![0x77; 512],
+                    buffer_type: LogBufferType::Btree,
+                    inode_buffer: false,
+                    dirty_chunks: Vec::new(),
+                }],
+                Vec::new(),
+            )
+            .expect("a record that does not fit must wrap instead of failing");
+        assert_eq!(lsn >> 32, 8, "wrapped record starts a new cycle");
+        assert_eq!(lsn as u32, 0, "wrapped record starts at block 0");
+        assert_eq!(journal.cycle, 8);
+        assert!(journal.head_block >= 2);
+
+        let mut reopened = Journal::new(device.clone(), superblock).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(
+            &device.data.lock().unwrap()[30 * 512..31 * 512],
+            &[0x77; 512]
+        );
+        assert_eq!(reopened.cycle, journal.cycle);
+        assert_eq!(reopened.head_block, journal.head_block);
+    }
+
+    #[test]
+    fn scan_rejects_an_unsupported_record_size_at_the_head() {
+        let device = Device::new();
+        let superblock = superblock();
+        let journal = Journal::new(device.clone(), superblock).unwrap();
+
+        let mut header = vec![0u8; 512];
+        header[0..4].copy_from_slice(&XLOG_HEADER_MAGIC.to_be_bytes());
+        header[4..8].copy_from_slice(&2u32.to_be_bytes());
+        header[8..12].copy_from_slice(&XLOG_VERSION_2.to_be_bytes());
+        let oversized = MAX_RECORD_BYTES + 512;
+        header[12..16].copy_from_slice(&oversized.to_be_bytes());
+        write_exact_at(
+            device.as_ref(),
+            journal.log_start_bytes,
+            &header,
+            device.size(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(journal.scan(), Err(FsError::NotSupported)),
+            "a well-framed record this driver cannot decode must not be skipped"
+        );
+    }
+
+    #[test]
+    fn read_only_probe_reports_whether_the_log_needs_replay() {
+        let device = Device::new();
+        let superblock = superblock();
+        let journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+        let seed = commit_record(1, 0, 20, 0xAA, u32::MAX);
+        write_exact_at(
+            device.as_ref(),
+            journal.log_start_bytes,
+            &seed,
+            device.size(),
+        )
+        .unwrap();
+        assert!(journal.log_needs_replay().unwrap());
+
+        let mut mounted = Journal::new(device.clone(), superblock.clone()).unwrap();
+        mounted.recover().unwrap();
+        mounted.shutdown().unwrap();
+
+        let probe = Journal::new(device.clone(), superblock).unwrap();
+        assert!(!probe.log_needs_replay().unwrap());
     }
 
     #[test]

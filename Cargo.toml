@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "GPLv3"
+license = "GPL-3.0-only"
 [workspace.dependencies]
 # Benchmark dependencies
 criterion = "0.5"

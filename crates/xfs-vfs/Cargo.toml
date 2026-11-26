@@ -3,7 +3,7 @@ name = "xfs-vfs"
 version = "0.1.0"
 edition = "2021"
 description = "XFS filesystem implementation of VFS traits"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 authors = ["CrissCrossFS contributors"]
 
 [dependencies]

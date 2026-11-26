@@ -150,6 +150,25 @@ impl XfsVfs {
         }
 
         let journal = if read_only {
+            // Read-only mounts never replay the log, so transactions that were
+            // only committed to the log stay invisible: the volume shows the
+            // pre-crash view. Say so instead of silently presenting stale
+            // metadata (Linux calls this `norecovery`).
+            match Journal::new(device.clone(), superblock.clone()) {
+                Ok(probe) => match probe.log_needs_replay() {
+                    Ok(true) => tracing::warn!(
+                        "XFS log needs replay but the volume is mounted read-only; recent \
+                         metadata changes are not visible (like Linux 'norecovery')"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::debug!(?error, "cannot inspect the XFS log on a read-only mount")
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(?error, "cannot inspect the XFS log on a read-only mount")
+                }
+            }
             None
         } else {
             let mut journal = Journal::new(device.clone(), superblock.clone())?;
@@ -162,6 +181,10 @@ impl XfsVfs {
         if !read_only {
             // Attribute-fork mutations are not implemented by the writer.
             capabilities.supports_xattr = false;
+            tracing::warn!(
+                "writable image mounts are experimental: unsupported metadata fails closed, so \
+                 keep a backup of the image and validate it with xfs_repair"
+            );
         }
         let free_blocks = AtomicU64::new(superblock.free_blocks);
         let free_inodes = AtomicU64::new(superblock.free_inodes);

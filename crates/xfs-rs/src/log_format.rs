@@ -628,7 +628,8 @@ pub struct DecodedLogRecord {
     pub h_cycle: u32,
     /// `h_version`.
     pub h_version: u32,
-    /// `h_len`, including physical basic-block padding.
+    /// `h_len`: payload length in bytes, padded to whole basic blocks. The
+    /// record occupies one 512-byte header block plus `h_len` bytes.
     pub h_len: u32,
     /// `h_lsn`.
     pub h_lsn: u64,
@@ -672,8 +673,8 @@ pub struct DecodedLogRecord {
 /// 32 KiB. `format` must match this host's endianness because item structures
 /// are emitted in native byte order.
 ///
-/// The returned allocation contains one 512-byte header followed by `h_len`
-/// bytes. The payload is zero-padded to a basic-block boundary and every
+/// The returned allocation is one 512-byte header followed by `h_len` bytes of
+/// payload, zero-padded to a basic-block boundary. Every
 /// payload basic block is cycle-stamped, with displaced first words saved in
 /// `h_cycle_data`. The CRC covers the 328-byte C header through `h_pad0` and
 /// the stamped payload.
@@ -818,11 +819,11 @@ pub fn encode_unmount_record(
 
 /// Validate and decode one physical v2 log record.
 ///
-/// `raw` may contain trailing bytes beyond `h_len`; only the declared record
-/// is checksummed and parsed. Both Linux little- and big-endian `h_fmt`
-/// values are understood. Unknown formats, multi-block record headers,
-/// continued operations, unsupported log items, and records containing more
-/// than one transaction are rejected.
+/// `raw` may contain trailing bytes beyond the record; only the declared
+/// record (header plus `h_len` payload bytes) is checksummed and parsed. Both
+/// Linux little- and big-endian `h_fmt` values are understood. Unknown formats,
+/// multi-block record headers, continued operations, unsupported log items, and
+/// records containing more than one transaction are rejected.
 ///
 /// Buffer and inode items are returned only after a matching commit operation.
 /// An unmount record decodes with `unmount = true`, `committed = false`, and no
