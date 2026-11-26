@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "Building XFS WinFsp filesystem..." -ForegroundColor Green
+Write-Host "Building CrissCrossFS..." -ForegroundColor Green
 
 $releaseArgs = @()
 if ($Configuration -eq "Release") {
@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $profileDir = if ($Configuration -eq "Release") { "release" } else { "debug" }
-$source = Join-Path $PSScriptRoot "..\target\x86_64-pc-windows-msvc\$profileDir\xfs-mount.exe"
+$source = Join-Path $PSScriptRoot "..\target\x86_64-pc-windows-msvc\$profileDir\crisscrossfs.exe"
 if (-not (Test-Path $source)) {
     Write-Host "Executable not found: $source" -ForegroundColor Red
     exit 1
@@ -27,7 +27,7 @@ if (-not (Test-Path $source)) {
 
 $packageDir = Join-Path $PSScriptRoot "..\Package"
 New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-$destination = Join-Path $packageDir "xfs-mount.exe"
+$destination = Join-Path $packageDir "crisscrossfs.exe"
 Copy-Item -Path $source -Destination $destination -Force
 
 Write-Host "Build complete: $destination" -ForegroundColor Green

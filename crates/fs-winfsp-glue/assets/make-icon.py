@@ -1,4 +1,4 @@
-"""Generate a 32x32 RGBA app icon for XFS Mount (raw bytes for CreateDIBSection)."""
+"""Generate a 32x32 RGBA app icon for CrissCrossFS (raw bytes for CreateDIBSection)."""
 import os, math
 
 SIZE = 32

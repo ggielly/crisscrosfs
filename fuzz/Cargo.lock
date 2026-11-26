@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "crisscrosfs-fuzz"
+name = "crisscrossfs-fuzz"
 version = "0.1.0"
 dependencies = [
  "libfuzzer-sys",

@@ -1,5 +1,8 @@
 //! Native file picker for XFS image files.
 
+// Win32 dialog structures are populated field-by-field before the FFI call.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::{mem::size_of, path::PathBuf};
 
 use windows::{

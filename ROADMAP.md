@@ -1,4 +1,4 @@
-# XFS Driver Implementation Roadmap
+# CrissCrossFS Implementation Roadmap
 
 > **Version**: 6.0
 > **Last Updated**: 2026-11-26
@@ -10,7 +10,7 @@
 
 ```text
 fs-abstraction → xfs-rs → xfs-vfs → fs-winfsp-glue
-   (traits)    (parser)   (VFS)     (xfs-mount.exe)
+   (traits)    (parser)   (VFS)     (crisscrossfs.exe)
 ```
 
 - `xfs-rs` owns on-disk parsing, validation, and metadata codecs.

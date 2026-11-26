@@ -3,7 +3,7 @@
 #
 # Usage: populate.sh <mountpoint> [small|large]
 #
-# The tree exercises what a Windows XFS driver has to deal with: nested
+# The tree exercises what CrissCrossFS has to deal with: nested
 # directories, short/long/unicode names, case sensitivity, hard and symbolic
 # links, sparse and fragmented files, exact block-size boundaries, permission
 # bits, xattrs, a FIFO, and directories big enough to leave shortform format.
@@ -45,7 +45,7 @@ XFS test image
 ==============
 
 This filesystem was formatted with mkfs.xfs and then populated by
-scripts/populate.sh. It is meant to exercise a read-only XFS driver:
+scripts/populate.sh. It is meant to exercise CrissCrossFS:
 directory formats, extents, sparse files, links, permissions and xattrs.
 EOF
 

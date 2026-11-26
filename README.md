@@ -1,6 +1,6 @@
-# XFS filesystem driver for Windows
+# CrissCrossFS — XFS filesystem driver for Windows
 
-This project implements an experimental XFS filesystem for Windows in Rust. It uses WinFsp for the kernel-mode filesystem interface and a user-mode Rust VFS for XFS parsing, reads, and transactional writes to regular image files.
+CrissCrossFS is an experimental XFS filesystem driver for Windows, written in Rust. It uses WinFsp for the kernel-mode filesystem interface and a user-mode Rust VFS for XFS parsing, reads, and transactional writes to regular image files.
 
 > **Status:** experimental. Do not use on production data. Physical disks, partitions, and volumes remain read-only. Writable image mounts use the real XFS internal log, but supported on-disk feature combinations and directory geometries are intentionally bounded.
 
@@ -32,8 +32,8 @@ This project implements an experimental XFS filesystem for Windows in Rust. It u
 cargo build -p fs-winfsp-glue
 ```
 
-The executables are written to `target\debug\xfs-mount.exe` (CLI) and
-`target\debug\xfs-mount-gui.exe` (GUI).
+The executables are written to `target\debug\crisscrossfs.exe` (CLI) and
+`target\debug\crisscrossfs-gui.exe` (GUI).
 
 For a release build:
 
@@ -47,26 +47,26 @@ Run from an elevated terminal.
 
 ```powershell
 # Mount an XFS partition by drive letter
-xfs-mount.exe mount --partition D: --mount-point X:
+crisscrossfs.exe mount --partition D: --mount-point X:
 
 # Mount a physical disk
-xfs-mount.exe mount --disk 1 --mount-point X:
+crisscrossfs.exe mount --disk 1 --mount-point X:
 
 # Mount an XFS image file read-only
-xfs-mount.exe mount --image C:\images\disk.img --mount-point X:
+crisscrossfs.exe mount --image C:\images\disk.img --mount-point X:
 
 # Mount a regular XFS image file read-write (experimental)
-xfs-mount.exe mount --image C:\images\disk.img --mount-point X: --rw
+crisscrossfs.exe mount --image C:\images\disk.img --mount-point X: --rw
 
 # Mount a Windows volume path
-xfs-mount.exe mount --volume '\\.\HarddiskVolume5' --mount-point X:
+crisscrossfs.exe mount --volume '\\.\HarddiskVolume5' --mount-point X:
 
 # Inspect or list an image
-xfs-mount.exe info --image C:\images\disk.img
-xfs-mount.exe ls --image C:\images\disk.img /
+crisscrossfs.exe info --image C:\images\disk.img
+crisscrossfs.exe ls --image C:\images\disk.img /
 
 # Scan physical disks
-xfs-mount.exe scan
+crisscrossfs.exe scan
 ```
 
 Press `Ctrl+C` to unmount. Writable mounts flush metadata and append a clean unmount record during shutdown. `--rw` is rejected for physical disks, partitions, and Windows volume paths; it is accepted only for regular image files.
@@ -85,33 +85,33 @@ The writer fails closed rather than silently producing incomplete metadata:
 
 ## Desktop GUI
 
-`xfs-mount-gui.exe` is a native Win32 front-end built directly on the `windows`
+`crisscrossfs-gui.exe` is a native Win32 front-end built directly on the `windows`
 crate: it lists the XFS volumes found on the machine plus any image file you
 pick, mounts and unmounts them on a free drive letter, and keeps running in the
 notification area when the window is closed.
 
 ```powershell
 # Windowless build, meant for Explorer or a Start-menu shortcut
-target\debug\xfs-mount-gui.exe
+target\debug\crisscrossfs-gui.exe
 
 # Same UI from a console (handy while developing)
-xfs-mount.exe gui
+crisscrossfs.exe gui
 ```
 
-The tray icon offers *Show XFS Mount*, *Unmount all* and *Exit*. The GUI and the
+The tray icon offers *Show CrissCrossFS*, *Unmount all* and *Exit*. The GUI and the
 CLI share the same mount layer, so a volume mounted from the GUI behaves exactly
-like one mounted with `xfs-mount mount`.
+like one mounted with `crisscrossfs mount`.
 
 ## Windows service
 
 ```powershell
-xfs-mount.exe service install
-xfs-mount.exe service start
-xfs-mount.exe service stop
-xfs-mount.exe service uninstall
+crisscrossfs.exe service install
+crisscrossfs.exe service start
+crisscrossfs.exe service stop
+crisscrossfs.exe service uninstall
 ```
 
-The service runs as `LocalSystem`. Install it only from a protected directory and review the mount-point access policy before exposing volumes to other users.
+The service is registered as **CrissCrossFS Service** (`CrissCrossFSService`) and runs as `LocalSystem`. Install it only from a protected directory and review the mount-point access policy before exposing volumes to other users.
 
 ## POSIX permissions and Windows ACLs
 
@@ -139,7 +139,7 @@ Example `xfs-acl.toml`:
 
 ```powershell
 $env:XFS_ACL_MAP = "C:\path\to\xfs-acl.toml"
-xfs-mount.exe mount --image C:\images\disk.img --mount-point X:
+crisscrossfs.exe mount --image C:\images\disk.img --mount-point X:
 ```
 
 Without this file only root-owned entries are accessible. This conservative

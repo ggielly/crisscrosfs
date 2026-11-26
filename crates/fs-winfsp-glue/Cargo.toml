@@ -2,9 +2,9 @@
 name = "fs-winfsp-glue"
 version = "0.1.0"
 edition = "2021"
-description = "Generic WinFsp glue layer for VFS filesystems"
+description = "CrissCrossFS WinFsp integration for XFS filesystems"
 license = "GPL-3.0"
-authors = ["XFS Development Team"]
+authors = ["CrissCrossFS contributors"]
 
 [build-dependencies]
 winfsp = "0.12"
@@ -61,9 +61,9 @@ toml = "0.9"
 windows-service = "0.7"
 
 [[bin]]
-name = "xfs-mount"
+name = "crisscrossfs"
 path = "src/main.rs"
 
 [[bin]]
-name = "xfs-mount-gui"
+name = "crisscrossfs-gui"
 path = "src/gui_main.rs"

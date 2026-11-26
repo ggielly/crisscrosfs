@@ -1,1 +1,1 @@
-//! Fuzzing workspace for crisscrosfs parsers.
+//! Fuzzing workspace for CrissCrossFS parsers.

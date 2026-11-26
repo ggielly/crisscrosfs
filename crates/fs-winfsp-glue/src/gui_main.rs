@@ -1,9 +1,9 @@
-//! Windowless entry point for the XFS Mount GUI.
+//! Windowless entry point for the CrissCrossFS GUI.
 //!
 //! This binary is compiled with the `windows` subsystem so double-clicking it
 //! from Explorer (or a Start-menu shortcut) opens the GUI without a console
-//! window.  The `xfs-mount gui` subcommand runs the exact same front-end with a
-//! console attached, which is handy for development.
+//! window.  The `crisscrossfs gui` subcommand runs the exact same front-end
+//! with a console attached, which is handy for development.
 
 #![windows_subsystem = "windows"]
 

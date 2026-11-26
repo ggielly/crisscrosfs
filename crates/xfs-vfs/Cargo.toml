@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "XFS filesystem implementation of VFS traits"
 license = "GPL-3.0"
-authors = ["XFS Development Team"]
+authors = ["CrissCrossFS contributors"]
 
 [dependencies]
 # VFS abstraction layer

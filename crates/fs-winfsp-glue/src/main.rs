@@ -1,10 +1,10 @@
-//! XFS Mount CLI - Mount XFS filesystems on Windows.
+//! CrissCrossFS CLI - Mount XFS filesystems on Windows.
 //!
 //! Usage:
-//!   xfs-mount mount --disk 1 --mount-point X:
-//!   xfs-mount mount --image /path/to/xfs.img --mount-point X:
-//!   xfs-mount mount --partition D: --mount-point X:
-//!   xfs-mount scan
+//!   crisscrossfs mount --disk 1 --mount-point X:
+//!   crisscrossfs mount --image /path/to/xfs.img --mount-point X:
+//!   crisscrossfs mount --partition D: --mount-point X:
+//!   crisscrossfs scan
 
 use std::{
     path::PathBuf,
@@ -26,10 +26,10 @@ use tracing_subscriber::FmtSubscriber;
 use xfs_vfs::XfsVfs;
 
 #[derive(Parser)]
-#[command(name = "xfs-mount")]
-#[command(author = "XFS Development Team")]
+#[command(name = "crisscrossfs")]
+#[command(author = "CrissCrossFS contributors")]
 #[command(version = "0.1.0")]
-#[command(about = "Mount XFS filesystems on Windows", long_about = None)]
+#[command(about = "CrissCrossFS — mount XFS filesystems on Windows", long_about = None)]
 struct Cli {
     /// Enable debug output
     #[arg(short = 'D', long, global = true)]
@@ -124,13 +124,13 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Install the XFS service
+    /// Install the CrissCrossFS service
     Install,
-    /// Uninstall the XFS service
+    /// Uninstall the CrissCrossFS service
     Uninstall,
-    /// Start the XFS service
+    /// Start the CrissCrossFS service
     Start,
-    /// Stop the XFS service
+    /// Stop the CrissCrossFS service
     Stop,
     /// Run as a service (internal use)
     Run,
@@ -288,7 +288,7 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
 
     // Detect and create filesystem
     info!("Detecting filesystem type...");
-    let fs = fs_winfsp_glue::factory::detect_and_create(device, true)?;
+    let fs = fs_winfsp_glue::factory::detect_and_create(device, options.read_only)?;
 
     // Get volume info for display
     let vol_info = fs.get_volume_info()?;
@@ -438,8 +438,8 @@ fn cmd_service_install() -> Result<()> {
     {
         fs_winfsp_glue::service::install_service()
             .map_err(|e| fs_winfsp_glue::error::XfsWinfspError::WinFspError(e.to_string()))?;
-        info!("XFS service installed successfully.");
-        info!("Start it with: xfs-mount service start");
+        info!("CrissCrossFS service installed successfully.");
+        info!("Start it with: crisscrossfs service start");
     }
     #[cfg(not(windows))]
     {
@@ -454,7 +454,7 @@ fn cmd_service_uninstall() -> Result<()> {
     {
         fs_winfsp_glue::service::uninstall_service()
             .map_err(|e| XfsWinfspError::WinFspError(e.to_string()))?;
-        info!("XFS service uninstalled successfully.");
+        info!("CrissCrossFS service uninstalled successfully.");
     }
     #[cfg(not(windows))]
     {
@@ -469,7 +469,7 @@ fn cmd_service_start() -> Result<()> {
     {
         service::start_service()
             .map_err(|e: Box<dyn std::error::Error>| XfsWinfspError::WinFspError(e.to_string()))?;
-        info!("XFS service started.");
+        info!("CrissCrossFS service started.");
     }
     #[cfg(not(windows))]
     {
@@ -484,7 +484,7 @@ fn cmd_service_stop() -> Result<()> {
     {
         service::stop_service()
             .map_err(|e: Box<dyn std::error::Error>| XfsWinfspError::WinFspError(e.to_string()))?;
-        info!("XFS service stopped.");
+        info!("CrissCrossFS service stopped.");
     }
     #[cfg(not(windows))]
     {
@@ -535,12 +535,19 @@ mod tests {
     }
 
     #[test]
+    fn cli_uses_the_product_name() {
+        use clap::CommandFactory;
+
+        assert_eq!(Cli::command().get_name(), "crisscrossfs");
+    }
+
+    #[test]
     fn cli_requires_exactly_one_source() {
-        assert!(Cli::try_parse_from(["xfs-mount", "mount", "--mount-point", "X:"]).is_err());
-        assert!(Cli::try_parse_from(["xfs-mount", "info"]).is_err());
-        assert!(Cli::try_parse_from(["xfs-mount", "ls", "/"]).is_err());
+        assert!(Cli::try_parse_from(["crisscrossfs", "mount", "--mount-point", "X:"]).is_err());
+        assert!(Cli::try_parse_from(["crisscrossfs", "info"]).is_err());
+        assert!(Cli::try_parse_from(["crisscrossfs", "ls", "/"]).is_err());
         assert!(Cli::try_parse_from([
-            "xfs-mount",
+            "crisscrossfs",
             "mount",
             "--disk",
             "0",
@@ -554,7 +561,7 @@ mod tests {
 
     #[test]
     fn service_run_arguments_match_the_cli() {
-        let cli = Cli::try_parse_from(["xfs-mount", "service", "run"]).unwrap();
+        let cli = Cli::try_parse_from(["crisscrossfs", "service", "run"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Service {

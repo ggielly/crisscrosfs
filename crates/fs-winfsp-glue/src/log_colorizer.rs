@@ -30,9 +30,9 @@ mod tests {
 
     #[test]
     fn test_add_visual_marker() {
-        let line = "xfs-mount[TID=20e8]: FFFFD18C537D5DE0: >>Create IoStatus=0[1]";
+        let line = "crisscrossfs[TID=20e8]: FFFFD18C537D5DE0: >>Create IoStatus=0[1]";
         let marked = WinFspLogVisualMarker::add_visual_marker(line);
         assert!(marked.starts_with("|||| "));
-        assert!(marked.contains("xfs-mount[TID=20e8]"));
+        assert!(marked.contains("crisscrossfs[TID=20e8]"));
     }
 }

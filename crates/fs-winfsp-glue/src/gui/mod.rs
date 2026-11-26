@@ -1,10 +1,13 @@
-//! Native Windows front-end for mounting XFS filesystems.
+//! Native Windows front-end for CrissCrossFS.
 //!
 //! Implemented directly on Win32 (User32 + Comctl32) through the `windows`
 //! crate: no cross-platform toolkit is involved.  The window lists the XFS
 //! volumes found on the machine (plus image files picked by the user), lets the
 //! user pick a free drive letter and mount/unmount, and keeps running in the
 //! notification area when the window is closed.
+
+// Win32 common-control structures are populated field-by-field before FFI calls.
+#![allow(clippy::field_reassign_with_default)]
 
 mod dialogs;
 mod icon;
@@ -182,7 +185,7 @@ pub fn run(debug: bool) -> Result<()> {
 pub fn report_fatal(message: &str) {
     unsafe {
         let text = wide(message);
-        let caption = wide("XFS Mount");
+        let caption = wide("CrissCrossFS");
         MessageBoxW(
             HWND(std::ptr::null_mut()),
             PCWSTR(text.as_ptr()),
@@ -229,7 +232,7 @@ unsafe fn run_inner(debug: bool) -> windows::core::Result<()> {
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class_name,
-        w!("XFS Mount"),
+        w!("CrissCrossFS"),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -369,7 +372,7 @@ impl App {
             w!("STATIC"),
             w!(
                 "Detected XFS volumes. Pick a free drive letter, then Mount. Closing this window \
-                 keeps XFS Mount in the notification area."
+                 keeps CrissCrossFS in the notification area."
             ),
             base(0),
             IDC_HINT,
@@ -771,7 +774,7 @@ impl App {
             }
             Err(error) => {
                 self.set_status(&format!("Mount failed: {error}"));
-                self.show_error("XFS Mount", &format!("Mount failed:\n\n{error}"));
+                self.show_error("CrissCrossFS", &format!("Mount failed:\n\n{error}"));
             }
         }
     }
@@ -881,7 +884,7 @@ impl App {
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = WM_APP_TRAY;
         data.hIcon = self.icon;
-        fill_wide(&mut data.szTip, "XFS Mount");
+        fill_wide(&mut data.szTip, "CrissCrossFS");
         self.tray_added = Shell_NotifyIconW(NIM_ADD, &data).as_bool();
     }
 
@@ -909,7 +912,7 @@ impl App {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let _ = AppendMenuW(menu, MF_STRING, IDM_SHOW, w!("Show XFS Mount"));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_SHOW, w!("Show CrissCrossFS"));
         let _ = AppendMenuW(menu, MF_STRING, IDM_UNMOUNT_ALL, w!("Unmount all"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
@@ -939,7 +942,7 @@ impl App {
     // -------------------------------------------------------------- messages
 
     unsafe fn on_command(&mut self, wparam: WPARAM) {
-        let id = (wparam.0 & 0xFFFF) as usize;
+        let id = wparam.0 & 0xFFFF;
         let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
         match id {

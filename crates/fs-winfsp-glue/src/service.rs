@@ -1,4 +1,4 @@
-//! Windows Service for automatic XFS disk detection and mounting.
+//! CrissCrossFS Windows service for automatic XFS disk detection and mounting.
 //!
 //! This module implements a Windows service that:
 //! 1. Scans for XFS partitions/disks at startup
@@ -34,13 +34,14 @@ use crate::{
 };
 
 /// Service name as registered with Windows.
-pub const SERVICE_NAME: &str = "XfsFilesystemService";
+pub const SERVICE_NAME: &str = "CrissCrossFSService";
 
 /// Service display name.
-pub const SERVICE_DISPLAY_NAME: &str = "XFS Filesystem Service";
+pub const SERVICE_DISPLAY_NAME: &str = "CrissCrossFS Service";
 
 /// Service description.
-pub const SERVICE_DESCRIPTION: &str = "Automatically detects and mounts XFS filesystems on Windows";
+pub const SERVICE_DESCRIPTION: &str =
+    "CrissCrossFS service for automatic XFS detection and mounting on Windows";
 
 /// Arguments the SCM must pass to the service binary.
 pub const SERVICE_LAUNCH_ARGUMENTS: [&str; 2] = ["service", "run"];
@@ -132,7 +133,7 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
         process_id: None,
     })?;
 
-    info!("XFS Filesystem Service started");
+    info!("CrissCrossFS Service started");
 
     // Main service loop
     loop {
@@ -175,7 +176,7 @@ fn run_service(_arguments: Vec<OsString>) -> Result<(), Box<dyn std::error::Erro
         process_id: None,
     })?;
 
-    info!("XFS Filesystem Service stopped");
+    info!("CrissCrossFS Service stopped");
     Ok(())
 }
 
@@ -295,7 +296,7 @@ pub fn install_service() -> Result<(), Box<dyn std::error::Error>> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary,
-        // Must match the Clap hierarchy in main.rs: `xfs-mount service run`.
+        // Must match the Clap hierarchy in main.rs: `crisscrossfs service run`.
         // The SCM appends these verbatim to the executable path.
         launch_arguments: SERVICE_LAUNCH_ARGUMENTS
             .iter()
@@ -385,7 +386,7 @@ pub fn stop_service() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err("Timed out waiting for XFS service to stop".into());
+            return Err("Timed out waiting for CrissCrossFS service to stop".into());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -403,6 +404,12 @@ mod tests {
     use std::{sync::mpsc, time::Duration};
 
     use super::*;
+
+    #[test]
+    fn service_uses_the_product_name() {
+        assert_eq!(SERVICE_NAME, "CrissCrossFSService");
+        assert_eq!(SERVICE_DISPLAY_NAME, "CrissCrossFS Service");
+    }
 
     #[test]
     fn service_launch_arguments_match_cli() {
