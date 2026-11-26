@@ -18,7 +18,9 @@ xfs-rs = { path = "../xfs-rs", default-features = false, features = ["std"] }
 xfs-vfs = { path = "../xfs-vfs" }
 
 # WinFsp bindings
-winfsp = { version = "0.12", features = ["debug"] }  # Safe Rust bindings for WinFsp with debug output
+# "system" lets `winfsp_init` fall back to the InstallDir registry value, so the
+# DLL is found even when WinFsp\bin is not on PATH (typically GUI launches).
+winfsp = { version = "0.12", features = ["debug", "system"] }
 winfsp-sys = "0.12"          # Keep FFI types on the same WinFsp 2.1 version as the safe bindings
 
 # Windows APIs
@@ -32,6 +34,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Services",
     "Win32_System_Console",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Error handling & logging
@@ -53,3 +63,7 @@ windows-service = "0.7"
 [[bin]]
 name = "xfs-mount"
 path = "src/main.rs"
+
+[[bin]]
+name = "xfs-mount-gui"
+path = "src/gui_main.rs"

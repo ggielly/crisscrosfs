@@ -58,11 +58,14 @@ pub mod context;
 pub mod disk;
 pub mod error;
 pub mod factory;
+#[cfg(windows)]
+pub mod gui;
 pub mod log_colorizer;
 pub mod mount;
 pub mod path;
 pub mod security;
 pub mod service;
+pub mod source;
 pub mod winfsp_mount;
 
 pub use error::{Result, XfsWinfspError};

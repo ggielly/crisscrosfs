@@ -14,7 +14,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use fs_abstraction::VfsFileSystem;
 use fs_winfsp_glue::{
-    disk::{self, scan_for_xfs_disks, ImageFileReader, PhysicalDiskReader},
+    disk::scan_for_xfs_disks,
     error::Result,
     mount::{parse_partition, validate_mount_point, MountOptions, MountSource},
     service,
@@ -117,6 +117,9 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Launch the graphical interface
+    Gui,
 }
 
 #[derive(Subcommand)]
@@ -221,6 +224,8 @@ fn main() {
             ServiceAction::Stop => cmd_service_stop(),
             ServiceAction::Run => cmd_service_run(),
         },
+
+        Commands::Gui => cmd_gui(cli.debug),
     };
 
     if let Err(e) = result {
@@ -270,16 +275,7 @@ fn open_source(
     source: &MountSource,
     read_only: bool,
 ) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
-    source.validate()?;
-    match source {
-        MountSource::DiskNumber(number) => disk::open_disk_with_partitions(*number),
-        MountSource::ImageFile(path) if read_only => Ok(Arc::new(ImageFileReader::open(path)?)),
-        MountSource::ImageFile(path) => disk::open_writable_image(path),
-        MountSource::Partition(letter) => {
-            Ok(Arc::new(PhysicalDiskReader::open_partition(*letter)?))
-        }
-        MountSource::DiskPath(path) => Ok(Arc::new(PhysicalDiskReader::open_by_path(path)?)),
-    }
+    fs_winfsp_glue::source::open_source(source, read_only)
 }
 
 /// Mount an XFS filesystem.
@@ -419,6 +415,21 @@ fn cmd_ls(source: MountSource, path: &str, debug: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Launch the graphical interface.
+fn cmd_gui(debug: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+        fs_winfsp_glue::gui::run(debug)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = debug;
+        Err(XfsWinfspError::InvalidArgument(
+            "The GUI is only available on Windows".to_string(),
+        ))
+    }
 }
 
 /// Install the service.

@@ -21,14 +21,17 @@ fuzz/artifacts/
 *.new
 *.bak
 *.old
+*.log
 
 GEMINI.md
 QWEN.md
 
 .vs
 .claude
-.cocoindex_code
-
+.cocoindex_code/
+.cocoindex
+.vscode
+.github
 #Ignore vscode AI rules
 .github\instructions\codacy.instructions.md
 
