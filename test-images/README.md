@@ -1,8 +1,9 @@
 # XFS test images
 
-Disk images used to exercise the read-only XFS driver. Every image was
-formatted with `mkfs.xfs`, populated on a Linux host, verified with
-`xfs_repair -n`, and mounted read-only to check its contents.
+Disk images used to exercise the XFS driver. Every image was formatted with
+`mkfs.xfs`, populated on a Linux host, verified with `xfs_repair -n`, and mounted
+read-only to check its contents. Writable regression tests copy an image to a
+temporary file and never modify the committed fixture.
 
 | File              | Size      | Format                                   | Entries | Git      |
 | ----------------- | --------- | ---------------------------------------- | ------- | -------- |

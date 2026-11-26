@@ -25,9 +25,7 @@ use windows::{
             FILE_BEGIN,
             FILE_FLAGS_AND_ATTRIBUTES,
             FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE,
             FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
             OPEN_EXISTING,
         },
     },
@@ -53,6 +51,21 @@ fn validate_raw_io_args(offset: u64, len: usize) -> Result<()> {
     if len > u32::MAX as usize {
         return Err(XfsWinfspError::InvalidArgument(
             "Win32 I/O buffer exceeds the u32 length range".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_device_write_range(offset: u64, len: usize, device_size: u64) -> Result<()> {
+    validate_raw_io_args(offset, len)?;
+    let len = u64::try_from(len)
+        .map_err(|_| XfsWinfspError::InvalidArgument("Write size does not fit u64".to_string()))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| XfsWinfspError::InvalidArgument("Write offset overflow".to_string()))?;
+    if end > device_size {
+        return Err(XfsWinfspError::InvalidArgument(
+            "Write extends beyond the device".to_string(),
         ));
     }
     Ok(())
@@ -365,6 +378,16 @@ impl fs_abstraction::BlockDevice for ImageFileReader {
     }
 }
 
+/// Open a regular image file through the checked read-write accessor.
+///
+/// The concrete writer remains crate-private; callers receive only the
+/// object-safe [`fs_abstraction::BlockDevice`] interface.
+pub fn open_writable_image<P: AsRef<Path>>(
+    path: P,
+) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
+    Ok(Arc::new(ImageFileWriter::open(path)?))
+}
+
 /// Read-write accessor for image files (.img, .raw, etc.).
 ///
 /// Unlike ImageFileReader, this opens the file with read-write permissions
@@ -381,11 +404,29 @@ impl ImageFileWriter {
     pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         use std::fs::OpenOptions;
 
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                // Deny other writers and deletion/replacement while mounted.
+                .share_mode(FILE_SHARE_READ.0)
+                .open(path.as_ref())?
+        };
+        #[cfg(not(windows))]
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path.as_ref())?;
-        let size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(XfsWinfspError::InvalidArgument(
+                "Writable image source must be a regular file".to_string(),
+            ));
+        }
+        let size = metadata.len();
 
         Ok(Self {
             file: std::sync::Mutex::new(file),
@@ -397,6 +438,19 @@ impl ImageFileWriter {
     pub(crate) fn create<P: AsRef<Path>>(path: P, size: u64) -> Result<Self> {
         use std::fs::OpenOptions;
 
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .share_mode(FILE_SHARE_READ.0)
+                .open(path.as_ref())?
+        };
+        #[cfg(not(windows))]
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -439,6 +493,7 @@ impl DiskWriter for ImageFileWriter {
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
         use std::io::Write;
 
+        validate_device_write_range(offset, data.len(), self.size)?;
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
         let bytes_written = file.write(data)?;
@@ -468,6 +523,10 @@ impl fs_abstraction::BlockDevice for ImageFileWriter {
 
     fn sector_size(&self) -> u32 {
         DiskReader::get_sector_size(self)
+    }
+
+    fn supports_write(&self) -> bool {
+        true
     }
 
     fn flush(&self) -> fs_abstraction::FsResult<()> {
@@ -619,6 +678,10 @@ impl fs_abstraction::BlockDevice for PartitionWriter {
 
     fn sector_size(&self) -> u32 {
         DiskReader::get_sector_size(self)
+    }
+
+    fn supports_write(&self) -> bool {
+        true
     }
 
     fn flush(&self) -> fs_abstraction::FsResult<()> {
@@ -1150,21 +1213,21 @@ impl PhysicalDiskWriter {
         // Buffered I/O accepts the ordinary, potentially unaligned VFS buffers.
         let flags = FILE_ATTRIBUTE_NORMAL.0;
 
-        // Use GENERIC_READ | GENERIC_WRITE (0x80000000 | 0x40000000 =
-        // 0xC0000000) This is different from FILE_GENERIC_READ/WRITE which
-        // include additional rights
+        // Writable raw-device mounts must exclude every other writer. There is
+        // deliberately no broader-access fallback: sharing write access would
+        // allow another process to mutate metadata underneath an open XFS
+        // mount.
         const GENERIC_READ: u32 = 0x80000000;
         const GENERIC_WRITE: u32 = 0x40000000;
         let access = GENERIC_READ | GENERIC_WRITE;
-        let share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let share_mode = FILE_SHARE_READ;
 
         tracing::debug!(
-            "Opening with RW access: 0x{:X}, flags: 0x{:X}",
+            "Opening with exclusive RW access: 0x{:X}, flags: 0x{:X}",
             access,
             flags
         );
 
-        // Try opening with GENERIC_READ | GENERIC_WRITE first
         let handle = unsafe {
             match CreateFileW(
                 PCWSTR(wide_path.as_ptr()),
@@ -1175,48 +1238,23 @@ impl PhysicalDiskWriter {
                 FILE_FLAGS_AND_ATTRIBUTES(flags),
                 None,
             ) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(
-                        "First attempt failed (0x{:X}), trying with FILE_GENERIC_*",
-                        e.code().0
-                    );
-
-                    // Fallback: try with FILE_GENERIC_READ | FILE_GENERIC_WRITE
-                    match CreateFileW(
-                        PCWSTR(wide_path.as_ptr()),
-                        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-                        share_mode,
-                        None,
-                        OPEN_EXISTING,
-                        FILE_FLAGS_AND_ATTRIBUTES(flags),
-                        None,
-                    ) {
-                        Ok(h) => h,
-                        Err(e2) => {
-                            tracing::error!("All attempts to open '{}' for writing failed", path);
-                            tracing::error!("Error 1: 0x{:X} - {}", e.code().0, e.message());
-                            tracing::error!("Error 2: 0x{:X} - {}", e2.code().0, e2.message());
-
-                            // Provide helpful error message
-                            let msg = if path.contains("PhysicalDrive") {
-                                format!(
-                                    "Failed to open '{}' for writing. Physical disk access \
-                                     requires:\n1. Run as Administrator\n2. The disk should not \
-                                     have mounted Windows partitions\n3. Try dismounting all \
-                                     partitions on the disk first\nError: {}",
-                                    path, e2
-                                )
-                            } else {
-                                format!(
-                                    "Failed to open '{}' for writing: {}. Try running as \
-                                     Administrator.",
-                                    path, e2
-                                )
-                            };
-                            return Err(XfsWinfspError::DiskOpenError(msg));
-                        }
-                    }
+                Ok(handle) => handle,
+                Err(error) => {
+                    let message = if path.contains("PhysicalDrive") {
+                        format!(
+                            "Failed to open '{}' for exclusive writing. Physical disk access \
+                             requires:\n1. Run as Administrator\n2. Dismount every partition on \
+                             the disk\n3. Ensure no other process has the disk open\nError: {}",
+                            path, error
+                        )
+                    } else {
+                        format!(
+                            "Failed to open '{}' for exclusive writing: {}. Try running as \
+                             Administrator and dismount the volume.",
+                            path, error
+                        )
+                    };
+                    return Err(XfsWinfspError::DiskOpenError(message));
                 }
             }
         };
@@ -1335,6 +1373,10 @@ impl fs_abstraction::BlockDevice for PhysicalDiskWriter {
 
     fn sector_size(&self) -> u32 {
         DiskReader::get_sector_size(self)
+    }
+
+    fn supports_write(&self) -> bool {
+        true
     }
 
     fn flush(&self) -> fs_abstraction::FsResult<()> {
@@ -2231,6 +2273,19 @@ mod tests {
     fn unaligned_read_returns_available_prefix_at_eof() {
         let disk = MemoryDisk::new(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(disk.read_unaligned(8, 4).unwrap(), vec![9, 10]);
+    }
+
+    #[test]
+    fn device_write_range_rejects_growth_and_overflow() {
+        assert!(validate_device_write_range(4, 4, 8).is_ok());
+        assert!(matches!(
+            validate_device_write_range(4, 5, 8),
+            Err(XfsWinfspError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate_device_write_range(u64::MAX, 1, u64::MAX),
+            Err(XfsWinfspError::InvalidArgument(_))
+        ));
     }
 
     #[test]

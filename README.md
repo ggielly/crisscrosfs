@@ -1,17 +1,22 @@
 # XFS filesystem driver for Windows
 
-This project implements an experimental, read-only XFS filesystem for Windows in Rust. It uses WinFsp for the kernel-mode filesystem interface and a user-mode Rust VFS for XFS parsing and reads.
+This project implements an experimental XFS filesystem for Windows in Rust. It uses WinFsp for the kernel-mode filesystem interface and a user-mode Rust VFS for XFS parsing, reads, and transactional writes to regular image files.
 
-> **Status:** experimental. Do not use on production data. Write support is currently disabled because block/inode allocation, journaling, and recovery are not complete.
+> **Status:** experimental. Do not use on production data. Physical disks, partitions, and volumes remain read-only. Writable image mounts use the real XFS internal log, but supported on-disk feature combinations and directory geometries are intentionally bounded.
 
 ## Features
 
-- Read-only access to XFS v4 and v5 filesystems
+- Read access to XFS v4 and v5 filesystems
 - Local, extent, and B+tree file reads
-- Shortform, block, leaf, and B+tree directory reads
+- Shortform, block, leaf, and node-directory reads
+- Transactional image-file writes with XFS log-v2 buffer/inode records, dirty bitmaps, tail advancement, and recovery
+- BNO/CNT and existing-chunk INOBT/FINOBT allocation
+- Local/extent/B+tree file writes, sparse holes, truncate, and timestamps
+- File/directory/symlink creation, hard links, unlink, and rename
+- Shortform, block, single-leaf, and bounded single-level node directories
 - Physical disk, partition, volume, and image-file sources
-- WinFsp mount/unmount lifecycle
-- Property-based parser tests and libFuzzer targets
+- WinFsp mount/unmount lifecycle and clean shutdown records
+- Property-based parser tests, real-image write regressions, and libFuzzer targets
 
 ## Requirements
 
@@ -27,7 +32,8 @@ This project implements an experimental, read-only XFS filesystem for Windows in
 cargo build -p fs-winfsp-glue
 ```
 
-The executable is written to `target\debug\xfs-mount.exe`.
+The executables are written to `target\debug\xfs-mount.exe` (CLI) and
+`target\debug\xfs-mount-gui.exe` (GUI).
 
 For a release build:
 
@@ -46,8 +52,11 @@ xfs-mount.exe mount --partition D: --mount-point X:
 # Mount a physical disk
 xfs-mount.exe mount --disk 1 --mount-point X:
 
-# Mount an XFS image file
+# Mount an XFS image file read-only
 xfs-mount.exe mount --image C:\images\disk.img --mount-point X:
+
+# Mount a regular XFS image file read-write (experimental)
+xfs-mount.exe mount --image C:\images\disk.img --mount-point X: --rw
 
 # Mount a Windows volume path
 xfs-mount.exe mount --volume '\\.\HarddiskVolume5' --mount-point X:
@@ -60,7 +69,38 @@ xfs-mount.exe ls --image C:\images\disk.img /
 xfs-mount.exe scan
 ```
 
-Press `Ctrl+C` to unmount. The `--rw` flag is intentionally rejected: enabling it before allocation and journal recovery are complete can corrupt the filesystem.
+Press `Ctrl+C` to unmount. Writable mounts flush metadata and append a clean unmount record during shutdown. `--rw` is rejected for physical disks, partitions, and Windows volume paths; it is accepted only for regular image files.
+
+### Writable-image limitations
+
+The writer fails closed rather than silently producing incomplete metadata:
+
+- New physical inode-cluster allocation is not implemented; only free inodes in existing chunks are reused.
+- Realtime or quota-enabled filesystems and RMAP-backed allocation groups are rejected.
+- REFCOUNBT is validated as a single leaf; shared and CoW staging extents are rejected, and refcount records are not mutated.
+- Directory rebuilding supports one LEAF1 or one DA-node level with one free-index block. Larger node trees fail with `NotSupported`.
+- A transaction must fit in one 32 KiB log record; log wrap/checkpointing and multi-record continuation are not implemented.
+- Extended-attribute mutation is not implemented, but existing attribute-fork bytes are preserved when inodes are rewritten; unlinking an inode with attribute extents is rejected rather than leaking those blocks.
+- Real WinFsp mount/unmount and Linux `xfs_repair` validation are still required before release.
+
+## Desktop GUI
+
+`xfs-mount-gui.exe` is a native Win32 front-end built directly on the `windows`
+crate: it lists the XFS volumes found on the machine plus any image file you
+pick, mounts and unmounts them on a free drive letter, and keeps running in the
+notification area when the window is closed.
+
+```powershell
+# Windowless build, meant for Explorer or a Start-menu shortcut
+target\debug\xfs-mount-gui.exe
+
+# Same UI from a console (handy while developing)
+xfs-mount.exe gui
+```
+
+The tray icon offers *Show XFS Mount*, *Unmount all* and *Exit*. The GUI and the
+CLI share the same mount layer, so a volume mounted from the GUI behaves exactly
+like one mounted with `xfs-mount mount`.
 
 ## Windows service
 
@@ -114,7 +154,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite includes real XFS v5 fixtures under `test-images/` and a VFS read/readdir regression test. A real WinFsp mount in a Windows VM is still required before release.
+The suite includes real XFS v5 fixtures under `test-images/`, VFS read/readdir regressions, and `crates/xfs-vfs/tests/write_image.rs`, which mutates only a disposable temporary copy. The write test covers allocation, sparse writes, truncate, BMBT conversion, directory growth, namespace operations, clean shutdown, and read-only reopen. A real WinFsp mount in a Windows VM and Linux `xfs_repair` validation are still required before release.
 
 ## Fuzzing
 

@@ -33,6 +33,7 @@ pub struct MountHandle {
     stop_tx: Option<mpsc::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     mount_point: String,
+    filesystem: Option<Arc<dyn fs_abstraction::VfsFileSystem>>,
 }
 
 impl MountHandle {
@@ -82,6 +83,14 @@ impl MountHandle {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        if let Some(filesystem) = self.filesystem.take() {
+            if let Err(error) = filesystem.shutdown() {
+                warn!(
+                    "Filesystem shutdown failed at {}: {:?}",
+                    self.mount_point, error
+                );
+            }
+        }
     }
 }
 
@@ -118,6 +127,7 @@ pub fn start_mount(
 
     let mount_point_owned = mount_point.to_string();
     let mount_point_for_handle = mount_point.to_string();
+    let filesystem_for_handle = fs.clone();
 
     // Shared host: populated by the mount thread after dispatcher start,
     // consumed by MountHandle::stop() / Drop to drive shutdown.
@@ -172,10 +182,8 @@ pub fn start_mount(
             volume_params.volume_serial_number(volume_serial);
             volume_params.sector_size(sector_size);
             volume_params.sectors_per_allocation_unit(sectors_per_allocation_unit);
-            // The XFS write path is incomplete. Never advertise or enable RW,
-            // even if a different VFS implementation reports writable
-            // capabilities.
-            volume_params.read_only_volume(true);
+            // WinFsp's mount policy must match the backend exactly.
+            volume_params.read_only_volume(fs.capabilities().read_only);
             volume_params.reparse_points(true);
             // ACL modification/persistence is not implemented by the glue.
             volume_params.persistent_acls(false);
@@ -263,6 +271,7 @@ pub fn start_mount(
                 stop_tx: Some(stop_tx),
                 thread: Some(thread),
                 mount_point: mount_point_for_handle,
+                filesystem: Some(filesystem_for_handle),
             })
         }
         Ok(Err(e)) => {

@@ -65,14 +65,15 @@ impl MountSource {
 impl MountOptions {
     /// Validate all user-controlled mount inputs.
     ///
-    /// Write mode is rejected structurally: the allocator and journal write
-    /// paths are not complete yet, so no caller may accidentally enable them.
+    /// Writable mounts are currently restricted to regular image files. Raw
+    /// physical-device writes remain disabled until they have separate
+    /// dismount/exclusive-access qualification.
     pub fn validate(&self) -> Result<()> {
         self.source.validate()?;
         validate_mount_point(&self.mount_point)?;
-        if !self.read_only {
+        if !self.read_only && !matches!(self.source, MountSource::ImageFile(_)) {
             return Err(XfsWinfspError::InvalidArgument(
-                "Read-write mounting is disabled".to_string(),
+                "Read-write mounting is supported only for image files".to_string(),
             ));
         }
         Ok(())
@@ -204,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_options_reject_invalid_sources_and_write_mode() {
+    fn mount_options_restrict_write_mode_to_images() {
         assert!(MountOptions::partition('é', "X:").validate().is_err());
         assert!(MountOptions::image("", "X:").validate().is_err());
         let mut options = MountOptions::disk(0, "not-a-drive:");
@@ -212,5 +213,12 @@ mod tests {
         options.mount_point = "X:".to_string();
         options.read_only = false;
         assert!(options.validate().is_err());
+
+        let image = MountOptions {
+            source: MountSource::ImageFile("disk.img".into()),
+            read_only: false,
+            ..MountOptions::default()
+        };
+        assert!(image.validate().is_ok());
     }
 }

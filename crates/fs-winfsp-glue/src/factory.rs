@@ -17,13 +17,6 @@ pub fn detect_and_create(
     device: Arc<dyn BlockDevice>,
     read_only: bool,
 ) -> FsResult<Arc<dyn VfsFileSystem>> {
-    // Write support is not complete (stub allocator, incomplete AGF/AGI and
-    // journal recovery).  Keep the restriction structural even for callers
-    // that bypass the CLI.
-    if !read_only {
-        return Err(FsError::ReadOnly);
-    }
-
     // Buffer size must be sector-aligned (512 bytes) for Windows volume access
     // btrfs magic is at offset 65600..65608, so we need at least 65608 bytes
     // Round up to 66048 (129 sectors of 512 bytes)

@@ -72,8 +72,7 @@ enum Commands {
         #[arg(short, long, required = true)]
         mount_point: String,
 
-        /// Reserved write-mode flag (currently rejected: allocation/journal are
-        /// incomplete)
+        /// Mount a regular XFS image file read-write (experimental)
         #[arg(long)]
         rw: bool,
     },
@@ -263,16 +262,19 @@ fn resolve_read_source(disk: Option<u32>, image: Option<PathBuf>) -> Result<Moun
     }
 }
 
-/// Open a validated source read-only.
+/// Open a validated source with the requested access mode.
 ///
-/// Disk numbers deliberately use the same GPT-aware resolution for mount,
-/// info, and ls. No command path opens a writer: RW remains disabled until the
-/// allocator and journal implementation are complete.
-fn open_read_only_source(source: &MountSource) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
+/// Writable access is intentionally limited to regular image files. Physical
+/// disks and partitions always use the read-only, GPT-aware opener.
+fn open_source(
+    source: &MountSource,
+    read_only: bool,
+) -> Result<Arc<dyn fs_abstraction::BlockDevice>> {
     source.validate()?;
     match source {
         MountSource::DiskNumber(number) => disk::open_disk_with_partitions(*number),
-        MountSource::ImageFile(path) => Ok(Arc::new(ImageFileReader::open(path)?)),
+        MountSource::ImageFile(path) if read_only => Ok(Arc::new(ImageFileReader::open(path)?)),
+        MountSource::ImageFile(path) => disk::open_writable_image(path),
         MountSource::Partition(letter) => {
             Ok(Arc::new(PhysicalDiskReader::open_partition(*letter)?))
         }
@@ -285,25 +287,8 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
     info!("Mounting XFS filesystem to {}", options.mount_point);
     tracing::debug!("Mount options: {:?}", options);
 
-    if !options.read_only {
-        // The block allocator's mark_allocated() and free_blocks() are stubs
-        // that have not been implemented yet.  Allowing write operations would
-        // silently reuse blocks that still appear free in the on-disk
-        // free-space B+trees, corrupting the filesystem without any error.
-        // Refuse here before any device is opened or write path is entered.
-        error!(
-            "--rw is disabled: the block allocator is not implemented. Write operations would \
-             silently corrupt the filesystem by reusing blocks that are already in use. Remove \
-             this error once mark_allocated() and free_blocks() in xfs-vfs/src/allocator.rs are \
-             fully implemented."
-        );
-        return Err(XfsWinfspError::WinFspError(
-            "--rw is not available: block allocator not implemented (see allocator.rs)".to_string(),
-        ));
-    }
-
     options.validate()?;
-    let device = open_read_only_source(&options.source)?;
+    let device = open_source(&options.source, options.read_only)?;
 
     // Detect and create filesystem
     info!("Detecting filesystem type...");
@@ -379,7 +364,7 @@ fn cmd_scan(verbose: bool) -> Result<()> {
 
 /// Show XFS filesystem information.
 fn cmd_info(source: MountSource, debug: bool) -> Result<()> {
-    let reader = open_read_only_source(&source)?;
+    let reader = open_source(&source, true)?;
     let fs = XfsVfs::with_options(reader, true)?;
     let vol_info = fs.get_volume_info()?;
 
@@ -409,7 +394,7 @@ fn cmd_info(source: MountSource, debug: bool) -> Result<()> {
 
 /// List directory contents.
 fn cmd_ls(source: MountSource, path: &str, debug: bool) -> Result<()> {
-    let reader = open_read_only_source(&source)?;
+    let reader = open_source(&source, true)?;
     let fs = Arc::new(XfsVfs::with_options(reader, true)?);
 
     if debug {
@@ -515,26 +500,17 @@ fn cmd_service_run() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// `cmd_mount` must refuse write mode immediately, before touching any
-    /// device, because the block allocator stubs are not implemented.
-    ///
-    /// Passing a non-existent disk number as source proves the early return
-    /// happens *before* device open: if the guard were absent, the call
-    /// would fail with a disk-open error instead of the allocator message.
+    /// Raw-device write mode is rejected before any device open.
     #[test]
-    fn cmd_mount_write_mode_fails_before_device_open() {
+    fn cmd_mount_raw_write_mode_fails_before_device_open() {
         let opts = MountOptions {
             source: MountSource::DiskNumber(u32::MAX), // no such physical disk
             mount_point: "X:".to_string(),
-            read_only: false, // request write mode
+            read_only: false,
             ..MountOptions::default()
         };
-        let err = cmd_mount(opts).expect_err("--rw must return an error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("block allocator not implemented"),
-            "error must mention the missing allocator, got: {msg}"
-        );
+        let err = cmd_mount(opts).expect_err("raw --rw must return an error");
+        assert!(err.to_string().contains("only for image files"));
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub struct VfsContext {
     pub volume_label: String,
     /// Normalized mount root used to confine absolute symbolic links.
     mount_root: String,
-    /// This glue currently mounts read-only regardless of backend capabilities.
+    /// Effective mount policy derived from the backend capabilities.
     read_only: bool,
     /// POSIX mode/uid/gid → Windows security descriptor mapper.
     acl_mapper: AclMapper,
@@ -91,12 +91,13 @@ impl VfsContext {
         volume_label: String,
         mount_root: String,
     ) -> FsResult<Self> {
+        let read_only = fs.capabilities().read_only;
         Ok(Self {
             fs,
             volume_label,
             mount_root: normalize_mount_root(&mount_root)?,
-            read_only: true,
-            acl_mapper: AclMapper::new(true),
+            read_only,
+            acl_mapper: AclMapper::new(read_only),
         })
     }
 
@@ -108,11 +109,12 @@ impl VfsContext {
         mount_root: String,
         acl_mapper: AclMapper,
     ) -> FsResult<Self> {
+        let read_only = fs.capabilities().read_only;
         Ok(Self {
             fs,
             volume_label,
             mount_root: normalize_mount_root(&mount_root)?,
-            read_only: true,
+            read_only,
             acl_mapper,
         })
     }
