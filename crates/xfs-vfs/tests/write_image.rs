@@ -522,3 +522,54 @@ fn creating_entries_in_the_root_preserves_non_file_directory_types() {
     let fifo = resolve(&reopened, "/special.fifo");
     assert_eq!(reopened.stat(fifo).unwrap().file_type, VfsFileType::Fifo);
 }
+
+/// The front-end uses `unclean_unmount` to warn about volumes that were not
+/// cleanly unmounted: pending log transactions for read-only mounts, replayed
+/// transactions for writable ones.
+#[test]
+fn unclean_unmount_is_reported_until_the_log_is_closed_cleanly() {
+    let Some(fixture) = fixture_path() else {
+        eprintln!("real XFS fixture unavailable; skipping");
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+
+    let clean = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert!(
+        !clean.unclean_unmount(),
+        "the committed fixture was unmounted cleanly"
+    );
+    drop(clean);
+
+    // Commit a transaction and drop the instance without shutdown(): this is
+    // what a crash leaves behind.
+    {
+        let fs = XfsVfs::with_options(Arc::new(FileDevice::open(temp.path()).unwrap()), false)
+            .expect("writable XFS mount");
+        let root = resolve(&fs, "/");
+        fs.create_file(root, "dirty-marker.txt", 0o644).unwrap();
+    }
+
+    let pending = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert!(
+        pending.unclean_unmount(),
+        "a read-only mount must report transactions that still need replay"
+    );
+    drop(pending);
+
+    let replayed = XfsVfs::with_options(Arc::new(FileDevice::open(temp.path()).unwrap()), false)
+        .expect("writable XFS mount");
+    assert!(
+        replayed.unclean_unmount(),
+        "a writable mount must report that it replayed the log"
+    );
+    replayed.shutdown().unwrap();
+    drop(replayed);
+
+    let recovered = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert!(
+        !recovered.unclean_unmount(),
+        "a clean unmount must clear the flag"
+    );
+}

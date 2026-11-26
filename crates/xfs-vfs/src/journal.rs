@@ -59,6 +59,8 @@ pub(crate) struct Journal {
     iclog_size: u32,
     next_tid: u32,
     poisoned: bool,
+    /// Set by [`Self::recover`] when committed records had to be replayed.
+    replayed: bool,
 }
 
 impl Journal {
@@ -102,12 +104,19 @@ impl Journal {
             iclog_size: DEFAULT_ICLOG_SIZE,
             next_tid: 1,
             poisoned: false,
+            replayed: false,
         })
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Whether [`Self::recover`] had to replay committed transactions, i.e. the
+    /// volume was not cleanly unmounted.
+    pub(crate) fn was_replayed(&self) -> bool {
+        self.replayed
     }
 
     /// Scan the physical log, locate its head/tail, and replay committed
@@ -143,6 +152,7 @@ impl Journal {
             .iter()
             .filter(|record| record.header.h_lsn >= tail_lsn)
             .collect();
+        self.replayed = !replay.is_empty();
         for pair in replay.windows(2) {
             if pair[1].block != Self::block_after(&pair[0].header, self.log_basic_blocks)
                 || pair[1].header.h_prev_block != pair[0].block

@@ -322,7 +322,9 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
     let _ = sig_rx.recv();
 
     // Stop the mount
-    handle.stop();
+    if let Err(error) = handle.stop() {
+        tracing::warn!("Clean unmount failed: {:?}", error);
+    }
 
     Ok(())
 }

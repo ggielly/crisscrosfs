@@ -109,6 +109,13 @@ The tray icon offers *Show CrissCrossFS*, *Unmount all* and *Exit*. The GUI and 
 CLI share the same mount layer, so a volume mounted from the GUI behaves exactly
 like one mounted with `crisscrossfs mount`.
 
+A warning icon appears next to the status line when the last mount or unmount
+needs attention: a volume that was not cleanly unmounted (its log still needs
+replay, or was replayed), a corrupted filesystem that failed to mount, or a
+volume that could not be closed cleanly. The affected row is marked with `⚠` and
+the **Logs** button opens a window with the full activity log (timestamps,
+mount/unmount results, warnings and errors) that can be selected and copied.
+
 With **Read-write** ticked on an image file, the XFS root owner is mapped to
 your Windows account: files created on Linux by root become editable from
 Explorer, while the POSIX group/world bits still apply to other accounts.

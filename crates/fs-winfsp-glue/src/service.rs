@@ -253,7 +253,14 @@ fn unmount_all(state: &mut XfsServiceState) {
             "Unmounting {} from {}",
             volume.disk_info.disk_path, volume.mount_point
         );
-        volume.handle.stop();
+        if let Err(error) = volume.handle.stop() {
+            tracing::warn!(
+                "Unmounting {} from {} failed: {:?}",
+                volume.disk_info.disk_path,
+                volume.mount_point,
+                error
+            );
+        }
     }
 }
 

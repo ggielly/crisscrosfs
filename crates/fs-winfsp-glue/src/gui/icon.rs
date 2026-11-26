@@ -21,7 +21,14 @@ use windows::Win32::{
         HDC,
         HGDIOBJ,
     },
-    UI::WindowsAndMessaging::{CreateIconIndirect, LoadIconW, HICON, ICONINFO, IDI_APPLICATION},
+    UI::WindowsAndMessaging::{
+        CreateIconIndirect,
+        LoadIconW,
+        HICON,
+        ICONINFO,
+        IDI_APPLICATION,
+        IDI_WARNING,
+    },
 };
 
 const ICON_SIZE: i32 = 32;
@@ -37,6 +44,12 @@ pub fn app_icon() -> HICON {
 /// Generic fallback icon, also used if the generated icon fails to load.
 pub fn generic_icon() -> HICON {
     unsafe { LoadIconW(HINSTANCE(ptr::null_mut()), IDI_APPLICATION).unwrap_or_default() }
+}
+
+/// Small system warning icon shown next to the status line when the last mount
+/// or unmount left the volume in an inconsistent state.
+pub fn warning_icon() -> HICON {
+    unsafe { LoadIconW(HINSTANCE(ptr::null_mut()), IDI_WARNING).unwrap_or_else(|_| generic_icon()) }
 }
 
 unsafe fn build_icon() -> windows::core::Result<HICON> {

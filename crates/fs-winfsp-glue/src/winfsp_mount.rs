@@ -51,13 +51,18 @@ impl MountHandle {
     }
 
     /// Stop the mount and wait for the thread to exit.
-    pub fn stop(mut self) {
+    ///
+    /// A returned error means the volume was **not** closed cleanly (for
+    /// example the journal could not append its unmount record), so the caller
+    /// should warn the user that the filesystem is left dirty.
+    pub fn stop(mut self) -> Result<()> {
         info!("Stopping mount at {}", self.mount_point);
-        self.do_stop();
+        let result = self.do_stop();
         info!("Mount stopped: {}", self.mount_point);
+        result
     }
 
-    fn do_stop(&mut self) {
+    fn do_stop(&mut self) -> Result<()> {
         // Take the host out of the shared Arc and stop WinFsp directly.
         // unmount() removes the mount point (no new FS requests accepted),
         // stop() calls FspFileSystemStopDispatcher which blocks until all
@@ -89,14 +94,16 @@ impl MountHandle {
                     "Filesystem shutdown failed at {}: {:?}",
                     self.mount_point, error
                 );
+                return Err(XfsWinfspError::from(error));
             }
         }
+        Ok(())
     }
 }
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        self.do_stop();
+        let _ = self.do_stop();
     }
 }
 

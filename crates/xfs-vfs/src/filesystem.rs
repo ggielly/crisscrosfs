@@ -61,6 +61,10 @@ pub struct XfsVfs {
     /// Cached superblock free-space counters updated after each transaction.
     free_blocks: AtomicU64,
     free_inodes: AtomicU64,
+
+    /// Whether the on-disk log showed an unclean unmount when this instance
+    /// was opened (replayed for writable mounts, still pending for read-only).
+    unclean_unmount: bool,
 }
 
 impl XfsVfs {
@@ -149,6 +153,7 @@ impl XfsVfs {
             }
         }
 
+        let mut unclean_unmount = false;
         let journal = if read_only {
             // Read-only mounts never replay the log, so transactions that were
             // only committed to the log stay invisible: the volume shows the
@@ -156,10 +161,13 @@ impl XfsVfs {
             // metadata (Linux calls this `norecovery`).
             match Journal::new(device.clone(), superblock.clone()) {
                 Ok(probe) => match probe.log_needs_replay() {
-                    Ok(true) => tracing::warn!(
-                        "XFS log needs replay but the volume is mounted read-only; recent \
-                         metadata changes are not visible (like Linux 'norecovery')"
-                    ),
+                    Ok(true) => {
+                        unclean_unmount = true;
+                        tracing::warn!(
+                            "XFS log needs replay but the volume is mounted read-only; recent \
+                             metadata changes are not visible (like Linux 'norecovery')"
+                        );
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         tracing::debug!(?error, "cannot inspect the XFS log on a read-only mount")
@@ -173,6 +181,7 @@ impl XfsVfs {
         } else {
             let mut journal = Journal::new(device.clone(), superblock.clone())?;
             journal.recover()?;
+            unclean_unmount = journal.was_replayed();
             Some(Mutex::new(journal))
         };
 
@@ -199,6 +208,7 @@ impl XfsVfs {
             journal,
             free_blocks,
             free_inodes,
+            unclean_unmount,
         })
     }
 
@@ -453,6 +463,10 @@ impl VfsFileSystem for XfsVfs {
 
     fn shutdown(&self) -> FsResult<()> {
         XfsVfs::shutdown(self)
+    }
+
+    fn unclean_unmount(&self) -> bool {
+        self.unclean_unmount
     }
 
     fn capabilities(&self) -> &FsCapabilities {

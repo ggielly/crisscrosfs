@@ -117,6 +117,17 @@ pub trait VfsFileSystem: Send + Sync {
         self.sync()
     }
 
+    /// Whether the volume was not cleanly unmounted when it was opened.
+    ///
+    /// A writable mount reports `true` when the journal still held committed
+    /// transactions and had to be replayed. A read-only mount reports `true`
+    /// when such transactions are pending but cannot be replayed without
+    /// writing. Front-ends use this to warn the user that the volume is in an
+    /// inconsistent state or that recent changes are missing.
+    fn unclean_unmount(&self) -> bool {
+        false
+    }
+
     // =========================================================================
     // Inode Operations
     // =========================================================================

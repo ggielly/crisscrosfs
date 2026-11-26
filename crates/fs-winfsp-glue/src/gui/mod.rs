@@ -29,10 +29,16 @@ use windows::{
             HBRUSH,
             HFONT,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            SystemInformation::GetLocalTime,
+            SystemServices::SS_ICON,
+        },
         UI::{
             Controls::{
                 InitCommonControlsEx,
+                EM_SCROLLCARET,
+                EM_SETSEL,
                 ICC_LISTVIEW_CLASSES,
                 INITCOMMONCONTROLSEX,
                 LVCFMT_LEFT,
@@ -107,6 +113,9 @@ use windows::{
                 CS_HREDRAW,
                 CS_VREDRAW,
                 CW_USEDEFAULT,
+                ES_AUTOVSCROLL,
+                ES_MULTILINE,
+                ES_READONLY,
                 GWLP_USERDATA,
                 HICON,
                 IDC_ARROW,
@@ -115,6 +124,7 @@ use windows::{
                 MF_SEPARATOR,
                 MF_STRING,
                 SIZE_MINIMIZED,
+                STM_SETICON,
                 SW_HIDE,
                 SW_SHOW,
                 SW_SHOWNORMAL,
@@ -170,6 +180,12 @@ const IDC_OPEN: i32 = 1008;
 const IDC_RESCAN: i32 = 1009;
 const IDC_BROWSE: i32 = 1010;
 const IDC_STATUS: i32 = 1011;
+const IDC_WARN: i32 = 1012;
+const IDC_LOGS: i32 = 1013;
+const IDC_LOG_EDIT: i32 = 2001;
+
+/// Number of log lines kept in memory (and shown by the log window).
+const MAX_LOG_ENTRIES: usize = 500;
 
 const IDM_SHOW: usize = 4001;
 const IDM_UNMOUNT_ALL: usize = 4002;
@@ -229,6 +245,23 @@ unsafe fn run_inner(debug: bool) -> windows::core::Result<()> {
         return Err(windows::core::Error::from_win32());
     }
 
+    let log_class_name = w!("XfsMountLogWindow");
+    let log_wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(log_wndproc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: icon,
+        hCursor: LoadCursorW(None, IDC_ARROW)?,
+        hbrBackground: bg_brush,
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: log_class_name,
+    };
+    if RegisterClassW(&log_wc) == 0 {
+        return Err(windows::core::Error::from_win32());
+    }
+
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class_name,
@@ -251,6 +284,7 @@ unsafe fn run_inner(debug: bool) -> windows::core::Result<()> {
     let app = &mut *app_ptr;
     app.build_children()?;
     app.install_tray();
+    app.log_entry(LogLevel::Info, "CrissCrossFS GUI started.");
     app.layout();
     app.start_scan();
 
@@ -293,6 +327,8 @@ struct ActiveMount {
     key: String,
     mount_point: String,
     handle: Option<MountHandle>,
+    /// The volume was not cleanly unmounted when it was opened.
+    unclean: bool,
 }
 
 /// One row of the volume list.
@@ -302,6 +338,31 @@ struct Entry {
     detail: String,
     label: String,
     size: u64,
+}
+
+/// Severity of a line in the GUI activity log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO ",
+            Self::Warn => "WARN ",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+/// One line in the GUI activity log, shown by the log window.
+struct LogEntry {
+    time: String,
+    level: LogLevel,
+    message: String,
 }
 
 struct App {
@@ -322,7 +383,9 @@ struct App {
     btn_open: HWND,
     btn_rescan: HWND,
     btn_browse: HWND,
+    btn_logs: HWND,
     status: HWND,
+    warn_icon: HWND,
 
     entries: Vec<Entry>,
     mounts: Vec<ActiveMount>,
@@ -330,6 +393,13 @@ struct App {
     tray_added: bool,
     read_write: bool,
     exiting: bool,
+
+    /// Message behind the warning icon, if the last action needs attention.
+    warning: Option<String>,
+    /// GUI activity log shown by the log window.
+    log: Vec<LogEntry>,
+    log_window: HWND,
+    log_edit: HWND,
 }
 
 impl App {
@@ -351,13 +421,19 @@ impl App {
             btn_open: HWND::default(),
             btn_rescan: HWND::default(),
             btn_browse: HWND::default(),
+            btn_logs: HWND::default(),
             status: HWND::default(),
+            warn_icon: HWND::default(),
             entries: Vec::new(),
             mounts: Vec::new(),
             scanning: false,
             tray_added: false,
             read_write: false,
             exiting: false,
+            warning: None,
+            log: Vec::new(),
+            log_window: HWND::default(),
+            log_edit: HWND::default(),
         }
     }
 
@@ -433,6 +509,17 @@ impl App {
         self.btn_open = self.make_button(w!("Open in Explorer"), IDC_OPEN)?;
         self.btn_rescan = self.make_button(w!("Rescan"), IDC_RESCAN)?;
         self.btn_browse = self.make_button(w!("Mount image..."), IDC_BROWSE)?;
+        self.btn_logs = self.make_button(w!("Logs"), IDC_LOGS)?;
+
+        self.warn_icon =
+            self.make_child(w!("STATIC"), PCWSTR::null(), base(SS_ICON.0), IDC_WARN)?;
+        SendMessageW(
+            self.warn_icon,
+            STM_SETICON,
+            WPARAM(icon::warning_icon().0 as usize),
+            LPARAM(0),
+        );
+        let _ = ShowWindow(self.warn_icon, SW_HIDE);
 
         self.status = self.make_child(w!("STATIC"), w!("Ready."), base(0), IDC_STATUS)?;
 
@@ -532,8 +619,28 @@ impl App {
             scale(130),
             scale(30),
         );
+        move_to(
+            self.btn_logs,
+            margin + scale(610),
+            button_y,
+            scale(80),
+            scale(30),
+        );
 
-        move_to(self.status, margin, height - scale(52), content, scale(40));
+        move_to(
+            self.warn_icon,
+            margin,
+            height - scale(54),
+            scale(16),
+            scale(16),
+        );
+        move_to(
+            self.status,
+            margin + scale(24),
+            height - scale(52),
+            content - scale(24),
+            scale(40),
+        );
     }
 
     // ----------------------------------------------------------------- state
@@ -556,6 +663,173 @@ impl App {
             PCWSTR(caption.as_ptr()),
             MB_OK | MB_ICONERROR,
         );
+    }
+
+    // ------------------------------------------------------------------- log
+
+    fn timestamp() -> String {
+        let time = unsafe { GetLocalTime() };
+        format!("{:02}:{:02}:{:02}", time.wHour, time.wMinute, time.wSecond)
+    }
+
+    /// Append one line to the GUI activity log.
+    fn log_entry(&mut self, level: LogLevel, message: impl Into<String>) {
+        if self.log.len() >= MAX_LOG_ENTRIES {
+            self.log.remove(0);
+        }
+        self.log.push(LogEntry {
+            time: Self::timestamp(),
+            level,
+            message: message.into(),
+        });
+        unsafe { self.refresh_log_view() };
+    }
+
+    /// Record a warning and light the warning icon next to the status line.
+    fn warn_user(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.log_entry(LogLevel::Warn, message.clone());
+        self.set_warning(message);
+    }
+
+    /// Light the warning icon without adding a log line (the caller already
+    /// logged the details at its own severity).
+    fn set_warning(&mut self, message: impl Into<String>) {
+        self.warning = Some(message.into());
+        self.update_warning_icon();
+    }
+
+    fn clear_warning(&mut self) {
+        self.warning = None;
+        self.update_warning_icon();
+    }
+
+    fn update_warning_icon(&self) {
+        unsafe {
+            let command = if self.warning.is_some() {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            };
+            let _ = ShowWindow(self.warn_icon, command);
+        }
+    }
+
+    /// Create the log window on first use; returns `false` if Win32 refuses.
+    unsafe fn ensure_log_window(&mut self) -> bool {
+        if !self.log_window.0.is_null() {
+            return true;
+        }
+        let dpi = self.dpi();
+        let Ok(window) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("XfsMountLogWindow"),
+            w!("CrissCrossFS logs"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            700 * dpi / 96,
+            420 * dpi / 96,
+            HWND(std::ptr::null_mut()),
+            windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()),
+            self.hinstance,
+            None,
+        ) else {
+            return false;
+        };
+        let app_ptr: *mut App = self;
+        SetWindowLongPtrW(window, GWLP_USERDATA, app_ptr as isize);
+
+        let edit_style = WINDOW_STYLE(
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | WS_BORDER.0
+                | WS_VSCROLL.0
+                | WS_TABSTOP.0
+                | ES_MULTILINE as u32
+                | ES_READONLY as u32
+                | ES_AUTOVSCROLL as u32,
+        );
+        let Ok(edit) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            w!(""),
+            edit_style,
+            0,
+            0,
+            10,
+            10,
+            window,
+            windows::Win32::UI::WindowsAndMessaging::HMENU(IDC_LOG_EDIT as isize as *mut c_void),
+            self.hinstance,
+            None,
+        ) else {
+            let _ = DestroyWindow(window);
+            return false;
+        };
+        SendMessageW(edit, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
+
+        self.log_window = window;
+        self.log_edit = edit;
+        self.layout_log_window();
+        let _ = ShowWindow(window, SW_SHOW);
+        let _ = SetForegroundWindow(window);
+        true
+    }
+
+    unsafe fn layout_log_window(&self) {
+        if self.log_window.0.is_null() || self.log_edit.0.is_null() {
+            return;
+        }
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if GetClientRect(self.log_window, &mut rect).is_err() {
+            return;
+        }
+        if rect.right <= 0 || rect.bottom <= 0 {
+            return;
+        }
+        let margin = 8 * self.dpi() / 96;
+        move_to(
+            self.log_edit,
+            margin,
+            margin,
+            rect.right - margin * 2,
+            rect.bottom - margin * 2,
+        );
+    }
+
+    /// Replace the log text and scroll to the newest line.
+    unsafe fn refresh_log_view(&self) {
+        if self.log_edit.0.is_null() {
+            return;
+        }
+        let mut text = String::new();
+        for entry in &self.log {
+            text.push_str(&entry.time);
+            text.push(' ');
+            text.push_str(entry.level.label());
+            text.push(' ');
+            text.push_str(&entry.message);
+            text.push_str("\r\n");
+        }
+        let wide_text = wide(&text);
+        let _ = SetWindowTextW(self.log_edit, PCWSTR(wide_text.as_ptr()));
+        let end = wide_text.len().saturating_sub(1);
+        SendMessageW(self.log_edit, EM_SETSEL, WPARAM(end), LPARAM(end as isize));
+        SendMessageW(self.log_edit, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+    }
+
+    unsafe fn show_logs(&mut self) {
+        if self.log_window.0.is_null() {
+            if !self.ensure_log_window() {
+                self.set_status("Could not open the log window.");
+                return;
+            }
+        } else {
+            let _ = ShowWindow(self.log_window, SW_SHOW);
+            let _ = SetForegroundWindow(self.log_window);
+        }
+        self.refresh_log_view();
     }
 
     unsafe fn selected_index(&self) -> Option<usize> {
@@ -616,6 +890,9 @@ impl App {
                 .iter()
                 .find(|m| m.key == source_key(&entry.source))
             {
+                Some(mount) if mount.unclean => {
+                    format!("Mounted at {} \u{26A0}", mount.mount_point)
+                }
                 Some(mount) => format!("Mounted at {}", mount.mount_point),
                 None => String::new(),
             };
@@ -706,6 +983,13 @@ impl App {
         self.refresh_drives();
 
         let count = self.entries.len();
+        self.log_entry(
+            LogLevel::Info,
+            format!(
+                "Volume scan finished: {count} XFS volume{} found.",
+                if count == 1 { "" } else { "s" }
+            ),
+        );
         self.set_status(&format!(
             "Found {count} XFS volume{}.",
             if count == 1 { "" } else { "s" }
@@ -738,8 +1022,16 @@ impl App {
         }
 
         self.set_status(&format!("Mounting {} at {drive}...", entry.detail));
+        self.log_entry(
+            LogLevel::Info,
+            format!(
+                "Mounting {} at {drive} ({}).",
+                entry.detail,
+                if read_only { "read-only" } else { "read-write" }
+            ),
+        );
 
-        let result = (|| -> Result<MountHandle> {
+        let result = (|| -> Result<(MountHandle, bool)> {
             let options = MountOptions {
                 source: entry.source.clone(),
                 mount_point: drive.to_string(),
@@ -750,31 +1042,76 @@ impl App {
             options.validate()?;
             let device = open_source(&options.source, options.read_only)?;
             let fs = factory::detect_and_create(device, options.read_only)?;
-            winfsp_mount::start_mount(&options.mount_point, fs, options.debug)
+            // Read the recovery state before the filesystem is handed to the
+            // mount thread.
+            let unclean = fs.unclean_unmount();
+            let handle = winfsp_mount::start_mount(&options.mount_point, fs, options.debug)?;
+            Ok((handle, unclean))
         })();
 
         match result {
-            Ok(handle) => {
+            Ok((handle, unclean)) => {
                 self.mounts.push(ActiveMount {
                     key: source_key(&entry.source),
                     mount_point: drive.to_string(),
                     handle: Some(handle),
+                    unclean,
                 });
-                self.set_status(&format!(
-                    "Mounted {}{} at {drive}.",
-                    entry.detail,
-                    if entry.label.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", entry.label)
-                    }
-                ));
                 self.refresh_drives();
                 self.populate_list();
+
+                let label = if entry.label.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", entry.label)
+                };
+                self.log_entry(
+                    LogLevel::Info,
+                    format!("Mounted {}{label} at {drive}.", entry.detail),
+                );
+
+                if unclean {
+                    let reason = if read_only {
+                        "the volume was not cleanly unmounted and its log still needs replay; \
+                         recent changes are not visible (mount read-write to replay them)"
+                    } else {
+                        "the volume was not cleanly unmounted; its log was replayed"
+                    };
+                    self.set_status(&format!(
+                        "Mounted {} at {drive} with warnings (unclean unmount).",
+                        entry.detail
+                    ));
+                    self.warn_user(format!("{}: {reason}", entry.detail));
+                } else {
+                    self.clear_warning();
+                    self.set_status(&format!("Mounted {}{label} at {drive}.", entry.detail));
+                }
             }
             Err(error) => {
-                self.set_status(&format!("Mount failed: {error}"));
+                let message = format!("Mount failed: {error}");
+                self.set_status(&message);
+                self.log_entry(LogLevel::Error, format!("{} ({})", message, entry.detail));
+                self.set_warning(message.clone());
                 self.show_error("CrissCrossFS", &format!("Mount failed:\n\n{error}"));
+            }
+        }
+    }
+
+    /// Stop one mount, logging the outcome.  Returns an error message when the
+    /// volume could not be closed cleanly.
+    fn stop_mount(&mut self, handle: Option<MountHandle>, mount_point: &str) -> Option<String> {
+        let handle = handle?;
+        match handle.stop() {
+            Ok(()) => {
+                self.log_entry(LogLevel::Info, format!("Unmounted {mount_point}."));
+                None
+            }
+            Err(error) => {
+                let message = format!(
+                    "{mount_point} was not closed cleanly; the filesystem is left dirty: {error}"
+                );
+                self.log_entry(LogLevel::Error, message.clone());
+                Some(message)
             }
         }
     }
@@ -796,12 +1133,20 @@ impl App {
             return false;
         };
         let mut mount = self.mounts.remove(position);
-        if let Some(handle) = mount.handle.take() {
-            handle.stop();
-        }
-        self.set_status(&format!("Unmounted {}.", mount.mount_point));
+        let mount_point = mount.mount_point.clone();
+        let failure = self.stop_mount(mount.handle.take(), &mount_point);
         self.refresh_drives();
         self.populate_list();
+        match failure {
+            Some(message) => {
+                self.set_status("Unmounted, but the volume was not closed cleanly.");
+                self.warn_user(message);
+            }
+            None => {
+                self.clear_warning();
+                self.set_status(&format!("Unmounted {mount_point}."));
+            }
+        }
         true
     }
 
@@ -811,17 +1156,32 @@ impl App {
             return;
         }
         let count = self.mounts.len();
-        for mut mount in self.mounts.drain(..) {
-            if let Some(handle) = mount.handle.take() {
-                handle.stop();
-            }
+        let mut failures = Vec::new();
+        let drained = std::mem::take(&mut self.mounts);
+        for mut mount in drained {
+            let mount_point = mount.mount_point.clone();
+            let handle = mount.handle.take();
+            failures.extend(self.stop_mount(handle, &mount_point));
         }
-        self.set_status(&format!(
-            "Unmounted {count} volume{}.",
-            if count == 1 { "" } else { "s" }
-        ));
         self.refresh_drives();
         self.populate_list();
+        if failures.is_empty() {
+            self.clear_warning();
+            self.set_status(&format!(
+                "Unmounted {count} volume{}.",
+                if count == 1 { "" } else { "s" }
+            ));
+        } else {
+            self.set_status(&format!(
+                "Unmounted {count} volume(s); {} could not be closed cleanly.",
+                failures.len()
+            ));
+            self.warn_user(format!(
+                "{} of {count} unmounted volume(s) were left dirty: {}",
+                failures.len(),
+                failures.join(" | ")
+            ));
+        }
     }
 
     unsafe fn open_selected(&mut self) {
@@ -869,6 +1229,7 @@ impl App {
             });
         }
         self.populate_list();
+        self.log_entry(LogLevel::Info, format!("Selected image {detail}."));
         self.set_status(&format!(
             "Selected image {detail}. Choose a drive and click Mount."
         ));
@@ -971,9 +1332,22 @@ impl App {
                     self.browse_image();
                 }
             }
+            _ if id == IDC_LOGS as usize => {
+                if code == 0 {
+                    self.show_logs();
+                }
+            }
             _ if id == IDC_RW as usize => {
                 if code == 0 {
                     self.read_write = !self.read_write;
+                    self.log_entry(
+                        LogLevel::Info,
+                        if self.read_write {
+                            "Read-write mode enabled for image files (experimental)."
+                        } else {
+                            "Read-write mode disabled."
+                        },
+                    );
                 }
             }
             IDM_SHOW => self.show_window(),
@@ -1001,10 +1375,11 @@ impl App {
 
     unsafe fn on_destroy(&mut self) {
         self.remove_tray();
+        if !self.log_window.0.is_null() {
+            let _ = DestroyWindow(self.log_window);
+        }
         for mut mount in self.mounts.drain(..) {
-            if let Some(handle) = mount.handle.take() {
-                handle.stop();
-            }
+            let _ = mount.handle.take().map(|handle| handle.stop());
         }
         PostQuitMessage(0);
     }
@@ -1062,10 +1437,11 @@ impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             self.remove_tray();
+            if !self.log_window.0.is_null() {
+                let _ = DestroyWindow(self.log_window);
+            }
             for mut mount in self.mounts.drain(..) {
-                if let Some(handle) = mount.handle.take() {
-                    handle.stop();
-                }
+                let _ = mount.handle.take().map(|handle| handle.stop());
             }
             let _ = DestroyIcon(self.icon);
             let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.font.0));
@@ -1080,6 +1456,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         let app = &mut *pointer;
         if let Some(result) = app.handle(msg, wparam, lparam) {
             return result;
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Window procedure for the log window: it only resizes its edit control and
+/// forgets itself when the user closes it.
+unsafe extern "system" fn log_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    if !pointer.is_null() {
+        let app = &mut *pointer;
+        match msg {
+            WM_SIZE => {
+                app.layout_log_window();
+                return LRESULT(0);
+            }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+            WM_DESTROY => {
+                if app.log_window == hwnd {
+                    app.log_window = HWND::default();
+                    app.log_edit = HWND::default();
+                }
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                return LRESULT(0);
+            }
+            _ => {}
         }
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
