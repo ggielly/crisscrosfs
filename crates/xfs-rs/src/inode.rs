@@ -346,6 +346,48 @@ impl InodeCore {
         }
     }
 
+    /// Encode a Unix timestamp in the selected XFS on-disk representation.
+    ///
+    /// Classical timestamps use a signed 34-bit second count.  Bigtime
+    /// timestamps use an unsigned 64-bit nanosecond count relative to
+    /// 1901-12-13.  Invalid fractions and out-of-range values are rejected
+    /// instead of being truncated.
+    pub fn unix_to_timestamp(
+        unix_seconds: i64,
+        nanoseconds: u32,
+        has_bigtime: bool,
+    ) -> FsResult<(u32, u32)> {
+        const NSEC_PER_SEC: u64 = 1_000_000_000;
+        if nanoseconds >= NSEC_PER_SEC as u32 {
+            return Err(FsError::InvalidArgument);
+        }
+
+        if has_bigtime {
+            let shifted = unix_seconds
+                .checked_add(XFS_BIGTIME_EPOCH_OFFSET)
+                .ok_or(FsError::InvalidArgument)?;
+            if shifted < 0 {
+                return Err(FsError::InvalidArgument);
+            }
+            let xfs_ns = (shifted as u64)
+                .checked_mul(NSEC_PER_SEC)
+                .and_then(|value| value.checked_add(u64::from(nanoseconds)))
+                .ok_or(FsError::InvalidArgument)?;
+            return Ok(((xfs_ns >> 32) as u32, xfs_ns as u32));
+        }
+
+        const SECOND_BITS: u32 = 34;
+        const MIN_SECONDS: i64 = -(1i64 << (SECOND_BITS - 1));
+        const MAX_SECONDS: i64 = (1i64 << (SECOND_BITS - 1)) - 1;
+        if !(MIN_SECONDS..=MAX_SECONDS).contains(&unix_seconds) {
+            return Err(FsError::InvalidArgument);
+        }
+        let raw = unix_seconds as u64 & ((1u64 << SECOND_BITS) - 1);
+        let sec = raw as u32;
+        let nsec = ((raw >> 32) as u32) << 30 | nanoseconds;
+        Ok((sec, nsec))
+    }
+
     /// Returns the access time as (seconds, nanoseconds).
     pub fn atime(&self, has_bigtime: bool) -> (i64, u32) {
         Self::timestamp_to_unix(self.atime_sec, self.atime_nsec, has_bigtime)
@@ -985,6 +1027,36 @@ mod tests {
         let core = InodeCore::parse(&buffer).unwrap();
         assert_eq!(core.permissions(), 0o644); // 0x1A4 = 420 decimal = 0644
                                                // octal
+    }
+
+    #[test]
+    fn unix_timestamp_round_trips_legacy_and_bigtime() {
+        for has_bigtime in [false, true] {
+            for (secs, nsecs) in [(0, 0), (1_700_000_000, 123_456_789), (-1, 999_999_999)] {
+                let (raw_sec, raw_nsec) =
+                    InodeCore::unix_to_timestamp(secs, nsecs, has_bigtime).unwrap();
+                assert_eq!(
+                    InodeCore::timestamp_to_unix(raw_sec, raw_nsec, has_bigtime),
+                    (secs, nsecs)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unix_timestamp_rejects_invalid_fraction_and_range() {
+        assert!(matches!(
+            InodeCore::unix_to_timestamp(0, 1_000_000_000, false),
+            Err(FsError::InvalidArgument)
+        ));
+        assert!(matches!(
+            InodeCore::unix_to_timestamp(1i64 << 33, 0, false),
+            Err(FsError::InvalidArgument)
+        ));
+        assert!(matches!(
+            InodeCore::unix_to_timestamp(-XFS_BIGTIME_EPOCH_OFFSET - 1, 0, true),
+            Err(FsError::InvalidArgument)
+        ));
     }
 
     #[test]
