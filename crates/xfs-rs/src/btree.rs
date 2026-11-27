@@ -126,6 +126,45 @@ impl BtreeBlockLong {
         crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
 
+    /// Verify the v5 CRC and the block's physical location.
+    ///
+    /// `expected_fs_block` is the absolute filesystem block requested from the
+    /// reader. `block_size` is the size of the complete metadata buffer.
+    pub fn verify_location(&self, expected_fs_block: u64, block_size: usize) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        let expected = crate::address::fs_block_to_daddr(expected_fs_block, block_size)?;
+        if self.block_no != expected {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
+    /// Verify all v5 identification fields available to a BMBT walker.
+    ///
+    /// `expected_owner` is the inode whose data fork owns the tree. The UUID is
+    /// optional for callers that only have an `is_v5` flag; VFS callers should
+    /// pass the superblock metadata UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        block_size: usize,
+        expected_owner: Option<u64>,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw)?;
+        self.verify_location(expected_fs_block, block_size)?;
+        if self.is_v5()
+            && (expected_owner.is_some_and(|owner| self.owner != owner)
+                || expected_uuid.is_some_and(|uuid| self.uuid != uuid))
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
     /// Returns `true` if this is a leaf node.
     pub fn is_leaf(&self) -> bool {
         self.level == 0
@@ -405,6 +444,37 @@ impl BtreeBlockShort {
         crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
 
+    /// Verify the v5 CRC and the block's physical location.
+    pub fn verify_location(&self, expected_fs_block: u64, block_size: usize) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        let expected = crate::address::fs_block_to_daddr(expected_fs_block, block_size)?;
+        if self.block_no != expected {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
+    /// Verify v5 CRC, location, owning AG, and (when supplied) filesystem UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        block_size: usize,
+        expected_owner: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw)?;
+        self.verify_location(expected_fs_block, block_size)?;
+        if self.is_v5()
+            && (self.owner != expected_owner || expected_uuid.is_some_and(|uuid| self.uuid != uuid))
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
     /// Returns `true` if this is a leaf node.
     pub fn is_leaf(&self) -> bool {
         self.level == 0
@@ -651,6 +721,41 @@ pub fn btree_lookup_extent<R: BlockReader>(
     reader: &R,
     is_v5: bool,
 ) -> FsResult<Option<crate::extent::Extent>> {
+    btree_lookup_extent_internal(root, file_block, reader, is_v5, None, None, None)
+}
+
+/// Owner-aware BMBT lookup used when the containing inode is known.
+#[cfg(feature = "alloc")]
+pub fn btree_lookup_extent_checked<R: BlockReader>(
+    root: &BmbtRoot,
+    file_block: u64,
+    reader: &R,
+    is_v5: bool,
+    expected_owner: u64,
+    expected_uuid: Option<[u8; 16]>,
+    block_size: usize,
+) -> FsResult<Option<crate::extent::Extent>> {
+    btree_lookup_extent_internal(
+        root,
+        file_block,
+        reader,
+        is_v5,
+        Some(expected_owner),
+        expected_uuid,
+        Some(block_size),
+    )
+}
+
+#[cfg(feature = "alloc")]
+fn btree_lookup_extent_internal<R: BlockReader>(
+    root: &BmbtRoot,
+    file_block: u64,
+    reader: &R,
+    is_v5: bool,
+    expected_owner: Option<u64>,
+    expected_uuid: Option<[u8; 16]>,
+    expected_block_size: Option<usize>,
+) -> FsResult<Option<crate::extent::Extent>> {
     use alloc::collections::BTreeSet;
 
     // The root of a btree-format fork always has level >= 1.
@@ -673,7 +778,17 @@ pub fn btree_lookup_extent<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
-        header.verify_crc(&block_data)?;
+        let block_size = expected_block_size.unwrap_or(block_data.len());
+        if block_size != block_data.len() {
+            return Err(FsError::Corrupted);
+        }
+        header.verify_metadata(
+            &block_data,
+            current_block,
+            block_size,
+            expected_owner,
+            expected_uuid,
+        )?;
         if header.level.checked_add(1) != Some(current_level) {
             return Err(FsError::Corrupted);
         }
@@ -701,6 +816,41 @@ pub fn btree_collect_extents<R: BlockReader>(
     root: &BmbtRoot,
     reader: &R,
     is_v5: bool,
+) -> FsResult<alloc::vec::Vec<crate::extent::Extent>> {
+    btree_collect_extents_internal(root, reader, is_v5, None, None, None)
+}
+
+/// Collect every BMBT extent while checking the owning inode and UUID.
+///
+/// This is the VFS read-path variant. `block_size` is the complete filesystem
+/// block size used to translate filesystem block numbers to v5 disk addresses.
+#[cfg(feature = "alloc")]
+pub fn btree_collect_extents_checked<R: BlockReader>(
+    root: &BmbtRoot,
+    reader: &R,
+    is_v5: bool,
+    expected_owner: u64,
+    expected_uuid: Option<[u8; 16]>,
+    block_size: usize,
+) -> FsResult<alloc::vec::Vec<crate::extent::Extent>> {
+    btree_collect_extents_internal(
+        root,
+        reader,
+        is_v5,
+        Some(expected_owner),
+        expected_uuid,
+        Some(block_size),
+    )
+}
+
+#[cfg(feature = "alloc")]
+fn btree_collect_extents_internal<R: BlockReader>(
+    root: &BmbtRoot,
+    reader: &R,
+    is_v5: bool,
+    expected_owner: Option<u64>,
+    expected_uuid: Option<[u8; 16]>,
+    expected_block_size: Option<usize>,
 ) -> FsResult<alloc::vec::Vec<crate::extent::Extent>> {
     use alloc::collections::BTreeSet;
 
@@ -730,7 +880,17 @@ pub fn btree_collect_extents<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
-        header.verify_crc(&block_data)?;
+        let block_size = expected_block_size.unwrap_or(block_data.len());
+        if block_size != block_data.len() {
+            return Err(FsError::Corrupted);
+        }
+        header.verify_metadata(
+            &block_data,
+            current_block,
+            block_size,
+            expected_owner,
+            expected_uuid,
+        )?;
         if header.level.checked_add(1) != Some(current_level) {
             return Err(FsError::Corrupted);
         }
@@ -757,7 +917,17 @@ pub fn btree_collect_extents<R: BlockReader>(
 
         let block_data = reader.read_block(current_block)?;
         let header = BtreeBlockLong::parse(&block_data, is_v5)?;
-        header.verify_crc(&block_data)?;
+        let block_size = expected_block_size.unwrap_or(block_data.len());
+        if block_size != block_data.len() {
+            return Err(FsError::Corrupted);
+        }
+        header.verify_metadata(
+            &block_data,
+            current_block,
+            block_size,
+            expected_owner,
+            expected_uuid,
+        )?;
 
         if !header.is_leaf() {
             return Err(FsError::Corrupted);
@@ -964,6 +1134,10 @@ mod tests {
         buf[0..4].copy_from_slice(&XFS_BMAP_CRC_MAGIC.to_be_bytes());
         buf[6..8].copy_from_slice(&1u16.to_be_bytes());
         buf[16..24].copy_from_slice(&right_sibling.to_be_bytes());
+        // The reader is asked for filesystem block 100; v5 blkno is in
+        // 512-byte basic-block units.
+        buf[24..32].copy_from_slice(&800u64.to_be_bytes());
+        buf[56..64].copy_from_slice(&42u64.to_be_bytes());
         let extent = crate::extent::Extent {
             file_offset: 0,
             start_block: 1000,
@@ -1008,6 +1182,42 @@ mod tests {
         };
         assert!(matches!(
             btree_collect_extents(&root, &reader, true),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn traversal_rejects_wrong_blkno_even_with_a_valid_crc() {
+        let root = root_for(1, 100);
+        let mut leaf = v5_leaf(u64::MAX);
+        leaf[24..32].copy_from_slice(&801u64.to_be_bytes());
+        finish_v5_crc(&mut leaf, BtreeBlockLong::CRC_OFFSET_V5);
+        let reader = MemoryReader {
+            blocks: [(100, leaf)].into_iter().collect(),
+        };
+        assert!(matches!(
+            btree_collect_extents(&root, &reader, true),
+            Err(FsError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn checked_collection_rejects_wrong_owner_and_uuid() {
+        let root = root_for(1, 100);
+        let mut leaf = v5_leaf(u64::MAX);
+        leaf.resize(4096, 0);
+        finish_v5_crc(&mut leaf, BtreeBlockLong::CRC_OFFSET_V5);
+        let reader = MemoryReader {
+            blocks: [(100, leaf)].into_iter().collect(),
+        };
+        let result = btree_collect_extents_checked(&root, &reader, true, 42, None, 4096);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(matches!(
+            btree_collect_extents_checked(&root, &reader, true, 43, None, 4096),
+            Err(FsError::Corrupted)
+        ));
+        assert!(matches!(
+            btree_collect_extents_checked(&root, &reader, true, 42, Some([0xAA; 16]), 4096),
             Err(FsError::Corrupted)
         ));
     }

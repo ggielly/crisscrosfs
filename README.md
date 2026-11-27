@@ -8,8 +8,11 @@ CrissCrossFS is an experimental XFS filesystem driver for Windows, written in Ru
 
 - Read access to XFS v4 and v5 filesystems
 - Local, extent, and B+tree file reads
-- Shortform, block, leaf, and node-directory reads
-- Transactional image-file writes with XFS log-v2 buffer/inode records, dirty bitmaps, tail advancement, and recovery
+- Shortform, block, leaf, and node-directory reads, with hash-directed DA lookup for large directories
+- Concurrent inode/directory/extent caches, IOCP-backed positional disk I/O, and asynchronous WinFsp pending responses
+- Transactional image-file writes with XFS log-v2 buffer/inode records, dirty bitmaps, tail advancement, group commit, and recovery
+- Per-inode locking and bounded delayed allocation with explicit flush-on-close/sync
+- POSIX access-ACL to Windows DACL mapping (read-only ACL mutation)
 - BNO/CNT and existing-chunk INOBT/FINOBT allocation
 - Local/extent/B+tree file writes, sparse holes, truncate, and timestamps
 - File/directory/symlink creation, hard links, unlink, and rename
@@ -71,6 +74,8 @@ crisscrossfs.exe scan
 
 Press `Ctrl+C` to unmount. Writable mounts flush metadata and append a clean unmount record during shutdown. `--rw` is rejected for physical disks, partitions, and Windows volume paths; it is accepted only for regular image files.
 
+Use `--case-insensitive` to accept case-insensitive lookup (ambiguous names are rejected), `--dispatcher-threads N` to tune WinFsp dispatcher concurrency, and `--io-workers N` to size the blocking VFS worker pool used by asynchronous pending responses (`0` keeps the automatic default). The GUI remains native Win32.
+
 ### Writable-image limitations
 
 The writer fails closed rather than silently producing incomplete metadata:
@@ -79,7 +84,10 @@ The writer fails closed rather than silently producing incomplete metadata:
 - Realtime or quota-enabled filesystems and RMAP-backed allocation groups are rejected.
 - REFCOUNBT is validated as a single leaf; shared and CoW staging extents are rejected, and refcount records are not mutated.
 - Directory rebuilding supports one LEAF1 or one DA-node level with one free-index block. Larger node trees fail with `NotSupported`.
-- A transaction must fit in one 32 KiB log record; multi-record continuation is not implemented. Records wrap to the beginning of the log with a new cycle number when they do not fit.
+- A group of transactions must fit in one 32 KiB log record; multi-record continuation is not implemented. Records wrap to the beginning of the log with a new cycle number when they do not fit.
+- WinFsp read/write/readdir callbacks return asynchronously, but the VFS interface itself remains synchronous and executes on a bounded worker pool. Disk completion uses IOCP; IoRing and fully async VFS traits are not implemented.
+- Pending async read/write callbacks use owned buffers for request-lifetime safety, so they add one copy compared with the synchronous fast path.
+- Dirty data is capped at 4 MiB per file and 16 MiB globally. A file with pending data flushes it when it hits its cap; under heavy parallel writes, a write can still fail with out-of-memory while other files hold the global budget, and succeeds once those writes are flushed (`flush_file`, `sync`, or unmount).
 - Extended-attribute mutation is not implemented, but existing attribute-fork bytes are preserved when inodes are rewritten; unlinking an inode with attribute extents is rejected rather than leaking those blocks.
 - Real WinFsp mount/unmount and Linux `xfs_repair` validation are still required before release.
 
@@ -177,7 +185,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite includes real XFS v5 fixtures under `test-images/`, VFS read/readdir regressions, and `crates/xfs-vfs/tests/write_image.rs`, which mutates only a disposable temporary copy. The write test covers allocation, sparse writes, truncate, BMBT conversion, directory growth, namespace operations, clean shutdown, and read-only reopen. A real WinFsp mount in a Windows VM and Linux `xfs_repair` validation are still required before release.
+The suite includes real XFS v5 fixtures under `test-images/`, VFS read/readdir regressions, and `crates/xfs-vfs/tests/write_image.rs`, which mutates only a disposable temporary copy. The bundled fixtures are formatted with reflink/refcount enabled, which the experimental writer refuses, so writable integration tests report a skip unless `test-images/xfs-16M.img` is replaced by an image without reflink, rmapbt, and sparse-inode features. The write test covers allocation, sparse writes, truncate, BMBT conversion, directory growth, namespace operations, the delalloc backpressure flush, clean shutdown, and read-only reopen. A real WinFsp mount in a Windows VM and Linux `xfs_repair` validation are still required before release.
 
 ## Fuzzing
 

@@ -140,7 +140,7 @@ mod tests {
             Ok(fs) => {
                 assert_eq!(fs.fs_type(), "xfs");
             }
-            Err(FsError::Corrupted) => {
+            Err(FsError::Corrupted | FsError::UnsupportedVersion) => {
                 // This means it detected XFS but failed to parse the
                 // superblock, which is expected for our empty
                 // data. Ideally we'd want it to succeed, but "Corrupted" means

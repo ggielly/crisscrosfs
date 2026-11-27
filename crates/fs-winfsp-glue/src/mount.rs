@@ -19,6 +19,12 @@ pub struct MountOptions {
     pub volume_prefix: Option<String>,
     /// File system name shown in Explorer.
     pub filesystem_name: String,
+    /// Resolve names case-insensitively, rejecting case-fold ambiguities.
+    pub case_insensitive_lookup: bool,
+    /// WinFsp dispatcher threads (0 = WinFsp default).
+    pub dispatcher_threads: u32,
+    /// Blocking VFS workers for async callbacks (0 = built-in default).
+    pub io_workers: u32,
 }
 
 impl Default for MountOptions {
@@ -30,6 +36,9 @@ impl Default for MountOptions {
             debug: false,
             volume_prefix: None,
             filesystem_name: "XFS".to_string(),
+            case_insensitive_lookup: false,
+            dispatcher_threads: 0,
+            io_workers: 0,
         }
     }
 }

@@ -19,8 +19,12 @@ tracing = "0.1"
 # CRC32C
 crc32c = "0.6"
 
-# LRU cache
-lru = "0.16.3"
+# Concurrent metadata caches (TinyLFU, no global reader/writer lock)
+moka = { version = "0.12", features = ["sync"] }
+# Unicode case folding for optional case-insensitive lookup
+unicase = "2"
+# Fast hasher for immutable directory name indexes
+ahash = "0.8"
 
 # Synchronization
 parking_lot = "0.12"

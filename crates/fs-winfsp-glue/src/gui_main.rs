@@ -7,6 +7,9 @@
 
 #![windows_subsystem = "windows"]
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     if let Err(error) = fs_winfsp_glue::gui::run(false) {
         // No console here; surface fatal startup failures in a message box.

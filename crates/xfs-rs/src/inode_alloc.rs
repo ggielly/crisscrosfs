@@ -374,6 +374,48 @@ impl InodeBtreeBlock {
         }
         crate::crc::verify_crc32c_field(raw, Self::CRC_OFFSET_V5, self.crc, true)
     }
+
+    /// Verify the v5 CRC, physical block address, owning AG and optional UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        block_size: usize,
+        expected_owner: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw)?;
+        if self.is_v5() {
+            let expected = crate::address::fs_block_to_daddr(expected_fs_block, block_size)?;
+            if self.blkno != expected
+                || self.owner != expected_owner
+                || expected_uuid.is_some_and(|uuid| self.uuid != uuid)
+            {
+                return Err(FsError::Corrupted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse and validate a complete inode B+tree block.
+    pub fn parse_checked(
+        buffer: &[u8],
+        is_v5: bool,
+        expected_fs_block: u64,
+        block_size: usize,
+        expected_owner: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<Self> {
+        let header = Self::parse(buffer, is_v5)?;
+        header.verify_metadata(
+            buffer,
+            expected_fs_block,
+            block_size,
+            expected_owner,
+            expected_uuid,
+        )?;
+        Ok(header)
+    }
 }
 
 /// Read leaf records from an inode B+tree block.
@@ -611,6 +653,8 @@ pub fn create_empty_inode_core_at(
         extsize: 0,
         nextents: 0,
         anextents: 0,
+        nrext64_nextents: None,
+        nrext64_anextents: None,
         forkoff: 0,
         aformat: crate::InodeFormat::Extents as u8,
         dmevmask: 0,

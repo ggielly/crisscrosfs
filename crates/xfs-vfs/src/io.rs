@@ -1,7 +1,41 @@
 //! Checked block-device I/O helpers shared by the XFS VFS.
 
+use std::sync::Arc;
+
 use fs_abstraction::{BlockDevice, FsError, FsResult};
 use xfs_rs::btree::BlockReader;
+
+/// Positional block access used by the read path.
+///
+/// Metadata buffers are shared; file data is read straight into the caller's
+/// buffer and never enters the metadata block cache.
+pub(crate) trait VfsBlockReader {
+    fn read_block(&self, block_num: u64) -> FsResult<Arc<[u8]>>;
+    fn read_at(&self, block_num: u64, offset: u64, buf: &mut [u8]) -> FsResult<()>;
+
+    /// Adapter for the xfs-rs walkers, whose public trait currently owns Vecs.
+    fn read_btree_block(&self, block_num: u64) -> FsResult<Vec<u8>> {
+        Ok(self.read_block(block_num)?.to_vec())
+    }
+}
+
+impl<R: VfsBlockReader + ?Sized> VfsBlockReader for &R {
+    fn read_block(&self, block_num: u64) -> FsResult<Arc<[u8]>> {
+        (**self).read_block(block_num)
+    }
+
+    fn read_at(&self, block_num: u64, offset: u64, buf: &mut [u8]) -> FsResult<()> {
+        (**self).read_at(block_num, offset, buf)
+    }
+}
+
+pub(crate) struct XfsBtreeReader<R>(pub(crate) R);
+
+impl<R: VfsBlockReader> BlockReader for XfsBtreeReader<R> {
+    fn read_block(&self, block_num: u64) -> FsResult<Vec<u8>> {
+        self.0.read_btree_block(block_num)
+    }
+}
 
 /// Validate a byte range without overflowing or crossing the supplied limit.
 pub(crate) fn validate_range(offset: u64, len: usize, limit: u64) -> FsResult<()> {

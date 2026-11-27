@@ -8,8 +8,9 @@
 //! Block numbers in snapshots, plans, sibling pointers and child pointers are
 //! AG-relative. [`crate::btree::BlockReader`] addresses are absolute filesystem
 //! block numbers, while v5 `bb_blkno` is a 64-bit disk address in 512-byte
-//! basic-block units. Both public operations therefore take `ag_number`,
-//! `ag_blocks` and `sector_size` to translate and validate these addresses.
+//! basic-block units. Both public operations therefore take `ag_number` and
+//! `ag_blocks` to translate these addresses; `sector_size` is validated for
+//! compatibility with the filesystem geometry.
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -131,7 +132,7 @@ struct CollectState {
     is_v5: bool,
     ag_number: u32,
     ag_blocks: u32,
-    sector_size: u32,
+    expected_uuid: Option<[u8; 16]>,
     visited: BTreeSet<u64>,
     level_tails: BTreeMap<u16, LevelTail>,
     blocks: Vec<u32>,
@@ -305,13 +306,10 @@ fn validate_sector_size(sector_size: u32, block_size: usize) -> FsResult<()> {
 }
 
 fn disk_address(absolute_fs_block: u64, block_size: usize, sector_size: u32) -> FsResult<u64> {
+    // Retain sector-size validation for the public API, but xfs_daddr_t is
+    // always expressed in 512-byte basic blocks.
     validate_sector_size(sector_size, block_size)?;
-    let byte_address = absolute_fs_block
-        .checked_mul(block_size as u64)
-        .ok_or(FsError::ArithmeticOverflow)?;
-    byte_address
-        .checked_div(u64::from(sector_size))
-        .ok_or(FsError::ArithmeticOverflow)
+    crate::address::fs_block_to_daddr(absolute_fs_block, block_size)
 }
 
 fn record_key(kind: ShortBtreeKind, record: &[u8]) -> FsResult<SortKey> {
@@ -434,17 +432,15 @@ fn collect_node<R: BlockReader>(
     if header.magic != state.kind.magic(state.is_v5) {
         return Err(FsError::InvalidMagic);
     }
-    header.verify_crc(&raw)?;
+    header.verify_metadata(
+        &raw,
+        absolute,
+        state.block_size,
+        state.ag_number,
+        state.expected_uuid,
+    )?;
     if header.level != expected_level {
         return Err(FsError::Corrupted);
-    }
-    if state.is_v5 {
-        // Unlike siblings and child pointers, short v5 bb_blkno is a 64-bit
-        // xfs_daddr_t in basic-block (sector) units.
-        let expected_disk_address = disk_address(absolute, state.block_size, state.sector_size)?;
-        if raw.read_be_u64(16)? != expected_disk_address || header.owner != state.ag_number {
-            return Err(FsError::Corrupted);
-        }
     }
     if is_root && (header.left_sibling != NULLAGBLOCK || header.right_sibling != NULLAGBLOCK) {
         return Err(FsError::Corrupted);
@@ -591,9 +587,8 @@ fn collect_node<R: BlockReader>(
 /// `root_block` and returned block numbers are AG-relative. The reader is
 /// called with absolute filesystem block numbers computed as
 /// `ag_number * ag_blocks + ag_block`. `ag_number`, `ag_blocks` and
-/// `sector_size` are required additions to the originally requested API so
-/// child addresses and v5's 64-bit `bb_blkno` disk address can be validated.
-/// The header field is `absolute_fs_block * block_size / sector_size`.
+/// `sector_size` validate the supplied geometry. The v5 `bb_blkno` field is
+/// `absolute_fs_block * block_size / 512`.
 ///
 /// Validation includes magic, version, CRCs, levels, capacity, canonical
 /// pointer placement, parent/child keys, record ordering, sibling chains and
@@ -609,6 +604,61 @@ pub fn collect_short_btree<R: BlockReader>(
     ag_blocks: u32,
     sector_size: u32,
     reader: &R,
+) -> FsResult<ShortBtreeSnapshot> {
+    collect_short_btree_internal(
+        kind,
+        root_block,
+        root_level,
+        block_size,
+        is_v5,
+        ag_number,
+        ag_blocks,
+        sector_size,
+        reader,
+        None,
+    )
+}
+
+/// Checked collector for VFS reads that also know the metadata UUID.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_short_btree_checked<R: BlockReader>(
+    kind: ShortBtreeKind,
+    root_block: u32,
+    root_level: u16,
+    block_size: usize,
+    is_v5: bool,
+    ag_number: u32,
+    ag_blocks: u32,
+    sector_size: u32,
+    reader: &R,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<ShortBtreeSnapshot> {
+    collect_short_btree_internal(
+        kind,
+        root_block,
+        root_level,
+        block_size,
+        is_v5,
+        ag_number,
+        ag_blocks,
+        sector_size,
+        reader,
+        expected_uuid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_short_btree_internal<R: BlockReader>(
+    kind: ShortBtreeKind,
+    root_block: u32,
+    root_level: u16,
+    block_size: usize,
+    is_v5: bool,
+    ag_number: u32,
+    ag_blocks: u32,
+    sector_size: u32,
+    reader: &R,
+    expected_uuid: Option<[u8; 16]>,
 ) -> FsResult<ShortBtreeSnapshot> {
     validate_block_size(block_size)?;
     validate_sector_size(sector_size, block_size)?;
@@ -628,7 +678,7 @@ pub fn collect_short_btree<R: BlockReader>(
         is_v5,
         ag_number,
         ag_blocks,
-        sector_size,
+        expected_uuid,
         visited: BTreeSet::new(),
         level_tails: BTreeMap::new(),
         blocks: Vec::new(),
@@ -940,9 +990,9 @@ fn encode_node(
 /// candidate list is accepted and skipped. Duplicate non-root candidates, null
 /// pointers and out-of-AG blocks are rejected.
 ///
-/// `ag_number`, `ag_blocks` and `sector_size` are required additions to the
-/// originally requested API. Every v5 header stores the 64-bit disk address
-/// `(ag_number * ag_blocks + ag_block) * block_size / sector_size`, while
+/// `ag_number`, `ag_blocks` and `sector_size` validate the supplied geometry.
+/// Every v5 header stores the 64-bit disk address
+/// `(ag_number * ag_blocks + ag_block) * block_size / 512`, while
 /// [`Self::blocks`] remains AG-relative. Records must already be strictly
 /// ordered according to the selected tree kind.
 #[allow(clippy::too_many_arguments)]
@@ -1397,6 +1447,41 @@ mod tests {
             &reader,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn checked_collection_rejects_wrong_uuid() {
+        let records = records_for(ShortBtreeKind::Inode, 7);
+        let plan = plan_records(ShortBtreeKind::Inode, &records, 512, true);
+        let reader = reader_for_plan(&plan);
+        assert!(collect_short_btree_checked(
+            ShortBtreeKind::Inode,
+            TEST_ROOT,
+            0,
+            512,
+            true,
+            TEST_AG,
+            TEST_AG_BLOCKS,
+            TEST_SECTOR_SIZE,
+            &reader,
+            Some(TEST_UUID),
+        )
+        .is_ok());
+        assert!(matches!(
+            collect_short_btree_checked(
+                ShortBtreeKind::Inode,
+                TEST_ROOT,
+                0,
+                512,
+                true,
+                TEST_AG,
+                TEST_AG_BLOCKS,
+                TEST_SECTOR_SIZE,
+                &reader,
+                Some([0xAA; 16]),
+            ),
+            Err(FsError::Corrupted)
+        ));
     }
 
     #[test]

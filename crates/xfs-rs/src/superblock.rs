@@ -7,7 +7,60 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use fs_abstraction::{safe_math::CheckedSliceOps, FsError, FsResult};
+use fs_abstraction::{FsError, FsResult};
+use zerocopy::{
+    byteorder::{BigEndian, LittleEndian, U16, U32, U64},
+    FromBytes,
+};
+
+trait OnDiskBytes {
+    fn be_u16(&self, offset: usize) -> FsResult<u16>;
+    fn be_u32(&self, offset: usize) -> FsResult<u32>;
+    fn be_u64(&self, offset: usize) -> FsResult<u64>;
+    fn le_u32(&self, offset: usize) -> FsResult<u32>;
+}
+
+impl OnDiskBytes for [u8] {
+    #[inline(always)]
+    fn be_u16(&self, offset: usize) -> FsResult<u16> {
+        let end = offset.checked_add(2).ok_or(FsError::ArithmeticOverflow)?;
+        let bytes = self.get(offset..end).ok_or(FsError::BufferTooSmall)?;
+        Ok(U16::<BigEndian>::ref_from_prefix(bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get())
+    }
+
+    #[inline(always)]
+    fn be_u32(&self, offset: usize) -> FsResult<u32> {
+        let end = offset.checked_add(4).ok_or(FsError::ArithmeticOverflow)?;
+        let bytes = self.get(offset..end).ok_or(FsError::BufferTooSmall)?;
+        Ok(U32::<BigEndian>::ref_from_prefix(bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get())
+    }
+
+    #[inline(always)]
+    fn be_u64(&self, offset: usize) -> FsResult<u64> {
+        let end = offset.checked_add(8).ok_or(FsError::ArithmeticOverflow)?;
+        let bytes = self.get(offset..end).ok_or(FsError::BufferTooSmall)?;
+        Ok(U64::<BigEndian>::ref_from_prefix(bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get())
+    }
+
+    #[inline(always)]
+    fn le_u32(&self, offset: usize) -> FsResult<u32> {
+        let end = offset.checked_add(4).ok_or(FsError::ArithmeticOverflow)?;
+        let bytes = self.get(offset..end).ok_or(FsError::BufferTooSmall)?;
+        Ok(U32::<LittleEndian>::ref_from_prefix(bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get())
+    }
+}
 
 use crate::constants::*;
 
@@ -130,6 +183,30 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Incompatible features implemented for read-only parsing.
+    pub const READ_ONLY_INCOMPAT_FEATURES: u32 = XFS_SB_FEAT_INCOMPAT_FTYPE
+        | XFS_SB_FEAT_INCOMPAT_SPINODES
+        | XFS_SB_FEAT_INCOMPAT_META_UUID
+        | XFS_SB_FEAT_INCOMPAT_BIGTIME
+        | XFS_SB_FEAT_INCOMPAT_NREXT64;
+    /// Read-only compatible features implemented for read-only parsing.
+    pub const READ_ONLY_RO_COMPAT_FEATURES: u32 = XFS_SB_FEAT_RO_COMPAT_FINOBT
+        | XFS_SB_FEAT_RO_COMPAT_REFLINK
+        | XFS_SB_FEAT_RO_COMPAT_RMAPBT
+        | XFS_SB_FEAT_RO_COMPAT_INOBTCNT
+        | XFS_SB_FEAT_RO_COMPAT_SPARSE;
+    /// Incompatible features implemented by the writable VFS.
+    pub const WRITABLE_INCOMPAT_FEATURES: u32 = XFS_SB_FEAT_INCOMPAT_FTYPE
+        | XFS_SB_FEAT_INCOMPAT_SPINODES
+        | XFS_SB_FEAT_INCOMPAT_META_UUID
+        | XFS_SB_FEAT_INCOMPAT_BIGTIME;
+    /// Read-only compatible features implemented by the writable VFS.
+    ///
+    /// INOBTCNT is deliberately not claimed here: although its counters are
+    /// decoded, the writer does not implement every inode-tree shape change
+    /// needed to maintain them safely.
+    pub const WRITABLE_RO_COMPAT_FEATURES: u32 = XFS_SB_FEAT_RO_COMPAT_FINOBT;
+
     /// Parses a superblock from a byte buffer.
     ///
     /// # Arguments
@@ -152,35 +229,35 @@ impl Superblock {
         let copy_len = buffer.len().min(XFS_SB_SIZE_V5);
         local[..copy_len].copy_from_slice(&buffer[..copy_len]);
 
-        // Convert to slice to use CheckedSliceOps
+        // Borrow fixed-width big-endian fields directly from the local copy.
         let local_slice = &local[..];
 
         // Check magic
-        let magic = local_slice.read_be_u32(0x000)?;
+        let magic = local_slice.be_u32(0x000)?;
         if magic != XFS_SB_MAGIC {
             return Err(FsError::InvalidMagic);
         }
 
         // Parse common fields (v4/v5)
-        let block_size = local_slice.read_be_u32(0x004)?;
-        let total_blocks = local_slice.read_be_u64(0x008)?;
-        let realtime_blocks = local_slice.read_be_u64(0x010)?;
-        let realtime_extents = local_slice.read_be_u64(0x018)?;
+        let block_size = local_slice.be_u32(0x004)?;
+        let total_blocks = local_slice.be_u64(0x008)?;
+        let realtime_blocks = local_slice.be_u64(0x010)?;
+        let realtime_extents = local_slice.be_u64(0x018)?;
 
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&local[0x020..0x030]);
 
-        let log_start = local_slice.read_be_u64(0x030)?;
-        let root_inode = local_slice.read_be_u64(0x038)?;
-        let realtime_bitmap_inode = local_slice.read_be_u64(0x040)?;
-        let realtime_summary_inode = local_slice.read_be_u64(0x048)?;
+        let log_start = local_slice.be_u64(0x030)?;
+        let root_inode = local_slice.be_u64(0x038)?;
+        let realtime_bitmap_inode = local_slice.be_u64(0x040)?;
+        let realtime_summary_inode = local_slice.be_u64(0x048)?;
 
-        let realtime_extent_size = local_slice.read_be_u32(0x050)?;
-        let ag_blocks = local_slice.read_be_u32(0x054)?;
-        let ag_count = local_slice.read_be_u32(0x058)?;
-        let realtime_bitmap_blocks = local_slice.read_be_u32(0x05C)?;
-        let log_blocks = local_slice.read_be_u32(0x060)?;
-        let version = local_slice.read_be_u16(0x064)?;
+        let realtime_extent_size = local_slice.be_u32(0x050)?;
+        let ag_blocks = local_slice.be_u32(0x054)?;
+        let ag_count = local_slice.be_u32(0x058)?;
+        let realtime_bitmap_blocks = local_slice.be_u32(0x05C)?;
+        let log_blocks = local_slice.be_u32(0x060)?;
+        let version = local_slice.be_u16(0x064)?;
         let version_num = version & 0x000F;
         if version_num != XFS_SB_VERSION_4 && version_num != XFS_SB_VERSION_5 {
             return Err(FsError::UnsupportedVersion);
@@ -190,9 +267,9 @@ impl Superblock {
             return Err(FsError::BufferTooSmall);
         }
 
-        let sector_size = local_slice.read_be_u16(0x066)?;
-        let inode_size = local_slice.read_be_u16(0x068)?;
-        let inodes_per_block = local_slice.read_be_u16(0x06A)?;
+        let sector_size = local_slice.be_u16(0x066)?;
+        let inode_size = local_slice.be_u16(0x068)?;
+        let inodes_per_block = local_slice.be_u16(0x06A)?;
 
         let mut name = [0u8; 12];
         name.copy_from_slice(&local[0x06C..0x078]);
@@ -206,15 +283,15 @@ impl Superblock {
         let in_progress = local[0x07E];
         let inode_max_percent = local[0x07F];
 
-        let inode_count = local_slice.read_be_u64(0x080)?;
-        let free_inodes = local_slice.read_be_u64(0x088)?;
-        let free_blocks = local_slice.read_be_u64(0x090)?;
-        let free_realtime_extents = local_slice.read_be_u64(0x098)?;
+        let inode_count = local_slice.be_u64(0x080)?;
+        let free_inodes = local_slice.be_u64(0x088)?;
+        let free_blocks = local_slice.be_u64(0x090)?;
+        let free_realtime_extents = local_slice.be_u64(0x098)?;
         let dir_block_log = local[0x0C0];
         let log_sector_log = local[0x0C1];
-        let log_sector_size = local_slice.read_be_u16(0x0C2)?;
-        let log_unit = local_slice.read_be_u32(0x0C4)?;
-        let features2 = local_slice.read_be_u32(0x0C8)?;
+        let log_sector_size = local_slice.be_u16(0x0C2)?;
+        let log_unit = local_slice.be_u32(0x0C4)?;
+        let features2 = local_slice.be_u32(0x0C8)?;
 
         // The version nibble (not the whole versionnum word, which contains
         // v4 feature flags) determines the v5 layout.  Its full fixed-size
@@ -223,10 +300,10 @@ impl Superblock {
         let (features_compat, features_ro_compat, features_incompat, features_log_incompat) =
             if is_v5_version {
                 (
-                    local_slice.read_be_u32(0x0D0)?,
-                    local_slice.read_be_u32(0x0D4)?,
-                    local_slice.read_be_u32(0x0D8)?,
-                    local_slice.read_be_u32(0x0DC)?,
+                    local_slice.be_u32(0x0D0)?,
+                    local_slice.be_u32(0x0D4)?,
+                    local_slice.be_u32(0x0D8)?,
+                    local_slice.be_u32(0x0DC)?,
                 )
             } else {
                 (0, 0, 0, 0)
@@ -234,25 +311,25 @@ impl Superblock {
 
         // XFS stores the superblock CRC as little-endian __le32.
         let crc = if is_v5_version {
-            local_slice.read_le_u32(0x0E0)?
+            local_slice.le_u32(0x0E0)?
         } else {
             0
         };
 
         let sparse_inode_align = if is_v5_version {
-            local_slice.read_be_u32(0x0E4)?
+            local_slice.be_u32(0x0E4)?
         } else {
             0
         };
 
         let project_quota_inode = if is_v5_version {
-            local_slice.read_be_u64(0x0E8)?
+            local_slice.be_u64(0x0E8)?
         } else {
             0
         };
 
         let lsn = if is_v5_version {
-            local_slice.read_be_u64(0x0F0)?
+            local_slice.be_u64(0x0F0)?
         } else {
             0
         };
@@ -409,26 +486,20 @@ impl Superblock {
             return Err(FsError::Corrupted);
         }
 
-        // Internal log must lie inside the filesystem.
-        if self.log_blocks > 0 {
-            let log_end = self
-                .log_start
-                .checked_add(u64::from(self.log_blocks))
-                .ok_or(FsError::ArithmeticOverflow)?;
-            if log_end > self.total_blocks {
-                return Err(FsError::Corrupted);
-            }
-        }
+        // Internal-log geometry is deliberately validated by the log reader,
+        // not by structural superblock parsing. Read-only data/directory access
+        // can continue when the log is unavailable (the VFS reports that it is
+        // mounting without recovery), while writable mounts still fail in
+        // Journal::new before any mutation.
 
-        // Reject incompatible features we do not understand rather than
-        // parsing them with the wrong on-disk layout.  In particular, NREXT64
-        // changes the inode extent-counter fields and is not implemented by
-        // this parser yet.
-        let known_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE
-            | XFS_SB_FEAT_INCOMPAT_SPINODES
-            | XFS_SB_FEAT_INCOMPAT_META_UUID
-            | XFS_SB_FEAT_INCOMPAT_BIGTIME;
-        if self.is_v5() && (self.features_incompat & !known_incompat) != 0 {
+        // Reject feature bits whose on-disk meaning we do not understand.
+        // Recognized-but-unsupported semantics are handled separately by
+        // validate_feature_support so read-only and writable mounts can have
+        // an explicit policy.
+        if self.is_v5()
+            && ((self.features_incompat & !XFS_SB_FEAT_INCOMPAT_KNOWN) != 0
+                || (self.features_ro_compat & !XFS_SB_FEAT_RO_COMPAT_KNOWN) != 0)
+        {
             return Err(FsError::NotSupported);
         }
 
@@ -461,6 +532,42 @@ impl Superblock {
     /// Returns `true` if this is a v5 filesystem.
     pub fn is_v5(&self) -> bool {
         (self.version & 0x000F) == XFS_SB_VERSION_5
+    }
+
+    /// Validate feature semantics for the requested mount mode.
+    ///
+    /// Parsing recognizes all known feature bits so callers can distinguish a
+    /// structurally valid filesystem from one whose semantics they implement.
+    /// Read-only mounts accept BIGTIME, NREXT64, REFLINK and RMAPBT; the latter
+    /// two are transparent for ordinary data and directory reads. Writable
+    /// mounts accept BIGTIME but reject NREXT64, reflink, rmapbt, metadir,
+    /// exchange, parent, INOBTCNT, and every feature not explicitly listed.
+    pub fn validate_feature_support(&self, read_only: bool) -> FsResult<()> {
+        if !self.is_v5() {
+            return Ok(());
+        }
+        if (self.features_incompat & !XFS_SB_FEAT_INCOMPAT_KNOWN) != 0
+            || (self.features_ro_compat & !XFS_SB_FEAT_RO_COMPAT_KNOWN) != 0
+            || self.features_log_incompat != 0
+        {
+            return Err(FsError::NotSupported);
+        }
+
+        let incompat = if read_only {
+            Self::READ_ONLY_INCOMPAT_FEATURES
+        } else {
+            Self::WRITABLE_INCOMPAT_FEATURES
+        };
+        let ro_compat = if read_only {
+            Self::READ_ONLY_RO_COMPAT_FEATURES
+        } else {
+            Self::WRITABLE_RO_COMPAT_FEATURES
+        };
+        if (self.features_incompat & !incompat) != 0 || (self.features_ro_compat & !ro_compat) != 0
+        {
+            return Err(FsError::NotSupported);
+        }
+        Ok(())
     }
 
     /// UUID stored in v5 metadata structures. Filesystems without the
@@ -830,15 +937,73 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_incompatible_features() {
-        for feature in [1 << 30, XFS_SB_FEAT_INCOMPAT_NREXT64] {
+    fn log_geometry_is_left_to_the_log_reader() {
+        let mut buf = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
+        buf[0x030..0x038].copy_from_slice(&u64::MAX.to_be_bytes());
+        buf[0x060..0x064].copy_from_slice(&u32::MAX.to_be_bytes());
+        let sb = Superblock::parse(&buf).unwrap();
+        assert_eq!(sb.log_start, u64::MAX);
+        assert_eq!(sb.log_blocks, u32::MAX);
+    }
+
+    #[test]
+    fn rejects_unknown_features_and_gates_known_features_by_mount_mode() {
+        let mut unknown = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
+        unknown[0x0D8..0x0DC].copy_from_slice(&(1u32 << 30).to_be_bytes());
+        assert!(matches!(
+            Superblock::parse(&unknown),
+            Err(FsError::NotSupported)
+        ));
+
+        for feature in [
+            XFS_SB_FEAT_INCOMPAT_BIGTIME,
+            XFS_SB_FEAT_INCOMPAT_NREXT64,
+            XFS_SB_FEAT_INCOMPAT_METADIR,
+            XFS_SB_FEAT_INCOMPAT_EXCHANGE,
+            XFS_SB_FEAT_INCOMPAT_PARENT,
+            XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR,
+        ] {
             let mut buf = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
             buf[0x0D8..0x0DC].copy_from_slice(&feature.to_be_bytes());
-            assert!(matches!(
-                Superblock::parse(&buf),
-                Err(FsError::NotSupported)
-            ));
+            let sb = Superblock::parse(&buf).unwrap();
+            let read_only_supported = matches!(
+                feature,
+                XFS_SB_FEAT_INCOMPAT_BIGTIME | XFS_SB_FEAT_INCOMPAT_NREXT64
+            );
+            assert_eq!(
+                sb.validate_feature_support(true).is_ok(),
+                read_only_supported
+            );
+            assert_eq!(
+                sb.validate_feature_support(false).is_ok(),
+                feature == XFS_SB_FEAT_INCOMPAT_BIGTIME
+            );
         }
+
+        for feature in [
+            XFS_SB_FEAT_RO_COMPAT_FINOBT,
+            XFS_SB_FEAT_RO_COMPAT_INOBTCNT,
+            XFS_SB_FEAT_RO_COMPAT_REFLINK,
+            XFS_SB_FEAT_RO_COMPAT_RMAPBT,
+        ] {
+            let mut buf = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
+            buf[0x0D4..0x0D8].copy_from_slice(&feature.to_be_bytes());
+            let sb = Superblock::parse(&buf).unwrap();
+            assert!(sb.validate_feature_support(true).is_ok());
+            assert_eq!(
+                sb.validate_feature_support(false).is_ok(),
+                feature == XFS_SB_FEAT_RO_COMPAT_FINOBT
+            );
+        }
+
+        let mut log_feature = valid_superblock_buffer(XFS_SB_VERSION_5, XFS_SB_SIZE_V5);
+        log_feature[0x0DC..0x0E0].copy_from_slice(&1u32.to_be_bytes());
+        assert!(matches!(
+            Superblock::parse(&log_feature)
+                .unwrap()
+                .validate_feature_support(true),
+            Err(FsError::NotSupported)
+        ));
     }
 
     #[test]

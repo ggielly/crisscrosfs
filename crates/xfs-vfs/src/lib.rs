@@ -53,6 +53,7 @@ mod inode_allocator;
 mod inode_write;
 mod io;
 mod journal;
+mod name_mangling;
 mod read_ops;
 mod transaction;
 mod writer;

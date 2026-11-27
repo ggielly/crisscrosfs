@@ -10,7 +10,7 @@ use winfsp::{
 };
 
 use crate::{
-    context::VfsContext,
+    context::{BlockingIoPool, VfsContext},
     error::{Result, XfsWinfspError},
 };
 
@@ -23,6 +23,20 @@ use crate::{
 /// in `stop()` / `Drop` rather than hidden inside `thread::join()`.
 type SharedHost = Arc<Mutex<Option<FileSystemHost<VfsContext>>>>;
 
+const WRITABLE_INFO_TIMEOUT_MS: u32 = 1_000;
+const READ_ONLY_INFO_TIMEOUT_MS: u32 = u32::MAX;
+
+/// Dispatcher settings that can be tuned without changing the mount lifecycle
+/// API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatcherConfig {
+    /// Number of WinFsp dispatcher threads. Zero selects WinFsp's default.
+    pub thread_count: u32,
+    /// Blocking VFS workers used to complete async WinFsp callbacks.
+    /// Zero selects the built-in default.
+    pub io_workers: u32,
+}
+
 /// Handle to a running mount. Dropping will stop the mount thread.
 pub struct MountHandle {
     /// Shared access to the WinFsp host; `stop` takes ownership to drive
@@ -34,6 +48,8 @@ pub struct MountHandle {
     thread: Option<thread::JoinHandle<()>>,
     mount_point: String,
     filesystem: Option<Arc<dyn fs_abstraction::VfsFileSystem>>,
+    /// Workers that complete pending WinFsp read/write responses.
+    io_pool: BlockingIoPool,
 }
 
 impl MountHandle {
@@ -68,15 +84,20 @@ impl MountHandle {
         // stop() calls FspFileSystemStopDispatcher which blocks until all
         // in-flight dispatcher threads drain.  This blocking happens HERE,
         // in an explicit call — not opaquely inside thread::join().
-        if let Ok(mut guard) = self.host.lock() {
-            if let Some(mut h) = guard.take() {
-                h.unmount();
-                h.stop();
-                // h is dropped here; FileSystemHost::Drop calls unmount/stop
-                // again but FspFileSystemRemoveMountPoint and
-                // FspFileSystemStopDispatcher are both safe to call on an
-                // already-stopped host (no-ops).
-            }
+        let host = self
+            .host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(mut host) = host {
+            host.unmount();
+            // Pending async callbacks call FspFileSystemSendResponse. Drain
+            // them while the WinFsp object and request/context storage are
+            // still valid, then stop the dispatcher and destroy the host.
+            self.io_pool.shutdown_and_wait();
+            host.stop();
+        } else {
+            self.io_pool.shutdown_and_wait();
         }
         // Now that WinFsp is stopped, tell the background thread it can exit.
         // The thread is blocked on stop_rx.recv() doing nothing; this unblocks
@@ -124,6 +145,19 @@ pub fn start_mount(
     fs: Arc<dyn fs_abstraction::VfsFileSystem>,
     debug_enabled: bool,
 ) -> Result<MountHandle> {
+    start_mount_with_config(mount_point, fs, debug_enabled, DispatcherConfig::default())
+}
+
+/// Start a mount with explicit WinFsp dispatcher settings.
+///
+/// This is an additive alternative to [`start_mount`]; existing callers retain
+/// WinFsp's default dispatcher sizing by passing [`DispatcherConfig::default`].
+pub fn start_mount_with_config(
+    mount_point: &str,
+    fs: Arc<dyn fs_abstraction::VfsFileSystem>,
+    debug_enabled: bool,
+    dispatcher: DispatcherConfig,
+) -> Result<MountHandle> {
     info!("Starting VFS mount at {}", mount_point);
 
     // The `winfsp` crate unwraps `GetStdHandle(STD_ERROR_HANDLE)` when its
@@ -143,6 +177,17 @@ pub fn start_mount(
                 .to_string(),
         )
     })?;
+
+    let io_workers = if dispatcher.io_workers == 0 {
+        crate::context::DEFAULT_IO_WORKERS
+    } else {
+        usize::try_from(dispatcher.io_workers).map_err(|_| {
+            XfsWinfspError::InvalidArgument("I/O worker count exceeds usize".to_string())
+        })?
+    };
+    let io_pool = BlockingIoPool::new(io_workers)
+        .map_err(|error| XfsWinfspError::WinFspError(error.to_string()))?;
+    let io_pool_for_context = io_pool.clone();
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), XfsWinfspError>>();
@@ -167,9 +212,11 @@ pub fn start_mount(
                     fs,
                     mount_point_owned,
                     debug_enabled,
+                    dispatcher.thread_count,
                     ready_tx,
                     stop_rx,
                     host_arc_for_thread,
+                    io_pool_for_context,
                 );
             }));
 
@@ -196,6 +243,7 @@ pub fn start_mount(
                 thread: Some(thread),
                 mount_point: mount_point_for_handle,
                 filesystem: Some(filesystem_for_handle),
+                io_pool,
             })
         }
         Ok(Err(e)) => {
@@ -215,13 +263,16 @@ pub fn start_mount(
 ///
 /// Runs inside `catch_unwind` so a panic is reported to the caller instead of
 /// surfacing as a closed channel.
+#[allow(clippy::too_many_arguments)]
 fn run_mount_thread(
     fs: Arc<dyn fs_abstraction::VfsFileSystem>,
     mount_point: String,
     debug_enabled: bool,
+    dispatcher_threads: u32,
     ready_tx: mpsc::Sender<std::result::Result<(), XfsWinfspError>>,
     stop_rx: mpsc::Receiver<()>,
     host_arc: SharedHost,
+    io_pool: BlockingIoPool,
 ) {
     // Derive volume geometry/serial from the filesystem instead of
     // hardcoding values that are identical for every mounted volume.
@@ -251,7 +302,14 @@ fn run_mount_thread(
 
     // Build context using the generic VfsContext. The mount root is
     // also the confinement boundary for absolute symlink targets.
-    let ctx = match VfsContext::new(fs.clone(), volume_label, mount_point.clone()) {
+    let read_only = fs.capabilities().read_only;
+    let ctx = match VfsContext::with_io_pool(
+        fs.clone(),
+        volume_label,
+        mount_point.clone(),
+        crate::security::AclMapper::new(read_only),
+        io_pool,
+    ) {
         Ok(ctx) => ctx,
         Err(error) => {
             let _ = ready_tx.send(Err(XfsWinfspError::from(error)));
@@ -260,27 +318,51 @@ fn run_mount_thread(
     };
 
     // Configure volume parameters
+    let info_timeout_ms = info_timeout_for(read_only);
     let mut volume_params = VolumeParams::default();
     volume_params.filesystem_name(fs.fs_type());
     volume_params.volume_serial_number(volume_serial);
     volume_params.sector_size(sector_size);
     volume_params.sectors_per_allocation_unit(sectors_per_allocation_unit);
     // WinFsp's mount policy must match the backend exactly.
-    volume_params.read_only_volume(fs.capabilities().read_only);
+    volume_params.read_only_volume(read_only);
     volume_params.reparse_points(true);
     // ACL modification/persistence is not implemented by the glue.
     volume_params.persistent_acls(false);
-    volume_params.case_sensitive_search(true);
+    volume_params.case_sensitive_search(!fs.is_case_insensitive_lookup());
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
     volume_params.max_component_length(255);
-    volume_params.flush_and_purge_on_cleanup(false);
+    // Writable metadata may become stale quickly. Read-only metadata can remain
+    // cached for the lifetime of the mount (WinFsp's infinite timeout).
+    // winfsp-rs 0.12 does not expose the V1 timeout-valid bits, so WinFsp 2.1
+    // inherits the specific timeouts from FileInfoTimeout; keep them equal.
+    volume_params.file_info_timeout(info_timeout_ms);
+    volume_params.dir_info_timeout(info_timeout_ms);
+    volume_params.security_timeout(info_timeout_ms);
+    volume_params.volume_info_timeout(info_timeout_ms);
+    // The VFS has no alternate streams or WSL-specific protocol support.
+    volume_params.named_streams(false);
+    volume_params.wsl_features(false);
+    // WinFsp 2.1 and winfsp-rs 0.12 can forward the caller's search expression
+    // as a filtering hint. WinFsp still performs the authoritative final match.
+    volume_params.pass_query_directory_pattern(true);
+    volume_params.post_disposition_only_when_necessary(true);
+    // Purge dirty writable data at cleanup, but retain read-only standby
+    // caching.
+    volume_params.flush_and_purge_on_cleanup(!read_only);
     volume_params.post_cleanup_when_modified_only(true);
+    volume_params.allow_open_in_kernel_mode(true);
 
     debug!(
         "FileSystemHost VolumeParams configured (sector_size={}, sectors_per_allocation_unit={}, \
-         serial=0x{:08X})",
-        sector_size, sectors_per_allocation_unit, volume_serial
+         serial=0x{:08X}, read_only={}, info_timeout_ms={}, dispatcher_threads={})",
+        sector_size,
+        sectors_per_allocation_unit,
+        volume_serial,
+        read_only,
+        info_timeout_ms,
+        dispatcher_threads
     );
 
     // Only enable WinFsp tracing when the caller asked for it.
@@ -291,8 +373,10 @@ fn run_mount_thread(
     };
     debug!("FileSystemParams created (debug={})", debug_enabled);
 
-    // Create filesystem host with full options
-    match FileSystemHost::new_with_options(fs_params, ctx) {
+    // Use WinFsp 0.12's true async Read/Write interface. The callbacks return
+    // STATUS_PENDING and the adapter later sends FspFileSystemSendResponse;
+    // blocking VFS work is confined to the bounded pool in VfsContext.
+    match FileSystemHost::new_with_options_async(fs_params, ctx) {
         Ok(mut host) => {
             debug!("Mounting at: {}", mount_point);
 
@@ -305,14 +389,15 @@ fn run_mount_thread(
 
             info!("Filesystem mounted at {}", mount_point);
 
-            // Start the WinFsp dispatcher.
-            // FspFileSystemStartDispatcher spawns worker threads and
-            // returns immediately — it is NOT blocking. The dispatcher
-            // runs autonomously until FspFileSystemStopDispatcher
-            // is called, which happens in MountHandle::stop() / Drop,
-            // not here.
-            if let Err(e) = host.start() {
-                let err_msg = format!("Dispatcher start failed: {:?}", e);
+            // Start the WinFsp dispatcher. A zero thread count preserves
+            // WinFsp's default sizing; an explicit count is passed through to
+            // FspFileSystemStartDispatcher. This call returns immediately and
+            // the dispatcher runs until MountHandle::stop() / Drop stops it.
+            if let Err(e) = host.start_with_threads(dispatcher_threads) {
+                let err_msg = format!(
+                    "Dispatcher start failed (threads={}): {:?}",
+                    dispatcher_threads, e
+                );
                 error!("{}", err_msg);
                 let _ = ready_tx.send(Err(XfsWinfspError::WinFspError(err_msg)));
                 return;
@@ -388,7 +473,7 @@ fn ensure_standard_error() {
 }
 
 /// Describe a panic payload captured by `catch_unwind`.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()
     } else if let Some(text) = payload.downcast_ref::<String>() {
@@ -419,6 +504,14 @@ impl Default for XfsMountOptions {
     }
 }
 
+fn info_timeout_for(read_only: bool) -> u32 {
+    if read_only {
+        READ_ONLY_INFO_TIMEOUT_MS
+    } else {
+        WRITABLE_INFO_TIMEOUT_MS
+    }
+}
+
 /// Derive WinFsp geometry so the allocation unit equals the XFS block size.
 /// WinFsp's sector size remains the conventional 512 bytes; larger XFS blocks
 /// are represented by SectorsPerAllocationUnit rather than being clamped.
@@ -439,6 +532,18 @@ fn volume_serial_number(uuid: Option<[u8; 16]>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn info_timeouts_match_volume_mutability() {
+        assert_eq!(info_timeout_for(false), 1_000);
+        assert_eq!(info_timeout_for(true), u32::MAX);
+    }
+
+    #[test]
+    fn dispatcher_default_preserves_winfsp_thread_sizing() {
+        assert_eq!(DispatcherConfig::default().thread_count, 0);
+        assert_eq!(DispatcherConfig::default().io_workers, 0);
+    }
 
     #[test]
     fn geometry_uses_xfs_block_size_as_allocation_unit() {

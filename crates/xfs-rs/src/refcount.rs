@@ -79,10 +79,10 @@ impl RefcountTree {
             .checked_mul(ag_blocks as u64)
             .and_then(|value| value.checked_add(ag_block as u64))
             .ok_or(FsError::ArithmeticOverflow)?;
-        let disk_address = absolute
-            .checked_mul(block_size as u64)
-            .and_then(|value| value.checked_div(sector_size as u64))
-            .ok_or(FsError::ArithmeticOverflow)?;
+        if sector_size < 512 || sector_size > block_size || !sector_size.is_power_of_two() {
+            return Err(FsError::InvalidArgument);
+        }
+        let disk_address = crate::address::fs_block_to_daddr(absolute, block_size)?;
         if raw.read_be_u64(16)? != disk_address
             || raw.read_be_u32(48)? != ag_number
             || raw[32..48] != uuid
@@ -130,10 +130,10 @@ impl RefcountTree {
             .checked_mul(ag_blocks as u64)
             .and_then(|value| value.checked_add(ag_block as u64))
             .ok_or(FsError::ArithmeticOverflow)?;
-        let disk_address = absolute
-            .checked_mul(block_size as u64)
-            .and_then(|value| value.checked_div(sector_size as u64))
-            .ok_or(FsError::ArithmeticOverflow)?;
+        if sector_size < 512 || sector_size > block_size || !sector_size.is_power_of_two() {
+            return Err(FsError::InvalidArgument);
+        }
+        let disk_address = crate::address::fs_block_to_daddr(absolute, block_size)?;
         let mut raw = vec![0u8; block_size];
         raw[0..4].copy_from_slice(&XFS_REFCOUNT_CRC_MAGIC.to_be_bytes());
         raw[6..8].copy_from_slice(&(self.records.len() as u16).to_be_bytes());

@@ -103,6 +103,28 @@ pub const XFS_MAX_INODE_SIZE: usize = 2048;
 /// Directory entry header size (without name).
 pub const XFS_DIR2_DATA_ENTRY_HDR_SIZE: usize = 8;
 
+/// Directory data entries and free-space records are 8-byte aligned.
+pub const XFS_DIR2_DATA_ALIGN: usize = 8;
+
+/// Free-space tag used by `xfs_dir2_data_unused`.
+pub const XFS_DIR2_DATA_FREE_TAG: u16 = 0xFFFF;
+
+/// Null data pointer used by stale leaf entries.
+pub const XFS_DIR2_NULL_DATAPTR: u32 = 0;
+
+/// Size of one directory address-space region. Data, leaf and free-index
+/// regions are separated by 32 GiB boundaries.
+pub const XFS_DIR2_SPACE_SIZE: u64 = 1 << 35;
+
+/// Byte offset of the leaf/node address space.
+pub const XFS_DIR2_LEAF_OFFSET: u64 = XFS_DIR2_SPACE_SIZE;
+
+/// Byte offset of the free-index address space.
+pub const XFS_DIR2_FREE_OFFSET: u64 = 2 * XFS_DIR2_SPACE_SIZE;
+
+/// Maximum number of levels in an XFS DA node tree (`XFS_DA_NODE_MAXDEPTH`).
+pub const XFS_DA_NODE_MAXDEPTH: u16 = 5;
+
 /// Size of an extent record (128 bits = 16 bytes).
 pub const XFS_EXTENT_SIZE: usize = 16;
 
@@ -147,6 +169,59 @@ pub const XFS_SB_FEAT_INCOMPAT_BIGTIME: u32 = 1 << 3;
 
 /// Feature: Large extent counters.
 pub const XFS_SB_FEAT_INCOMPAT_NREXT64: u32 = 1 << 5;
+
+/// Feature: Filesystem requires repair before it can be mounted read-write.
+pub const XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR: u32 = 1 << 4;
+
+/// Feature: Atomic inode exchange support.
+pub const XFS_SB_FEAT_INCOMPAT_EXCHANGE: u32 = 1 << 6;
+
+/// Feature: Parent inode pointers in directory entries.
+pub const XFS_SB_FEAT_INCOMPAT_PARENT: u32 = 1 << 7;
+
+/// Feature: Metadata directory tree layout.
+pub const XFS_SB_FEAT_INCOMPAT_METADIR: u32 = 1 << 8;
+
+/// Feature: Zoned filesystem allocation geometry.
+pub const XFS_SB_FEAT_INCOMPAT_ZONED: u32 = 1 << 9;
+
+/// Read-only compatible feature: Free inode B+tree.
+pub const XFS_SB_FEAT_RO_COMPAT_FINOBT: u32 = 1 << 0;
+
+/// Read-only compatible feature: Shared file extents (reflink).
+pub const XFS_SB_FEAT_RO_COMPAT_REFLINK: u32 = 1 << 1;
+
+/// Read-only compatible feature: Reverse mapping B+tree.
+pub const XFS_SB_FEAT_RO_COMPAT_RMAPBT: u32 = 1 << 2;
+
+/// Read-only compatible feature: Inode B+tree block counters.
+pub const XFS_SB_FEAT_RO_COMPAT_INOBTCNT: u32 = 1 << 3;
+
+/// Read-only compatible feature: Legacy sparse inode marker.
+pub const XFS_SB_FEAT_RO_COMPAT_SPARSE: u32 = 1 << 4;
+
+/// Every incompatible feature bit currently understood by the parser.
+///
+/// Parsing a known bit does not imply that the VFS supports its semantics.
+/// Call [`crate::Superblock::validate_feature_support`] for the mount-mode
+/// policy.
+pub const XFS_SB_FEAT_INCOMPAT_KNOWN: u32 = XFS_SB_FEAT_INCOMPAT_FTYPE
+    | XFS_SB_FEAT_INCOMPAT_SPINODES
+    | XFS_SB_FEAT_INCOMPAT_META_UUID
+    | XFS_SB_FEAT_INCOMPAT_BIGTIME
+    | XFS_SB_FEAT_INCOMPAT_NEEDSREPAIR
+    | XFS_SB_FEAT_INCOMPAT_NREXT64
+    | XFS_SB_FEAT_INCOMPAT_EXCHANGE
+    | XFS_SB_FEAT_INCOMPAT_PARENT
+    | XFS_SB_FEAT_INCOMPAT_METADIR
+    | XFS_SB_FEAT_INCOMPAT_ZONED;
+
+/// Every read-only compatible feature bit currently understood by the parser.
+pub const XFS_SB_FEAT_RO_COMPAT_KNOWN: u32 = XFS_SB_FEAT_RO_COMPAT_FINOBT
+    | XFS_SB_FEAT_RO_COMPAT_REFLINK
+    | XFS_SB_FEAT_RO_COMPAT_RMAPBT
+    | XFS_SB_FEAT_RO_COMPAT_INOBTCNT
+    | XFS_SB_FEAT_RO_COMPAT_SPARSE;
 
 // ─── Inode Format Types ───────────────────────────────────────────────────
 

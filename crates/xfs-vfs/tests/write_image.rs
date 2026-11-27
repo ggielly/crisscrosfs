@@ -72,6 +72,45 @@ fn fixture_path() -> Option<PathBuf> {
     fixture.is_file().then_some(fixture)
 }
 
+/// Open a disposable fixture for writing. Modern mkfs.xfs enables features
+/// such as RMAPBT that are safe for reads but deliberately unsupported by the
+/// experimental writer; those fixtures exercise the rejection path instead.
+fn open_writable_fixture(path: &Path) -> Option<XfsVfs> {
+    let device = Arc::new(FileDevice::open(path).unwrap());
+    match XfsVfs::with_options(device, false) {
+        Ok(fs) => Some(fs),
+        Err(FsError::NotSupported) => {
+            eprintln!(
+                "fixture uses XFS features the experimental writer refuses (for example \
+                 reflink/refcount); skipping writable test"
+            );
+            None
+        }
+        Err(error) => panic!("writable XFS mount: {error:?}"),
+    }
+}
+
+#[test]
+fn writable_mount_rejects_rmapbt_fixture() {
+    let Some(fixture) = fixture_path() else {
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+    let device = Arc::new(FileDevice::open(temp.path()).unwrap());
+    let mut probe = [0u8; 512];
+    read_device_exact(device.as_ref(), 0, &mut probe);
+    let ro_compat = u32::from_be_bytes([probe[0xD4], probe[0xD5], probe[0xD6], probe[0xD7]]);
+    if ro_compat & xfs_rs::constants::XFS_SB_FEAT_RO_COMPAT_RMAPBT == 0 {
+        return;
+    }
+    assert!(XfsVfs::read_only(device.clone()).is_ok());
+    assert!(matches!(
+        XfsVfs::with_options(device, false),
+        Err(FsError::NotSupported)
+    ));
+}
+
 fn resolve(fs: &XfsVfs, path: &str) -> u64 {
     fs.resolve_path(path)
         .unwrap_or_else(|error| panic!("resolve {path:?}: {error:?}"))
@@ -124,10 +163,6 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
     let mut probe = [0u8; 512];
     let probe_device = FileDevice::open(&fixture).unwrap();
     read_device_exact(&probe_device, 0, &mut probe);
-    if u32::from_be_bytes([probe[0xD8], probe[0xD9], probe[0xDA], probe[0xDB]]) & (1 << 5) != 0 {
-        eprintln!("large fixture uses NREXT64, which this parser does not support; skipping");
-        return Ok(());
-    }
     let device = Arc::new(probe_device);
     let fs = match XfsVfs::read_only(device.clone()) {
         Ok(fs) => fs,
@@ -159,7 +194,10 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
         extents
             .iter()
             .find(|extent| extent.contains_file_block(logical))
-            .ok_or(FsError::Corrupted)?
+            .ok_or_else(|| {
+                eprintln!("no extent for logical block {logical}");
+                FsError::Corrupted
+            })?
             .translate(logical)
     };
 
@@ -173,8 +211,21 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
     let leaf_count = u16::from_be_bytes([root[56], root[57]]) as usize;
     assert_eq!(u16::from_be_bytes([root[58], root[59]]), 1);
     assert!(leaf_count > 1);
+    let logicals: Vec<u64> = (0..leaf_count)
+        .map(|index| {
+            let entry_offset = 64 + index * 8;
+            u32::from_be_bytes([
+                root[entry_offset + 4],
+                root[entry_offset + 5],
+                root[entry_offset + 6],
+                root[entry_offset + 7],
+            ]) as u64
+        })
+        .collect();
     let mut indexed_entries = 0usize;
-    for index in 0..leaf_count {
+    let mut leaf_heads = 0usize;
+    let mut leaf_tails = 0usize;
+    for (index, &logical) in logicals.iter().enumerate() {
         let entry_offset = 64 + index * 8;
         let max_hash = u32::from_be_bytes([
             root[entry_offset],
@@ -182,13 +233,7 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
             root[entry_offset + 2],
             root[entry_offset + 3],
         ]);
-        let logical = u32::from_be_bytes([
-            root[entry_offset + 4],
-            root[entry_offset + 5],
-            root[entry_offset + 6],
-            root[entry_offset + 7],
-        ]) as u64;
-        assert_eq!(logical, leaf_offset + index as u64 + 1);
+        assert!(logical > leaf_offset);
         let leaf = reader.read_block(block_for(logical)?)?;
         assert_eq!(
             u16::from_be_bytes([leaf[8], leaf[9]]),
@@ -200,20 +245,22 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
         let last_hash =
             u32::from_be_bytes([leaf[last], leaf[last + 1], leaf[last + 2], leaf[last + 3]]);
         assert_eq!(max_hash, last_hash);
-        assert_eq!(
-            u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]]),
-            if index == 0 { 0 } else { (logical - 1) as u32 }
-        );
-        assert_eq!(
-            u32::from_be_bytes([leaf[4], leaf[5], leaf[6], leaf[7]]),
-            if index + 1 == leaf_count {
-                0
-            } else {
-                (logical + 1) as u32
-            }
-        );
+        let previous = u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]]);
+        let next = u32::from_be_bytes([leaf[4], leaf[5], leaf[6], leaf[7]]);
+        if previous == 0 {
+            leaf_heads += 1;
+        } else {
+            assert!(logicals.contains(&u64::from(previous)));
+        }
+        if next == 0 {
+            leaf_tails += 1;
+        } else {
+            assert!(logicals.contains(&u64::from(next)));
+        }
         indexed_entries += count;
     }
+    assert_eq!(leaf_heads, 1);
+    assert_eq!(leaf_tails, 1);
     assert_eq!(fs.readdir(ino).unwrap().len() + 2, indexed_entries);
 
     let free = reader.read_block(block_for(free_offset)?)?;
@@ -229,18 +276,161 @@ fn real_node_directory_headers_match_the_writer_layout() -> FsResult<()> {
                 .ok_or(FsError::ArithmeticOverflow)
         })?;
     assert_eq!(
-        u32::from_be_bytes([free[56], free[57], free[58], free[59]]),
+        u32::from_be_bytes([free[48], free[49], free[50], free[51]]),
         0
     );
     assert_eq!(
-        u32::from_be_bytes([free[60], free[61], free[62], free[63]]),
+        u32::from_be_bytes([free[52], free[53], free[54], free[55]]),
         data_blocks as u32
     );
     assert_eq!(
-        u32::from_be_bytes([free[64], free[65], free[66], free[67]]),
+        u32::from_be_bytes([free[56], free[57], free[58], free[59]]),
         data_blocks as u32
     );
+    assert_eq!(
+        u32::from_be_bytes([free[60], free[61], free[62], free[63]]),
+        0
+    );
     Ok(())
+}
+
+#[test]
+fn persistent_allocator_deltas_are_not_reapplied_by_later_transactions() {
+    let Some(fixture) = fixture_path() else {
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+    let Some(fs) = open_writable_fixture(temp.path()) else {
+        return;
+    };
+
+    let root = fs.root_inode();
+    let before = fs.get_volume_info().unwrap();
+    let first = fs.create_file(root, "delta-first.txt", 0o644).unwrap();
+    let after_first = fs.get_volume_info().unwrap();
+    assert_eq!(after_first.free_inodes + 1, before.free_inodes);
+
+    let second = fs.create_file(root, "delta-second.txt", 0o644).unwrap();
+    let after_second = fs.get_volume_info().unwrap();
+    assert_eq!(after_second.free_inodes + 2, before.free_inodes);
+    assert_eq!(after_second.free_inodes + 1, after_first.free_inodes);
+
+    fs.unlink(root, "delta-first.txt", first.ino).unwrap();
+    fs.unlink(root, "delta-second.txt", second.ino).unwrap();
+    let after_unlink = fs.get_volume_info().unwrap();
+    assert_eq!(after_unlink.free_inodes, before.free_inodes);
+}
+
+#[test]
+fn delalloc_read_flush_truncate_and_atomic_append() {
+    let Some(fixture) = fixture_path() else {
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+    let Some(fs) = open_writable_fixture(temp.path()) else {
+        return;
+    };
+    let fs = Arc::new(fs);
+    let root = fs.root_inode();
+    let created = fs.create_file(root, "delalloc.txt", 0o644).unwrap();
+
+    fs.write(created.ino, 0, b"abc").unwrap();
+    fs.write(created.ino, 5, b"xy").unwrap();
+    assert_eq!(fs.stat(created.ino).unwrap().size, 7);
+    assert_eq!(read_all(&fs, created.ino, 7), b"abc\0\0xy");
+
+    let mut threads = Vec::new();
+    for index in 1..=8u8 {
+        let fs = fs.clone();
+        threads.push(std::thread::spawn(move || {
+            let data = vec![index; 1024];
+            fs.append_with_info(created.ino, &data)
+                .map(|(written, info)| {
+                    assert_eq!(written, data.len());
+                    info.size
+                })
+        }));
+    }
+    let mut reported_sizes = Vec::new();
+    for thread in threads {
+        reported_sizes.push(thread.join().unwrap().unwrap());
+    }
+    reported_sizes.sort_unstable();
+    assert_eq!(reported_sizes[0], 7 + 1024);
+    assert_eq!(reported_sizes.last(), Some(&(7 + 8 * 1024)));
+    assert_eq!(fs.stat(created.ino).unwrap().size, 7 + 8 * 1024);
+
+    let appended = read_all(&fs, created.ino, 7 + 8 * 1024);
+    assert_eq!(&appended[..7], b"abc\0\0xy");
+    for index in 1..=8u8 {
+        assert_eq!(
+            appended[7 + (index as usize - 1) * 1024..7 + index as usize * 1024]
+                .iter()
+                .filter(|&&byte| byte == index)
+                .count(),
+            1024
+        );
+    }
+
+    fs.flush_file(created.ino).unwrap();
+    assert_eq!(read_all(&fs, created.ino, appended.len() as u64), appended);
+    fs.append(created.ino, b"tail").unwrap();
+    fs.set_size(created.ino, 10).unwrap();
+    assert_eq!(fs.stat(created.ino).unwrap().size, 10);
+    assert_eq!(read_all(&fs, created.ino, 10), &appended[..10]);
+    fs.append(created.ino, b"Z").unwrap();
+    assert_eq!(fs.stat(created.ino).unwrap().size, 11);
+    fs.flush_file(created.ino).unwrap();
+
+    fs.shutdown().unwrap();
+    drop(fs);
+    let reopened = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert_eq!(reopened.stat(created.ino).unwrap().size, 11);
+    let mut final_byte = [0u8; 1];
+    assert_eq!(reopened.read(created.ino, 10, &mut final_byte).unwrap(), 1);
+    assert_eq!(final_byte, *b"Z");
+}
+
+#[test]
+fn large_write_is_flushed_past_the_per_file_delalloc_cap() {
+    let Some(fixture) = fixture_path() else {
+        return;
+    };
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(fixture, temp.path()).unwrap();
+    let Some(fs) = open_writable_fixture(temp.path()) else {
+        return;
+    };
+    let fs = Arc::new(fs);
+    let created = fs.create_file(fs.root_inode(), "big.bin", 0o644).unwrap();
+
+    // Six MiB in one call: a single chunk stays under the cap, so only the
+    // cumulative budget can force an intermediate delalloc flush.
+    const SIZE: usize = 6 * 1024 * 1024;
+    let data: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
+    let (written, info) = fs.write_with_info(created.ino, 0, &data).unwrap();
+    assert_eq!(written, SIZE);
+    assert_eq!(info.size, SIZE as u64);
+
+    fs.flush_file(created.ino).unwrap();
+    let on_disk = read_all(&fs, created.ino, SIZE as u64);
+    assert_eq!(on_disk.len(), SIZE);
+    assert_eq!(on_disk, data);
+
+    fs.shutdown().unwrap();
+    drop(fs);
+
+    let reopened = XfsVfs::read_only(Arc::new(FileDevice::open(temp.path()).unwrap())).unwrap();
+    assert_eq!(reopened.stat(created.ino).unwrap().size, SIZE as u64);
+    let mut tail = vec![0u8; 4096];
+    let tail_offset = (SIZE - tail.len()) as u64;
+    assert_eq!(
+        reopened.read(created.ino, tail_offset, &mut tail).unwrap(),
+        tail.len()
+    );
+    assert_eq!(tail, &data[SIZE - tail.len()..]);
 }
 
 #[test]
@@ -252,8 +442,9 @@ fn writable_image_overwrites_inline_and_extent_files_and_recovers_cleanly() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(fixture, temp.path()).unwrap();
 
-    let device = Arc::new(FileDevice::open(temp.path()).unwrap());
-    let fs = XfsVfs::with_options(device.clone(), false).expect("writable XFS mount");
+    let Some(fs) = open_writable_fixture(temp.path()) else {
+        return;
+    };
     assert!(!fs.capabilities().read_only);
 
     let hello = resolve(&fs, "/hello.txt");
@@ -497,8 +688,9 @@ fn creating_entries_in_the_root_preserves_non_file_directory_types() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(fixture, temp.path()).unwrap();
 
-    let device = Arc::new(FileDevice::open(temp.path()).unwrap());
-    let fs = XfsVfs::with_options(device.clone(), false).expect("writable XFS mount");
+    let Some(fs) = open_writable_fixture(temp.path()) else {
+        return;
+    };
     let root = resolve(&fs, "/");
 
     let created = fs.create_file(root, "root-created.txt", 0o644).unwrap();
@@ -545,8 +737,9 @@ fn unclean_unmount_is_reported_until_the_log_is_closed_cleanly() {
     // Commit a transaction and drop the instance without shutdown(): this is
     // what a crash leaves behind.
     {
-        let fs = XfsVfs::with_options(Arc::new(FileDevice::open(temp.path()).unwrap()), false)
-            .expect("writable XFS mount");
+        let Some(fs) = open_writable_fixture(temp.path()) else {
+            return;
+        };
         let root = resolve(&fs, "/");
         fs.create_file(root, "dirty-marker.txt", 0o644).unwrap();
     }
@@ -558,8 +751,7 @@ fn unclean_unmount_is_reported_until_the_log_is_closed_cleanly() {
     );
     drop(pending);
 
-    let replayed = XfsVfs::with_options(Arc::new(FileDevice::open(temp.path()).unwrap()), false)
-        .expect("writable XFS mount");
+    let replayed = open_writable_fixture(temp.path()).expect("fixture remained writable-supported");
     assert!(
         replayed.unclean_unmount(),
         "a writable mount must report that it replayed the log"

@@ -8,7 +8,7 @@ use xfs_rs::{
     Inode,
 };
 
-use crate::io::ClosureBlockReader;
+use crate::io::{VfsBlockReader, XfsBtreeReader};
 
 /// Read file data from an XFS inode.
 pub fn read_file_data(
@@ -18,7 +18,7 @@ pub fn read_file_data(
     block_size: u32,
     total_blocks: u64,
     is_v5: bool,
-    read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
 ) -> FsResult<usize> {
     let file_size = inode.core.size;
 
@@ -51,7 +51,7 @@ pub fn read_file_data(
             &mut buf[..to_read],
             block_size,
             total_blocks,
-            read_block,
+            reader,
         ),
         DataFork::Btree {
             level,
@@ -62,12 +62,13 @@ pub fn read_file_data(
             let root = BmbtRoot::parse(data, *level, *num_recs)?;
             read_btree_data(
                 &root,
+                inode.core.ino,
                 offset,
                 &mut buf[..to_read],
                 block_size,
                 total_blocks,
                 is_v5,
-                read_block,
+                reader,
             )
         }
         _ => Err(FsError::NotSupported),
@@ -92,18 +93,36 @@ fn read_local_data(data: &[u8], offset: u64, buf: &mut [u8]) -> FsResult<usize> 
 
 /// Read data from extent-based storage.
 ///
-/// Reads are done one logical filesystem block at a time.  Any logical block
-/// not covered by a written extent (a hole or an unwritten/preallocated
-/// extent) is filled with zeroes instead of copying bytes from an unrelated
-/// extent.  Extents are validated for ordering/overlap and all arithmetic is
-/// checked.
-fn read_extent_data(
+/// Each written extent segment covered by the request is read with one
+/// positional I/O directly into the caller's buffer. There is no per-block
+/// allocation or intermediate copy. Holes and unwritten extents are zeroed.
+pub(crate) fn read_extent_data(
     extents: &[Extent],
     offset: u64,
     buf: &mut [u8],
     block_size: u32,
     total_blocks: u64,
-    read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
+) -> FsResult<usize> {
+    if block_size == 0 {
+        return Err(FsError::Corrupted);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    validate_extents(extents, u64::from(block_size), total_blocks)?;
+
+    read_extent_data_validated(extents, offset, buf, block_size, total_blocks, reader)
+}
+
+/// Read an extent map that was validated when it entered the in-core cache.
+pub(crate) fn read_extent_data_validated(
+    extents: &[Extent],
+    offset: u64,
+    buf: &mut [u8],
+    block_size: u32,
+    _total_blocks: u64,
+    reader: &impl VfsBlockReader,
 ) -> FsResult<usize> {
     let block_size = u64::from(block_size);
     if block_size == 0 {
@@ -113,78 +132,112 @@ fn read_extent_data(
         return Ok(0);
     }
 
-    validate_extents(extents, block_size, total_blocks)?;
-
     let buffer_len = u64::try_from(buf.len()).map_err(|_| FsError::ArithmeticOverflow)?;
     let end = offset
         .checked_add(buffer_len)
         .ok_or(FsError::ArithmeticOverflow)?;
 
     let mut written = 0usize;
-    let mut current_offset = offset;
-    let mut extent_index = 0usize;
+    let mut current = offset;
+    let mut index = extents.partition_point(|extent| {
+        // `validate_extents` has already checked every file_end.
+        extent
+            .file_offset
+            .saturating_add(u64::from(extent.block_count))
+            * block_size
+            <= current
+    });
 
-    while current_offset < end {
-        let logical_block = current_offset / block_size;
-        let block_start = logical_block
-            .checked_mul(block_size)
-            .ok_or(FsError::ArithmeticOverflow)?;
-        let chunk_end = std::cmp::min(
-            block_start
-                .checked_add(block_size)
+    while current < end {
+        let extent = extents.get(index);
+        let extent_start = match extent {
+            Some(extent) => extent
+                .file_offset
+                .checked_mul(block_size)
                 .ok_or(FsError::ArithmeticOverflow)?,
-            end,
-        );
-        let chunk_len =
-            usize::try_from(chunk_end - current_offset).map_err(|_| FsError::ArithmeticOverflow)?;
+            None => end,
+        };
+        let extent_end = extent
+            .map(|e| {
+                e.file_end()?
+                    .checked_mul(block_size)
+                    .ok_or(FsError::ArithmeticOverflow)
+            })
+            .transpose()?
+            .unwrap_or(end);
 
-        // Advance past extents that end at or before this logical block.
-        while extent_index < extents.len() && extents[extent_index].file_end()? <= logical_block {
-            extent_index += 1;
+        if current < extent_start {
+            // Hole up to the next extent (or EOF of this request).
+            let run_end = end.min(extent_start);
+            let run_len =
+                usize::try_from(run_end - current).map_err(|_| FsError::ArithmeticOverflow)?;
+            buf[written..written + run_len].fill(0);
+            written += run_len;
+            current = run_end;
+            continue;
         }
 
-        let covering = extents.get(extent_index);
-        let use_extent = match covering {
-            Some(extent) => extent.contains_file_block(logical_block) && !extent.is_unwritten,
-            None => false,
+        let Some(extent) = extent else {
+            let run_len =
+                usize::try_from(end - current).map_err(|_| FsError::ArithmeticOverflow)?;
+            buf[written..written + run_len].fill(0);
+            written += run_len;
+            current = end;
+            continue;
         };
 
-        if use_extent {
-            let extent = covering.expect("checked above");
-            let physical_block = extent.translate(logical_block)?;
-            let block_data = read_block(physical_block)?;
-
-            // The block device must return a complete block.  Zero-filling a
-            // short read would silently fabricate file contents.
-            if block_data.len() < block_size as usize {
-                return Err(FsError::Corrupted);
-            }
-
-            let start_in_block = usize::try_from(current_offset - block_start)
-                .map_err(|_| FsError::ArithmeticOverflow)?;
-            let copy_end = start_in_block
-                .checked_add(chunk_len)
-                .ok_or(FsError::ArithmeticOverflow)?;
-            if copy_end > block_data.len() {
-                return Err(FsError::Corrupted);
-            }
-            let output_end = written
-                .checked_add(chunk_len)
-                .ok_or(FsError::ArithmeticOverflow)?;
-            buf[written..output_end].copy_from_slice(&block_data[start_in_block..copy_end]);
+        let run_end = end.min(extent_end);
+        let run_len =
+            usize::try_from(run_end - current).map_err(|_| FsError::ArithmeticOverflow)?;
+        if extent.is_unwritten {
+            buf[written..written + run_len].fill(0);
         } else {
-            // Hole or unwritten (preallocated) extent: logical zeroes.
-            let output_end = written
-                .checked_add(chunk_len)
-                .ok_or(FsError::ArithmeticOverflow)?;
-            buf[written..output_end].fill(0);
+            let logical_block = current / block_size;
+            let physical_block = extent.translate(logical_block)?;
+            let offset_in_block = current % block_size;
+            reader.read_at(
+                physical_block,
+                offset_in_block,
+                &mut buf[written..written + run_len],
+            )?;
         }
-
-        written += chunk_len;
-        current_offset = chunk_end;
+        written += run_len;
+        current = run_end;
+        if current == extent_end {
+            index += 1;
+        }
     }
 
     Ok(written)
+}
+
+/// EOF-clamped file read using an already validated/cached extent map.
+pub(crate) fn read_file_data_with_extents(
+    inode: &Inode,
+    extents: &[Extent],
+    offset: u64,
+    buf: &mut [u8],
+    block_size: u32,
+    total_blocks: u64,
+    reader: &impl VfsBlockReader,
+) -> FsResult<usize> {
+    if offset >= inode.core.size {
+        return Ok(0);
+    }
+    let available = inode.core.size - offset;
+    let to_read = usize::try_from(available.min(buf.len() as u64))
+        .map_err(|_| FsError::ArithmeticOverflow)?;
+    if to_read == 0 {
+        return Ok(0);
+    }
+    read_extent_data_validated(
+        extents,
+        offset,
+        &mut buf[..to_read],
+        block_size,
+        total_blocks,
+        reader,
+    )
 }
 
 /// Validate extent ordering and both logical and physical bounds.
@@ -225,26 +278,30 @@ pub(crate) fn validate_extents(
 }
 
 /// Read data from btree-based storage.
+#[allow(clippy::too_many_arguments)]
 fn read_btree_data(
     root: &BmbtRoot,
+    owner: u64,
     offset: u64,
     buf: &mut [u8],
     block_size: u32,
     total_blocks: u64,
     is_v5: bool,
-    read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
 ) -> FsResult<usize> {
     // Collect extents with the shared, bounded and cycle-checking xfs-rs
     // walker, then validate physical bounds before reading the requested range.
-    let extents = collect_extents_from_btree(root, is_v5, &read_block)?;
-    read_extent_data(&extents, offset, buf, block_size, total_blocks, read_block)
+    let extents =
+        collect_extents_from_btree_checked(root, is_v5, owner, None, block_size as usize, reader)?;
+    read_extent_data(&extents, offset, buf, block_size, total_blocks, reader)
 }
 
 /// Collect all extents from a btree structure.
-fn collect_extents_from_btree(
+#[cfg(test)]
+pub(crate) fn collect_extents_from_btree(
     root: &BmbtRoot,
     is_v5: bool,
-    read_block: &impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
 ) -> FsResult<Vec<xfs_rs::Extent>> {
     if root.level == 0 || root.num_recs == 0 {
         // A btree-format fork always has a root level >= 1 and at least one
@@ -252,17 +309,47 @@ fn collect_extents_from_btree(
         return Err(FsError::Corrupted);
     }
 
-    let reader = ClosureBlockReader::new(read_block);
+    let reader = XfsBtreeReader(reader);
     btree::btree_collect_extents(root, &reader, is_v5)
 }
 
+/// Collect BMBT extents after checking the owning inode and metadata UUID.
+pub(crate) fn collect_extents_from_btree_checked(
+    root: &BmbtRoot,
+    is_v5: bool,
+    owner: u64,
+    metadata_uuid: Option<[u8; 16]>,
+    block_size: usize,
+    reader: &impl VfsBlockReader,
+) -> FsResult<Vec<xfs_rs::Extent>> {
+    if root.level == 0 || root.num_recs == 0 {
+        return Err(FsError::Corrupted);
+    }
+    let reader = XfsBtreeReader(reader);
+    btree::btree_collect_extents_checked(root, &reader, is_v5, owner, metadata_uuid, block_size)
+}
+
 /// Read symlink target from an XFS inode.
+#[allow(dead_code)] // Public compatibility wrapper; VFS uses the UUID-checked
+                    // form.
 pub fn read_symlink_target(
     inode: &Inode,
     block_size: u32,
     total_blocks: u64,
     is_v5: bool,
-    read_block: impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
+) -> FsResult<String> {
+    read_symlink_target_with_uuid(inode, block_size, total_blocks, is_v5, None, reader)
+}
+
+/// Checked symlink read used by the VFS, including the v5 metadata UUID.
+pub fn read_symlink_target_with_uuid(
+    inode: &Inode,
+    block_size: u32,
+    total_blocks: u64,
+    is_v5: bool,
+    metadata_uuid: Option<[u8; 16]>,
+    reader: &impl VfsBlockReader,
 ) -> FsResult<String> {
     // XFS symlink targets are bounded by MAXPATHLEN (1024 bytes); never trust
     // the on-disk size for an allocation.
@@ -290,15 +377,7 @@ pub fn read_symlink_target(
         _ if !is_v5 => {
             // v4 remote symlink: the target is stored contiguously.
             buf.resize(target_len, 0);
-            let read = read_file_data(
-                inode,
-                0,
-                &mut buf,
-                block_size,
-                total_blocks,
-                is_v5,
-                read_block,
-            )?;
+            let read = read_file_data(inode, 0, &mut buf, block_size, total_blocks, is_v5, reader)?;
             buf.truncate(read);
         }
         DataFork::Extents(extents) => {
@@ -309,7 +388,7 @@ pub fn read_symlink_target(
                 total_blocks,
                 DSYMLINK_HDR_SIZE,
                 DSYMLINK_MAGIC,
-                &read_block,
+                reader,
                 &mut buf,
             )?;
         }
@@ -319,7 +398,14 @@ pub fn read_symlink_target(
             data,
         } => {
             let root = BmbtRoot::parse(data, *level, *num_recs)?;
-            let extents = collect_extents_from_btree(&root, is_v5, &read_block)?;
+            let extents = collect_extents_from_btree_checked(
+                &root,
+                is_v5,
+                inode.core.ino,
+                metadata_uuid,
+                block_size as usize,
+                reader,
+            )?;
             read_remote_symlink_v5(
                 &extents,
                 target_len,
@@ -327,7 +413,7 @@ pub fn read_symlink_target(
                 total_blocks,
                 DSYMLINK_HDR_SIZE,
                 DSYMLINK_MAGIC,
-                &read_block,
+                reader,
                 &mut buf,
             )?;
         }
@@ -351,7 +437,7 @@ fn read_remote_symlink_v5(
     total_blocks: u64,
     header_size: usize,
     magic: &[u8; 4],
-    read_block: &impl Fn(u64) -> FsResult<Vec<u8>>,
+    reader: &impl VfsBlockReader,
     out: &mut Vec<u8>,
 ) -> FsResult<()> {
     let block_size = u64::from(block_size);
@@ -377,10 +463,9 @@ fn read_remote_symlink_v5(
             return Err(FsError::Corrupted);
         }
         let physical = extent.translate(logical_block)?;
-        let block = read_block(physical)?;
-        if block.len() < block_size as usize {
-            return Err(FsError::Corrupted);
-        }
+        let mut block =
+            vec![0u8; usize::try_from(block_size).map_err(|_| FsError::ArithmeticOverflow)?];
+        reader.read_at(physical, 0, &mut block)?;
         if &block[..4] != magic {
             return Err(FsError::Corrupted);
         }
@@ -397,18 +482,76 @@ fn read_remote_symlink_v5(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use xfs_rs::Extent;
 
     use super::*;
 
     const BLOCK: u32 = 16;
 
-    fn reader_for(block: u64) -> FsResult<Vec<u8>> {
-        if block == 10 {
-            Ok(vec![0xAA; BLOCK as usize])
-        } else {
-            Err(FsError::InvalidBlockAddress)
+    struct TestReader {
+        data: Vec<u8>,
+        expected_block: u64,
+        reads: AtomicUsize,
+        panic_on_read: bool,
+    }
+
+    impl TestReader {
+        fn for_block(block: u64) -> Self {
+            Self {
+                data: vec![0xAA; BLOCK as usize],
+                expected_block: block,
+                reads: AtomicUsize::new(0),
+                panic_on_read: false,
+            }
         }
+    }
+
+    impl VfsBlockReader for TestReader {
+        fn read_block(&self, block_num: u64) -> FsResult<Arc<[u8]>> {
+            assert_eq!(block_num, self.expected_block);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::from(self.data.as_slice()))
+        }
+
+        fn read_at(&self, block_num: u64, offset: u64, buf: &mut [u8]) -> FsResult<()> {
+            assert!(!self.panic_on_read, "unexpected data read");
+            assert_eq!(block_num, self.expected_block);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let offset = usize::try_from(offset).unwrap();
+            if offset + buf.len() > self.data.len() {
+                return Err(FsError::Corrupted);
+            }
+            buf.copy_from_slice(&self.data[offset..offset + buf.len()]);
+            Ok(())
+        }
+    }
+
+    fn reader_for(block: u64) -> TestReader {
+        TestReader::for_block(block)
+    }
+
+    #[test]
+    fn contiguous_extent_is_read_with_one_positional_io() {
+        let extents = vec![Extent {
+            file_offset: 0,
+            start_block: 10,
+            block_count: 8,
+            is_unwritten: false,
+        }];
+        let mut reader = reader_for(10);
+        reader.data = (0..128u8).collect();
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader).unwrap(),
+            128
+        );
+        assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(buf, reader.data.as_slice());
     }
 
     #[test]
@@ -422,7 +565,7 @@ mod tests {
         }];
 
         let mut buf = [0x55u8; 32];
-        let n = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, reader_for).unwrap();
+        let n = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader_for(10)).unwrap();
         assert_eq!(n, 32);
         assert_eq!(&buf[..16], &[0u8; 16]);
         assert_eq!(&buf[16..], &[0xAAu8; 16]);
@@ -438,7 +581,7 @@ mod tests {
         }];
 
         let mut buf = [0x55u8; 16];
-        let n = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, reader_for).unwrap();
+        let n = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader_for(10)).unwrap();
         assert_eq!(n, 16);
         assert_eq!(buf, [0u8; 16]);
     }
@@ -462,7 +605,7 @@ mod tests {
 
         let mut buf = [0u8; 16];
         assert!(matches!(
-            read_extent_data(&extents, 0, &mut buf, BLOCK, 100, reader_for),
+            read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader_for(10)),
             Err(FsError::Corrupted)
         ));
     }
@@ -477,7 +620,9 @@ mod tests {
         }];
 
         let mut buf = [0u8; 16];
-        let result = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, |_| Ok(vec![0xAA; 8]));
+        let mut reader = reader_for(10);
+        reader.data.resize(8, 0xAA);
+        let result = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader);
         assert!(matches!(result, Err(FsError::Corrupted)));
     }
 
@@ -491,7 +636,7 @@ mod tests {
         }];
 
         let mut buf = [0x55u8; 20];
-        let read = read_extent_data(&extents, 12, &mut buf, BLOCK, 100, reader_for).unwrap();
+        let read = read_extent_data(&extents, 12, &mut buf, BLOCK, 100, &reader_for(10)).unwrap();
         assert_eq!(read, buf.len());
         assert_eq!(&buf[..4], &[0u8; 4]);
         assert_eq!(&buf[4..], &[0xAAu8; 16]);
@@ -508,7 +653,7 @@ mod tests {
 
         let mut buf = [0x55u8; 32];
         assert_eq!(
-            read_extent_data(&extents, 0, &mut buf, BLOCK, 100, reader_for).unwrap(),
+            read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader_for(10)).unwrap(),
             32
         );
         assert_eq!(&buf[..16], &[0xAAu8; 16]);
@@ -525,10 +670,9 @@ mod tests {
         }];
 
         let mut buf = [0x55u8; 16];
-        let read = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, |_| {
-            panic!("unwritten extent must not be read")
-        })
-        .unwrap();
+        let mut reader = reader_for(10);
+        reader.panic_on_read = true;
+        let read = read_extent_data(&extents, 0, &mut buf, BLOCK, 100, &reader).unwrap();
         assert_eq!(read, 16);
         assert_eq!(buf, [0u8; 16]);
     }
@@ -550,7 +694,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            read_extent_data(&extents, 0, &mut [0u8; 16], BLOCK, 100, reader_for),
+            read_extent_data(&extents, 0, &mut [0u8; 16], BLOCK, 100, &reader_for(10)),
             Err(FsError::Corrupted)
         ));
     }
@@ -564,7 +708,7 @@ mod tests {
             is_unwritten: false,
         }];
         assert!(matches!(
-            read_extent_data(&extents, 0, &mut [0u8; 16], BLOCK, 100, reader_for),
+            read_extent_data(&extents, 0, &mut [0u8; 16], BLOCK, 100, &reader_for(10)),
             Err(FsError::Corrupted)
         ));
     }
@@ -578,7 +722,7 @@ mod tests {
             is_unwritten: false,
         }];
         assert!(matches!(
-            read_extent_data(&zero_length, 0, &mut [0u8; 16], BLOCK, 100, reader_for),
+            read_extent_data(&zero_length, 0, &mut [0u8; 16], BLOCK, 100, &reader_for(10)),
             Err(FsError::Corrupted)
         ));
 
@@ -589,15 +733,13 @@ mod tests {
             is_unwritten: false,
         }];
         assert!(matches!(
-            read_extent_data(&overflowing, 0, &mut [0u8; 16], BLOCK, 100, reader_for),
+            read_extent_data(&overflowing, 0, &mut [0u8; 16], BLOCK, 100, &reader_for(10)),
             Err(FsError::ArithmeticOverflow)
         ));
     }
 
     #[test]
     fn btree_sibling_cycle_is_bounded_and_rejected() {
-        use std::cell::Cell;
-
         use xfs_rs::btree::{BmbtKey, BmbtPtr, BmbtRoot};
 
         let root = BmbtRoot {
@@ -613,15 +755,16 @@ mod tests {
         leaf[16..24].copy_from_slice(&10u64.to_be_bytes()); // right sibling ->
                                                             // self
 
-        let reads = Cell::new(0usize);
-        let result = collect_extents_from_btree(&root, false, &|block| {
-            assert_eq!(block, 10);
-            reads.set(reads.get() + 1);
-            Ok(leaf.clone())
-        });
+        let reader = TestReader {
+            data: leaf,
+            expected_block: 10,
+            reads: AtomicUsize::new(0),
+            panic_on_read: false,
+        };
+        let result = collect_extents_from_btree(&root, false, &reader);
         assert!(matches!(result, Err(FsError::Corrupted)));
         assert_eq!(
-            reads.get(),
+            reader.reads.load(Ordering::SeqCst),
             1,
             "the repeated block must be rejected before a second read"
         );
@@ -630,9 +773,27 @@ mod tests {
 
 #[cfg(test)]
 mod symlink_tests {
+    use std::sync::Arc;
+
     use xfs_rs::Extent;
 
     use super::*;
+
+    struct SymlinkReader(Vec<u8>);
+
+    impl VfsBlockReader for SymlinkReader {
+        fn read_block(&self, block: u64) -> FsResult<Arc<[u8]>> {
+            assert_eq!(block, 5);
+            Ok(Arc::from(self.0.as_slice()))
+        }
+
+        fn read_at(&self, block: u64, offset: u64, buf: &mut [u8]) -> FsResult<()> {
+            assert_eq!(block, 5);
+            let offset = usize::try_from(offset).map_err(|_| FsError::ArithmeticOverflow)?;
+            buf.copy_from_slice(&self.0[offset..offset + buf.len()]);
+            Ok(())
+        }
+    }
 
     fn symlink_inode(target_len: u64) -> Inode {
         let mut buf = vec![0u8; 256];
@@ -656,34 +817,26 @@ mod symlink_tests {
     #[test]
     fn v5_remote_symlink_skips_block_header() {
         let inode = symlink_inode(5);
-        let target = read_symlink_target(&inode, 512, 1024, true, |_| {
-            let mut block = vec![0u8; 512];
-            block[0..4].copy_from_slice(b"XSLM");
-            block[56..61].copy_from_slice(b"hello");
-            Ok(block)
-        })
-        .unwrap();
+        let mut block = vec![0u8; 512];
+        block[0..4].copy_from_slice(b"XSLM");
+        block[56..61].copy_from_slice(b"hello");
+        let target = read_symlink_target(&inode, 512, 1024, true, &SymlinkReader(block)).unwrap();
         assert_eq!(target, "hello");
     }
 
     #[test]
     fn v4_remote_symlink_is_contiguous() {
         let inode = symlink_inode(5);
-        let target = read_symlink_target(&inode, 512, 1024, false, |_| {
-            let mut block = vec![0u8; 512];
-            block[0..5].copy_from_slice(b"world");
-            Ok(block)
-        })
-        .unwrap();
+        let mut block = vec![0u8; 512];
+        block[0..5].copy_from_slice(b"world");
+        let target = read_symlink_target(&inode, 512, 1024, false, &SymlinkReader(block)).unwrap();
         assert_eq!(target, "world");
     }
 
     #[test]
     fn oversized_symlink_is_rejected_before_allocation_or_io() {
         let inode = symlink_inode(1025);
-        let result = read_symlink_target(&inode, 512, 1024, true, |_| {
-            panic!("oversized symlink must not read any block")
-        });
+        let result = read_symlink_target(&inode, 512, 1024, true, &SymlinkReader(Vec::new()));
         assert!(matches!(result, Err(FsError::Corrupted)));
     }
 }

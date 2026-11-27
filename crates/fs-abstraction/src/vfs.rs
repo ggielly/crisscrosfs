@@ -48,7 +48,7 @@ use crate::types::{VfsDirEntry, VfsVolumeInfo};
 use crate::{
     capabilities::FsCapabilities,
     error::{FsError, FsResult},
-    types::{RenameFlags, VfsFileInfo, VfsTimestamp},
+    types::{RenameFlags, VfsFileInfo, VfsPosixAcl, VfsTimestamp},
 };
 
 /// Main filesystem trait.
@@ -87,6 +87,14 @@ pub trait VfsFileSystem: Send + Sync {
     /// - Adapt behavior (e.g., case sensitivity)
     fn capabilities(&self) -> &FsCapabilities;
 
+    /// Enables optional case-insensitive lookup. Backends must reject ambiguous
+    /// names rather than choosing a directory entry arbitrarily.
+    fn set_case_insensitive_lookup(&self, _enabled: bool) {}
+
+    fn is_case_insensitive_lookup(&self) -> bool {
+        false
+    }
+
     // =========================================================================
     // Volume Operations
     // =========================================================================
@@ -105,6 +113,12 @@ pub trait VfsFileSystem: Send + Sync {
     ///
     /// For read-only filesystems, this is a no-op.
     fn sync(&self) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Makes one file's pending writes durable without syncing the volume.
+    /// Backends whose writes are already durable may leave this as a no-op.
+    fn flush_file(&self, _ino: u64) -> FsResult<()> {
         Ok(())
     }
 
@@ -141,6 +155,23 @@ pub trait VfsFileSystem: Send + Sync {
     /// * `FsError::InodeNotFound` - Inode doesn't exist
     fn stat(&self, ino: u64) -> FsResult<VfsFileInfo>;
 
+    /// Returns validated raw POSIX ACL xattrs without implying write support.
+    ///
+    /// Backends that already include ACLs in [`Self::stat`] need not override
+    /// this method. A backend may override it when ACL loading is optional or
+    /// decoupled from its ordinary metadata cache.
+    fn read_posix_acl(&self, ino: u64) -> FsResult<Option<VfsPosixAcl>> {
+        self.stat(ino).map(|info| info.posix_acl)
+    }
+
+    /// Returns metadata for several inodes while preserving input order.
+    ///
+    /// Backends may batch inode-buffer reads. Errors are per item so callers
+    /// such as readdir can skip one corrupt entry without losing the listing.
+    fn stat_many(&self, inos: &[u64]) -> Vec<FsResult<VfsFileInfo>> {
+        inos.iter().map(|&ino| self.stat(ino)).collect()
+    }
+
     /// Looks up an entry in a directory by name.
     ///
     /// # Arguments
@@ -152,6 +183,10 @@ pub trait VfsFileSystem: Send + Sync {
     /// * `FsError::NotADirectory` - Parent is not a directory
     fn lookup(&self, parent_ino: u64, name: &str) -> FsResult<VfsFileInfo>;
 
+    fn lookup_wide(&self, parent_ino: u64, name: &[u16]) -> FsResult<VfsFileInfo> {
+        self.lookup(parent_ino, &String::from_utf16_lossy(name))
+    }
+
     /// Resolves a path to an inode number.
     ///
     /// # Arguments
@@ -162,6 +197,13 @@ pub trait VfsFileSystem: Send + Sync {
     /// * `FsError::NotFound` - Path component doesn't exist
     /// * `FsError::NotADirectory` - Path component is not a directory
     fn resolve_path(&self, path: &str) -> FsResult<u64>;
+
+    /// UTF-16 path resolution for frontends that already have a Windows path.
+    /// Backends with byte-preserving names should override this to avoid a
+    /// lossy UTF-16 → UTF-8 conversion.
+    fn resolve_path_wide(&self, path: &[u16]) -> FsResult<u64> {
+        self.resolve_path(&String::from_utf16_lossy(path))
+    }
 
     // =========================================================================
     // Read Operations
@@ -225,6 +267,26 @@ pub trait VfsFileSystem: Send + Sync {
     fn write(&self, ino: u64, offset: u64, data: &[u8]) -> FsResult<usize> {
         let _ = (ino, offset, data);
         Err(FsError::ReadOnly)
+    }
+
+    /// Writes data and returns post-write metadata when the backend can provide
+    /// it without an extra inode read.
+    fn write_with_info(
+        &self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> FsResult<(usize, VfsFileInfo)> {
+        let written = self.write(ino, offset, data)?;
+        Ok((written, self.stat(ino)?))
+    }
+
+    /// Atomically appends data at the current end of file and returns the
+    /// post-write metadata. Backends without an atomic primitive may use the
+    /// default, but concurrent writers should override it.
+    fn append_with_info(&self, ino: u64, data: &[u8]) -> FsResult<(usize, VfsFileInfo)> {
+        let offset = self.stat(ino)?.size;
+        self.write_with_info(ino, offset, data)
     }
 
     /// Creates a new regular file.
@@ -354,6 +416,14 @@ pub trait VfsFileSystem: Send + Sync {
     // =========================================================================
     // Cache Management
     // =========================================================================
+
+    /// Pins an inode for an open handle. Unlink must not reclaim its data until
+    /// every successful pin has been released.
+    fn pin_inode(&self, _ino: u64) -> FsResult<()> {
+        Ok(())
+    }
+
+    fn unpin_inode(&self, _ino: u64) {}
 
     /// Invalidates cached data for an inode.
     ///

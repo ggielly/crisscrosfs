@@ -9,6 +9,26 @@ use fs_abstraction::{safe_math::CheckedOps, FsError, FsResult};
 
 use crate::Superblock;
 
+/// Size of an XFS basic block, the unit used by on-disk `xfs_daddr_t` values.
+pub const XFS_BASIC_BLOCK_SIZE: u64 = 512;
+
+/// Convert an absolute filesystem block number to an on-disk disk address.
+///
+/// V5 metadata stores `bb_blkno`, directory `blkno`, and AG-header addresses
+/// in 512-byte basic-block units, independently of the filesystem's logical
+/// sector size.
+pub fn fs_block_to_daddr(fs_block: u64, block_size: usize) -> FsResult<u64> {
+    if block_size < XFS_BASIC_BLOCK_SIZE as usize
+        || !block_size.is_power_of_two()
+        || !block_size.is_multiple_of(XFS_BASIC_BLOCK_SIZE as usize)
+    {
+        return Err(FsError::InvalidArgument);
+    }
+    fs_block
+        .checked_mul((block_size as u64) / XFS_BASIC_BLOCK_SIZE)
+        .ok_or(FsError::ArithmeticOverflow)
+}
+
 /// Splits an inode number into AG number and AG-relative inode.
 ///
 /// XFS inode numbers are packed as:
@@ -193,6 +213,14 @@ mod tests {
             lsn: 0,
             meta_uuid: [0; 16],
         }
+    }
+
+    #[test]
+    fn disk_addresses_always_use_512_byte_basic_blocks() {
+        assert_eq!(fs_block_to_daddr(3, 512).unwrap(), 3);
+        assert_eq!(fs_block_to_daddr(3, 4096).unwrap(), 24);
+        assert!(fs_block_to_daddr(u64::MAX, 4096).is_err());
+        assert!(fs_block_to_daddr(1, 256).is_err());
     }
 
     #[test]

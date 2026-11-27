@@ -11,7 +11,7 @@ use fs_abstraction::{BlockDevice, FsError, FsResult};
 use xfs_rs::{
     freespace::AllocRec,
     short_btree::{
-        collect_short_btree,
+        collect_short_btree_checked,
         plan_short_btree,
         required_block_count,
         ShortBtreeKind,
@@ -197,6 +197,13 @@ impl BlockAllocator {
     /// Net free-block counter delta for this transaction.
     pub fn free_block_delta(&self) -> i128 {
         self.free_block_delta
+    }
+
+    /// Forget transaction-local accounting after the caller has successfully
+    /// committed the staged superblock. On failure the owner discards and
+    /// rebuilds this allocator instead, so stale deltas are never reused.
+    pub fn finish_transaction(&mut self) {
+        self.free_block_delta = 0;
     }
 
     /// Stage all modified AG trees and AGF sectors. The caller merges the
@@ -403,10 +410,12 @@ impl BlockAllocator {
                 &mut raw,
                 self.filesystem_size,
             )?;
-            let agf = AgFreeHeader::parse(&raw)?;
-            if self.sb.is_v5() {
-                agf.verify_crc(&raw)?;
-            }
+            let agf = AgFreeHeader::parse_checked(
+                &raw,
+                self.sb.is_v5(),
+                ag_num,
+                self.sb.is_v5().then_some(self.sb.metadata_uuid()),
+            )?;
             let expected_length = if ag_num + 1 == self.sb.ag_count {
                 self.sb.total_blocks - u64::from(ag_num) * u64::from(self.sb.ag_blocks)
             } else {
@@ -423,7 +432,7 @@ impl BlockAllocator {
 
             let read_block = |block| self.read_block(block);
             let reader = ClosureBlockReader::new(&read_block);
-            let bno = collect_short_btree(
+            let bno = collect_short_btree_checked(
                 ShortBtreeKind::AllocBno,
                 agf.bno_root,
                 agf.bno_level.checked_sub(1).ok_or(FsError::Corrupted)? as u16,
@@ -433,8 +442,9 @@ impl BlockAllocator {
                 self.sb.ag_blocks,
                 u32::from(self.sb.sector_size),
                 &reader,
+                self.sb.is_v5().then_some(self.sb.metadata_uuid()),
             )?;
-            let cnt = collect_short_btree(
+            let cnt = collect_short_btree_checked(
                 ShortBtreeKind::AllocCnt,
                 agf.cnt_root,
                 agf.cnt_level.checked_sub(1).ok_or(FsError::Corrupted)? as u16,
@@ -444,6 +454,7 @@ impl BlockAllocator {
                 self.sb.ag_blocks,
                 u32::from(self.sb.sector_size),
                 &reader,
+                self.sb.is_v5().then_some(self.sb.metadata_uuid()),
             )?;
             let refcount = if agf.refcount_root != 0 || agf.refcount_blocks != 0 {
                 if agf.refcount_root == 0 || agf.refcount_level != 1 || agf.refcount_blocks != 1 {

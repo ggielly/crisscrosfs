@@ -128,6 +128,33 @@ impl AgFreeHeader {
         Ok(agf)
     }
 
+    /// Parse an AGF and validate its CRC and allocation-group identity.
+    pub fn parse_checked(
+        buffer: &[u8],
+        is_v5: bool,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<Self> {
+        let header = Self::parse(buffer)?;
+        if is_v5 {
+            header.verify_crc(buffer)?;
+        }
+        header.verify_identity(expected_ag, expected_uuid)?;
+        Ok(header)
+    }
+
+    /// Verify the AG sequence number and, when supplied, the metadata UUID.
+    pub fn verify_identity(
+        &self,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        if self.seq_number != expected_ag || expected_uuid.is_some_and(|uuid| self.uuid != uuid) {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
     /// Verifies a v5 AGF CRC over the complete sector supplied in `raw`.
     pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
         if raw.len() < 512 {
@@ -313,6 +340,33 @@ impl AgInodeHeader {
         Ok(agi)
     }
 
+    /// Parse an AGI and validate its CRC and allocation-group identity.
+    pub fn parse_checked(
+        buffer: &[u8],
+        is_v5: bool,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<Self> {
+        let header = Self::parse(buffer)?;
+        if is_v5 {
+            header.verify_crc(buffer)?;
+        }
+        header.verify_identity(expected_ag, expected_uuid)?;
+        Ok(header)
+    }
+
+    /// Verify the AG sequence number and, when supplied, the metadata UUID.
+    pub fn verify_identity(
+        &self,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        if self.seq_number != expected_ag || expected_uuid.is_some_and(|uuid| self.uuid != uuid) {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+
     /// Verifies a v5 AGI CRC over the complete sector supplied in `raw`.
     pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
         if raw.len() < Self::SIZE {
@@ -430,6 +484,35 @@ impl AgFreeList {
             agfl.verify_crc(buffer)?;
         }
         Ok(agfl)
+    }
+
+    /// Parse an AGFL and validate its CRC and allocation-group identity.
+    pub fn parse_checked(
+        buffer: &[u8],
+        is_v5: bool,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<Self> {
+        let header = Self::parse(buffer, is_v5)?;
+        header.verify_identity(expected_ag, expected_uuid)?;
+        Ok(header)
+    }
+
+    /// Verify the AG sequence number and, when supplied, the metadata UUID.
+    pub fn verify_identity(
+        &self,
+        expected_ag: u32,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        if self.magic == XFS_AGFL_MAGIC {
+            if self.seq_number != expected_ag || expected_uuid.is_some_and(|uuid| self.uuid != uuid)
+            {
+                return Err(FsError::Corrupted);
+            }
+        } else if expected_uuid.is_some() {
+            return Err(FsError::InvalidArgument);
+        }
+        Ok(())
     }
 
     pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
@@ -649,6 +732,66 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn checked_ag_headers_reject_wrong_sequence_uuid_and_crc() {
+        let uuid = [0x5A; 16];
+        let mut agf = vec![0u8; 512];
+        agf[0..4].copy_from_slice(&XFS_AGF_MAGIC.to_be_bytes());
+        agf[4..8].copy_from_slice(&1u32.to_be_bytes());
+        agf[8..12].copy_from_slice(&3u32.to_be_bytes());
+        agf[0x40..0x50].copy_from_slice(&uuid);
+        crate::crc::recalculate_crc_le(&mut agf, AgFreeHeader::CRC_OFFSET_V5).unwrap();
+        assert!(AgFreeHeader::parse_checked(&agf, true, 3, Some(uuid)).is_ok());
+        assert!(matches!(
+            AgFreeHeader::parse_checked(&agf, true, 2, Some(uuid)),
+            Err(FsError::Corrupted)
+        ));
+        assert!(matches!(
+            AgFreeHeader::parse_checked(&agf, true, 3, Some([0xAA; 16])),
+            Err(FsError::Corrupted)
+        ));
+        agf[100] ^= 1;
+        assert!(matches!(
+            AgFreeHeader::parse_checked(&agf, true, 3, Some(uuid)),
+            Err(FsError::Corrupted)
+        ));
+
+        let mut agi = vec![0u8; 512];
+        agi[0..4].copy_from_slice(&XFS_AGI_MAGIC.to_be_bytes());
+        agi[4..8].copy_from_slice(&1u32.to_be_bytes());
+        agi[8..12].copy_from_slice(&4u32.to_be_bytes());
+        agi[0x128..0x138].copy_from_slice(&uuid);
+        crate::crc::recalculate_crc_le(&mut agi, AgInodeHeader::CRC_OFFSET_V5).unwrap();
+        assert!(AgInodeHeader::parse_checked(&agi, true, 4, Some(uuid)).is_ok());
+        assert!(matches!(
+            AgInodeHeader::parse_checked(&agi, true, 5, Some(uuid)),
+            Err(FsError::Corrupted)
+        ));
+        assert!(matches!(
+            AgInodeHeader::parse_checked(&agi, true, 4, Some([0xAA; 16])),
+            Err(FsError::Corrupted)
+        ));
+
+        let agfl = AgFreeList {
+            magic: XFS_AGFL_MAGIC,
+            seq_number: 5,
+            uuid,
+            lsn: 0,
+            crc: 0,
+            entries: vec![1, 2, 3],
+        };
+        let raw = agfl.to_bytes(512, true).unwrap();
+        assert!(AgFreeList::parse_checked(&raw, true, 5, Some(uuid)).is_ok());
+        assert!(matches!(
+            AgFreeList::parse_checked(&raw, true, 4, Some(uuid)),
+            Err(FsError::Corrupted)
+        ));
+        assert!(matches!(
+            AgFreeList::parse_checked(&raw, true, 5, Some([0xAA; 16])),
+            Err(FsError::Corrupted)
+        ));
     }
 
     #[test]

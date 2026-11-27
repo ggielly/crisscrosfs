@@ -38,6 +38,24 @@ struct StagedBuffer {
     kind: MetadataKind,
 }
 
+/// A metadata batch ready to join a group commit. Transaction IDs are assigned
+/// by the journal only when the group is encoded, so preparation cannot consume
+/// or reorder IDs.
+#[derive(Debug)]
+pub(crate) struct PreparedTransaction {
+    pub(crate) items: Vec<xfs_rs::log_format::LogBufferItem>,
+    pub(crate) inode_items: Vec<xfs_rs::log_format::LogInodeItem>,
+}
+
+impl PreparedTransaction {
+    pub(crate) fn new(
+        items: Vec<xfs_rs::log_format::LogBufferItem>,
+        inode_items: Vec<xfs_rs::log_format::LogInodeItem>,
+    ) -> Self {
+        Self { items, inode_items }
+    }
+}
+
 /// A coalesced set of positional writes.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -98,6 +116,12 @@ impl WriteBatch {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.buffers.is_empty()
+    }
+
+    pub(crate) fn buffer_blocks(&self, block_size: u64) -> impl Iterator<Item = u64> + '_ {
+        self.buffers
+            .keys()
+            .filter_map(move |offset| offset.checked_div(block_size))
     }
 
     /// Read a buffer from the pending batch, falling back to the device.
@@ -169,9 +193,23 @@ impl WriteBatch {
         Ok(items)
     }
 
+    /// Prepare the staged metadata for a later synchronous or group commit.
+    pub(crate) fn prepare(&self) -> FsResult<PreparedTransaction> {
+        Ok(PreparedTransaction::new(
+            self.log_items()?,
+            self.log_inode_items(),
+        ))
+    }
+
     /// Commit the staged metadata through the XFS log.
     pub(crate) fn commit(&self, journal: &mut Journal) -> FsResult<u64> {
         journal.commit(self.log_items()?, self.log_inode_items())
+    }
+
+    /// Commit this batch through the grouped-log API. A multi-inode caller can
+    /// merge batches before encoding; the one-batch form remains compatible.
+    pub(crate) fn commit_group(&self, journal: &mut Journal) -> FsResult<u64> {
+        journal.commit_group(vec![self.prepare()?])
     }
 
     /// Apply every staged buffer and flush the device. If an I/O error occurs,

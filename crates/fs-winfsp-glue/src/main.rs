@@ -25,6 +25,9 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 use xfs_vfs::XfsVfs;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "crisscrossfs")]
 #[command(author = "CrissCrossFS contributors")]
@@ -75,6 +78,18 @@ enum Commands {
         /// Mount a regular XFS image file read-write (experimental)
         #[arg(long)]
         rw: bool,
+
+        /// Resolve names case-insensitively; ambiguous names are rejected
+        #[arg(long)]
+        case_insensitive: bool,
+
+        /// WinFsp dispatcher threads (0 = automatic)
+        #[arg(long, default_value_t = 0)]
+        dispatcher_threads: u32,
+
+        /// Blocking VFS workers for async callbacks (0 = automatic)
+        #[arg(long, default_value_t = 0)]
+        io_workers: u32,
     },
 
     /// Scan for XFS filesystems
@@ -196,12 +211,18 @@ fn main() {
             volume,
             mount_point,
             rw,
+            case_insensitive,
+            dispatcher_threads,
+            io_workers,
         } => resolve_mount_source(disk, image, partition, volume).and_then(|source| {
             let options = MountOptions {
                 source,
                 mount_point: validate_mount_point(&mount_point)?,
                 read_only: !rw,
                 debug: cli.debug,
+                case_insensitive_lookup: case_insensitive,
+                dispatcher_threads,
+                io_workers,
                 ..Default::default()
             };
             cmd_mount(options)
@@ -298,9 +319,17 @@ fn cmd_mount(options: MountOptions) -> Result<()> {
     info!("  Block size: {} bytes", vol_info.block_size);
     info!("  Read-only: {}", fs.capabilities().read_only);
 
+    fs.set_case_insensitive_lookup(options.case_insensitive_lookup);
     // Start the mount using VFS layer
-    let handle: winfsp_mount::MountHandle =
-        winfsp_mount::start_mount(&options.mount_point, fs.clone(), options.debug)?;
+    let handle: winfsp_mount::MountHandle = winfsp_mount::start_mount_with_config(
+        &options.mount_point,
+        fs.clone(),
+        options.debug,
+        winfsp_mount::DispatcherConfig {
+            thread_count: options.dispatcher_threads,
+            io_workers: options.io_workers,
+        },
+    )?;
 
     // Show volume information
     info!("Volume Information:");

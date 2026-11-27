@@ -91,7 +91,6 @@ struct BuildShape {
 #[derive(Debug, Clone, Copy)]
 struct EncodeConfig {
     block_size: usize,
-    sector_size: usize,
     is_v5: bool,
     owner: u64,
     uuid: [u8; 16],
@@ -460,12 +459,7 @@ fn encode_root_data(
 }
 
 fn disk_address(fs_block: u64, config: EncodeConfig) -> FsResult<u64> {
-    let byte_address = fs_block
-        .checked_mul(config.block_size as u64)
-        .ok_or(FsError::ArithmeticOverflow)?;
-    byte_address
-        .checked_div(config.sector_size as u64)
-        .ok_or(FsError::ArithmeticOverflow)
+    crate::address::fs_block_to_daddr(fs_block, config.block_size)
 }
 
 /// Plan and encode a canonical long-format BMBT from sorted extents.
@@ -480,8 +474,8 @@ fn disk_address(fs_block: u64, config: EncodeConfig) -> FsResult<u64> {
 /// order. Surplus unique candidates are ignored; duplicates, null candidates
 /// and insufficient candidates are rejected. All plan and on-disk child/sibling
 /// pointers are absolute filesystem blocks. For v5, each node's `bb_blkno` is
-/// `fs_block * block_size / sector_size`, while `owner`, `uuid` and `lsn` are
-/// written to the long header and its CRC at `0x40` is recalculated.
+/// `fs_block * block_size / 512`, while `owner`, `uuid` and `lsn` are written
+/// to the long header and its CRC at `0x40` is recalculated.
 ///
 /// Extents must be strictly ordered and non-overlapping by logical file offset,
 /// and every packed extent field must be representable on disk.
@@ -528,7 +522,6 @@ pub fn plan_bmbt(
     let root_data = encode_root_data(&shape, &blocks, fork_data_size)?;
     let config = EncodeConfig {
         block_size,
-        sector_size,
         is_v5,
         owner,
         uuid,
@@ -848,7 +841,7 @@ mod tests {
     fn v5_blockno_uses_basic_block_units() {
         let input = extents(3);
         let fs_block = 0x1234;
-        for (sector_size, units) in [(512, 8), (1024, 4), (4096, 1)] {
+        for sector_size in [512, 1024, 4096] {
             let plan = plan_bmbt(
                 &input,
                 &[fs_block],
@@ -862,7 +855,10 @@ mod tests {
                 TEST_LSN,
             )
             .unwrap();
-            assert_eq!(plan.buffers[0].read_be_u64(24).unwrap(), fs_block * units);
+            assert_eq!(
+                plan.buffers[0].read_be_u64(24).unwrap(),
+                fs_block * (4096 / 512)
+            );
             assert_eq!(plan.blocks, vec![fs_block]);
         }
     }

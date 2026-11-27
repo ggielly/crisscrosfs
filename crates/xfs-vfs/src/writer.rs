@@ -1,11 +1,18 @@
 //! Transactional XFS write operations.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use fs_abstraction::{BlockDevice, FsError, FsResult, RenameFlags, VfsFileInfo, VfsTimestamp};
+use parking_lot::MutexGuard;
 use xfs_rs::{
     bmbt_write::{plan_bmbt, required_block_count},
-    btree::{BmbtRoot, BtreeBlockLong},
+    btree::{btree_collect_extents_checked, BmbtRoot, BtreeBlockLong},
     constants::{S_IFDIR, S_IFLNK, S_IFREG},
     dir_write::{
         add_block_directory_entry,
@@ -34,24 +41,274 @@ use crate::{
     inode::inode_to_file_info,
     inode_allocator::InodeAllocator,
     inode_write::{nblocks_from_fs_blocks, serialize_inode, touch_inode},
-    io::{read_exact_at, write_exact_at, ClosureBlockReader},
+    io::{read_exact_at, write_exact_at, ClosureBlockReader, VfsBlockReader},
     journal::Journal,
     transaction::{MetadataKind, WriteBatch},
 };
 
-/// Mutable writer context. The caller holds the filesystem-wide write lock.
+/// Total dirty block memory retained across all inodes. Sparse writes consume
+/// one block each, never memory proportional to the logical file size.
+pub(crate) const MAX_DELALLOC_BYTES: usize = 16 * 1024 * 1024;
+/// Per-inode cap prevents one writer from monopolizing the global budget.
+pub(crate) const MAX_DELALLOC_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+pub(crate) struct DelallocBudget {
+    remaining: AtomicUsize,
+}
+
+impl DelallocBudget {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(capacity),
+        }
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        self.remaining.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_reserve(&self, bytes: usize) -> FsResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(bytes)
+            })
+            .map(|_| ())
+            .map_err(|_| FsError::OutOfMemory)
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(bytes)
+            });
+    }
+}
+
+/// Dirty full-block images plus the logical EOF for one inode. Access is
+/// protected by that inode's RwLock; no internal mutex is needed.
+#[derive(Debug, Default)]
+pub(crate) struct PendingWrites {
+    blocks: BTreeMap<u64, Vec<u8>>,
+    size: u64,
+}
+
+impl PendingWrites {
+    pub(crate) fn with_size(size: u64) -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            size,
+        }
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    pub(crate) fn memory_bytes(&self, block_size: usize) -> usize {
+        self.blocks.len().saturating_mul(block_size)
+    }
+
+    pub(crate) fn ranges(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.blocks
+            .iter()
+            .map(|(&file_block, block)| (file_block, block.as_slice()))
+    }
+
+    /// Buffer one write without partial mutation on allocation/budget failure.
+    /// Replacements are staged separately and installed only after every block
+    /// succeeds. Existing dirty blocks may be temporarily duplicated, bounded
+    /// by the same per-inode and global dirty-block limits.
+    pub(crate) fn write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        block_size: usize,
+        disk_size: u64,
+        budget: &DelallocBudget,
+        mut read_disk_block: impl FnMut(u64) -> FsResult<Vec<u8>>,
+    ) -> FsResult<usize> {
+        if block_size == 0 {
+            return Err(FsError::InvalidArgument);
+        }
+        let data_len = u64::try_from(data.len()).map_err(|_| FsError::ArithmeticOverflow)?;
+        let end = offset
+            .checked_add(data_len)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if end > i64::MAX as u64 {
+            return Err(FsError::FileTooLarge);
+        }
+        if data.is_empty() {
+            self.size = self.size.max(disk_size);
+            return Ok(0);
+        }
+
+        let first = offset / block_size as u64;
+        let last = (end - 1) / block_size as u64;
+        let count = last - first + 1;
+        let max_blocks = (MAX_DELALLOC_FILE_BYTES / block_size) as u64;
+        if count > max_blocks {
+            return Err(FsError::OutOfMemory);
+        }
+        let missing = (first..=last)
+            .filter(|file_block| !self.blocks.contains_key(file_block))
+            .count();
+        let additional = missing
+            .checked_mul(block_size)
+            .ok_or(FsError::OutOfMemory)?;
+        let projected = self
+            .memory_bytes(block_size)
+            .checked_add(additional)
+            .ok_or(FsError::OutOfMemory)?;
+        if projected > MAX_DELALLOC_FILE_BYTES || additional > budget.available() {
+            return Err(FsError::OutOfMemory);
+        }
+
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(count as usize)
+            .map_err(|_| FsError::OutOfMemory)?;
+        let mut reserved = 0usize;
+        let result = (|| -> FsResult<()> {
+            for file_block in first..=last {
+                let block = if let Some(previous) = self.blocks.get(&file_block) {
+                    let mut block = Vec::new();
+                    block
+                        .try_reserve_exact(previous.len())
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    block.extend_from_slice(previous);
+                    block
+                } else {
+                    budget.try_reserve(block_size)?;
+                    reserved += block_size;
+                    let mut block = Vec::new();
+                    block
+                        .try_reserve_exact(block_size)
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    block.resize(block_size, 0);
+                    block
+                };
+                staged.push((file_block, block));
+
+                let block_start = file_block
+                    .checked_mul(block_size as u64)
+                    .ok_or(FsError::ArithmeticOverflow)?;
+                let range_start = offset.max(block_start);
+                let range_end = end.min(block_start + block_size as u64);
+                let dst = usize::try_from(range_start - block_start)
+                    .map_err(|_| FsError::ArithmeticOverflow)?;
+                let src = usize::try_from(range_start - offset)
+                    .map_err(|_| FsError::ArithmeticOverflow)?;
+                let len = usize::try_from(range_end - range_start)
+                    .map_err(|_| FsError::ArithmeticOverflow)?;
+                let block = &mut staged.last_mut().expect("just pushed").1;
+                if dst != 0 || len != block_size {
+                    let disk = read_disk_block(file_block)?;
+                    if disk.len() != block_size {
+                        return Err(FsError::Corrupted);
+                    }
+                    block.copy_from_slice(&disk);
+                }
+                block[dst..dst + len].copy_from_slice(&data[src..src + len]);
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            budget.release(reserved);
+            return Err(error);
+        }
+
+        self.blocks.extend(staged);
+        self.size = self.size.max(end);
+        Ok(data.len())
+    }
+
+    /// Overlay dirty bytes onto a zero-filled disk read. The caller clamps the
+    /// read to this logical EOF before invoking this method.
+    pub(crate) fn overlay_read(&self, offset: u64, buf: &mut [u8], block_size: usize) {
+        if buf.is_empty() || block_size == 0 {
+            return;
+        }
+        let end = offset.saturating_add(buf.len() as u64).min(self.size);
+        if end <= offset {
+            return;
+        }
+        let first = offset / block_size as u64;
+        for (&file_block, block) in self.blocks.range(first..) {
+            let block_start = file_block.saturating_mul(block_size as u64);
+            let block_end = block_start.saturating_add(block_size as u64);
+            let copy_start = offset.max(block_start);
+            let copy_end = end.min(block_end);
+            if copy_start >= copy_end {
+                if block_start >= end {
+                    break;
+                }
+                continue;
+            }
+            let dst = usize::try_from(copy_start - offset).unwrap_or(0);
+            let src = usize::try_from(copy_start - block_start).unwrap_or(0);
+            let count = usize::try_from(copy_end - copy_start).unwrap_or(0);
+            if let (Some(destination), Some(source)) =
+                (buf.get_mut(dst..dst + count), block.get(src..src + count))
+            {
+                destination.copy_from_slice(source);
+            }
+        }
+    }
+}
+
+/// Mutable writer context. The caller holds the metadata and inode write locks.
 pub(crate) struct WriteContext<'a> {
     pub device: Arc<dyn BlockDevice>,
     pub superblock: Superblock,
     pub filesystem_size: u64,
     pub journal: &'a mut Journal,
-    pub allocator: BlockAllocator,
-    pub inode_allocator: InodeAllocator,
+    pub allocator: MutexGuard<'a, BlockAllocator>,
+    pub inode_allocator: MutexGuard<'a, InodeAllocator>,
     /// Blocks staged earlier in the same transaction.
     pub block_overlay: std::collections::BTreeMap<u64, Vec<u8>>,
     /// Original data-block images restored if metadata preparation fails before
     /// a log record is committed.
     pub data_rollback: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// Inode images staged earlier in this context. Deferred multi-inode
+    /// flushes use these instead of rereading superseded on-disk inodes.
+    pub staged_inodes: BTreeMap<u64, Inode>,
+    /// Cache invalidation hints collected before the context is dropped.
+    pub dirty_inodes: BTreeSet<u64>,
+    pub dirty_directories: BTreeSet<u64>,
+    pub dirty_blocks: BTreeSet<u64>,
+    /// Handles pinned at transaction start; their inodes cannot be reclaimed.
+    pub pinned_inodes: BTreeSet<u64>,
+}
+
+impl VfsBlockReader for WriteContext<'_> {
+    fn read_block(&self, block_num: u64) -> FsResult<Arc<[u8]>> {
+        Ok(WriteContext::read_block(self, block_num)?.into())
+    }
+
+    fn read_at(&self, block_num: u64, offset: u64, buf: &mut [u8]) -> FsResult<()> {
+        let block_size = u64::from(self.superblock.block_size);
+        let len = u64::try_from(buf.len()).map_err(|_| FsError::ArithmeticOverflow)?;
+        if offset > block_size || len > block_size - offset {
+            return Err(FsError::Corrupted);
+        }
+        let block = WriteContext::read_block(self, block_num)?;
+        let start = usize::try_from(offset).map_err(|_| FsError::ArithmeticOverflow)?;
+        buf.copy_from_slice(&block[start..start + buf.len()]);
+        Ok(())
+    }
 }
 
 impl Drop for WriteContext<'_> {
@@ -87,11 +344,24 @@ struct InodeLocation {
 }
 
 impl WriteContext<'_> {
-    /// Write file data, allocating holes and converting inline data to extents
-    /// when necessary. Data blocks are forced before metadata is journaled.
-    pub fn write_data(&mut self, ino: u64, offset: u64, data: &[u8]) -> FsResult<usize> {
+    fn stage_write_data_with_info(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+        batch: &mut WriteBatch,
+    ) -> FsResult<(usize, VfsFileInfo)> {
         if data.is_empty() {
-            return Ok(0);
+            let location = self.inode_location(ino)?;
+            let inode = self.read_inode(ino, location)?;
+            let info = inode_to_file_info(
+                ino,
+                &inode,
+                self.superblock.block_size,
+                self.superblock.has_bigtime(),
+                self.filesystem_size,
+            )?;
+            return Ok((0, info));
         }
         let end = offset
             .checked_add(data.len() as u64)
@@ -117,15 +387,24 @@ impl WriteContext<'_> {
                 let start = usize::try_from(offset).map_err(|_| FsError::FileTooLarge)?;
                 local[start..end_usize].copy_from_slice(data);
                 inode.core.size = local.len() as u64;
-                self.commit_inode(ino, location, inode)?;
-                return Ok(data.len());
+                let info = inode_to_file_info(
+                    ino,
+                    &inode,
+                    self.superblock.block_size,
+                    self.superblock.has_bigtime(),
+                    self.filesystem_size,
+                )?;
+                self.stage_inode(batch, ino, location, &inode)?;
+                return Ok((data.len(), info));
             }
         }
 
-        let mut prepared = None;
         let mut extents = match &inode.data_fork {
             DataFork::Local(local) => {
-                let blocks = end.div_ceil(block_size);
+                // Preserve inline bytes in one allocated block. Remaining
+                // holes are allocated by the per-file-block loop below, so a
+                // sparse write does not materialize every intervening block.
+                let blocks = u64::from(!local.is_empty());
                 let extents = self.allocate_extents(0, blocks)?;
                 let byte_len = usize::try_from(
                     blocks
@@ -136,8 +415,17 @@ impl WriteContext<'_> {
                 let mut raw = vec![0u8; byte_len];
                 let copy_len = local.len().min(raw.len());
                 raw[..copy_len].copy_from_slice(&local[..copy_len]);
-                let start = usize::try_from(offset).map_err(|_| FsError::FileTooLarge)?;
-                raw[start..start + data.len()].copy_from_slice(data);
+                let raw_len = raw.len() as u64;
+                let copy_start = offset.min(raw_len);
+                let copy_end = end.min(raw_len);
+                if copy_start < copy_end {
+                    let start = usize::try_from(copy_start).map_err(|_| FsError::FileTooLarge)?;
+                    let source = usize::try_from(copy_start - offset)
+                        .map_err(|_| FsError::ArithmeticOverflow)?;
+                    let len = usize::try_from(copy_end - copy_start)
+                        .map_err(|_| FsError::ArithmeticOverflow)?;
+                    raw[start..start + len].copy_from_slice(&data[source..source + len]);
+                }
                 for extent in &extents {
                     let file_start = usize::try_from(
                         extent
@@ -154,135 +442,174 @@ impl WriteContext<'_> {
                     .map_err(|_| FsError::ArithmeticOverflow)?;
                     self.write_data_block(extent.start_block, &raw[file_start..file_start + len])?;
                 }
-                prepared = Some(());
                 extents
             }
-            DataFork::Extents(_) | DataFork::Btree { .. } => {
-                let read_block = |block| self.read_block(block);
-                inode.collect_extents(
-                    &ClosureBlockReader::new(&read_block),
-                    self.superblock.is_v5(),
-                )?
-            }
+            DataFork::Extents(_) | DataFork::Btree { .. } => self.collect_inode_extents(&inode)?,
             _ => return Err(FsError::NotSupported),
         };
 
-        if prepared.is_none() {
-            let first_block = offset / block_size;
-            let last_block = (end - 1) / block_size;
-            for file_block in first_block..=last_block {
-                let existing = extents
+        let first_block = offset / block_size;
+        let last_block = (end - 1) / block_size;
+        for file_block in first_block..=last_block {
+            let existing = extents
+                .iter()
+                .position(|extent| extent.contains_file_block(file_block));
+            let (disk_block, zero_first) = if let Some(index) = existing {
+                (
+                    extents[index].translate(file_block)?,
+                    extents[index].is_unwritten,
+                )
+            } else {
+                let allocation = self.allocator.allocate_blocks(1)?;
+                let disk_block = allocation.to_absolute_block(self.superblock.ag_blocks)?;
+                let insert_at = extents
                     .iter()
-                    .position(|extent| extent.contains_file_block(file_block));
-                let (disk_block, zero_first) = if let Some(index) = existing {
-                    (
-                        extents[index].translate(file_block)?,
-                        extents[index].is_unwritten,
-                    )
-                } else {
-                    let allocation = self.allocator.allocate_blocks(1)?;
-                    let disk_block = allocation.to_absolute_block(self.superblock.ag_blocks)?;
-                    let insert_at = extents
-                        .iter()
-                        .position(|extent| extent.file_offset > file_block)
-                        .unwrap_or(extents.len());
-                    extents.insert(
-                        insert_at,
-                        Extent {
-                            file_offset: file_block,
-                            start_block: disk_block,
-                            block_count: 1,
-                            is_unwritten: false,
-                        },
-                    );
-                    coalesce_extents(&mut extents)?;
-                    (disk_block, true)
-                };
-                self.allocator.ensure_extent_unshared(disk_block, 1)?;
-                if zero_first {
-                    let zeros = vec![0u8; block_size as usize];
-                    self.write_data_block(disk_block, &zeros)?;
-                    let index = extents
-                        .iter()
-                        .position(|extent| extent.contains_file_block(file_block))
-                        .ok_or(FsError::Corrupted)?;
-                    let mut extent = extents.remove(index);
-                    let before = file_block - extent.file_offset;
-                    let after = extent
-                        .block_count
-                        .checked_sub(before as u32 + 1)
-                        .ok_or(FsError::Corrupted)?;
-                    let start = extent.start_block;
-                    extent.block_count = before as u32;
-                    if before != 0 {
-                        extents.insert(index, extent);
-                    }
-                    let converted_index = index + usize::from(before != 0);
-                    let converted_start = start
-                        .checked_add(before)
+                    .position(|extent| extent.file_offset > file_block)
+                    .unwrap_or(extents.len());
+                extents.insert(
+                    insert_at,
+                    Extent {
+                        file_offset: file_block,
+                        start_block: disk_block,
+                        block_count: 1,
+                        is_unwritten: false,
+                    },
+                );
+                coalesce_extents(&mut extents)?;
+                (disk_block, true)
+            };
+            self.allocator.ensure_extent_unshared(disk_block, 1)?;
+            if zero_first {
+                let zeros = vec![0u8; block_size as usize];
+                self.write_data_block(disk_block, &zeros)?;
+                let index = extents
+                    .iter()
+                    .position(|extent| extent.contains_file_block(file_block))
+                    .ok_or(FsError::Corrupted)?;
+                let mut extent = extents.remove(index);
+                let before = file_block - extent.file_offset;
+                let after = extent
+                    .block_count
+                    .checked_sub(before as u32 + 1)
+                    .ok_or(FsError::Corrupted)?;
+                let start = extent.start_block;
+                extent.block_count = before as u32;
+                if before != 0 {
+                    extents.insert(index, extent);
+                }
+                let converted_index = index + usize::from(before != 0);
+                let converted_start = start
+                    .checked_add(before)
+                    .ok_or(FsError::ArithmeticOverflow)?;
+                extents.insert(
+                    converted_index,
+                    Extent {
+                        file_offset: file_block,
+                        start_block: converted_start,
+                        block_count: 1,
+                        is_unwritten: false,
+                    },
+                );
+                if after != 0 {
+                    let after_start = converted_start
+                        .checked_add(1)
+                        .ok_or(FsError::ArithmeticOverflow)?;
+                    let after_offset = file_block
+                        .checked_add(1)
                         .ok_or(FsError::ArithmeticOverflow)?;
                     extents.insert(
-                        converted_index,
+                        converted_index + 1,
                         Extent {
-                            file_offset: file_block,
-                            start_block: converted_start,
-                            block_count: 1,
-                            is_unwritten: false,
+                            file_offset: after_offset,
+                            start_block: after_start,
+                            block_count: after,
+                            is_unwritten: true,
                         },
                     );
-                    if after != 0 {
-                        let after_start = converted_start
-                            .checked_add(1)
-                            .ok_or(FsError::ArithmeticOverflow)?;
-                        let after_offset = file_block
-                            .checked_add(1)
-                            .ok_or(FsError::ArithmeticOverflow)?;
-                        extents.insert(
-                            converted_index + 1,
-                            Extent {
-                                file_offset: after_offset,
-                                start_block: after_start,
-                                block_count: after,
-                                is_unwritten: true,
-                            },
-                        );
-                    }
-                    coalesce_extents(&mut extents)?;
                 }
+                coalesce_extents(&mut extents)?;
+            }
 
-                let block_start = file_block
+            let block_start = file_block
+                .checked_mul(block_size)
+                .ok_or(FsError::ArithmeticOverflow)?;
+            let range_start = offset.max(block_start);
+            let range_end = end.min(block_start + block_size);
+            let dst = usize::try_from(range_start - block_start)
+                .map_err(|_| FsError::ArithmeticOverflow)?;
+            let src =
+                usize::try_from(range_start - offset).map_err(|_| FsError::ArithmeticOverflow)?;
+            let len = usize::try_from(range_end - range_start)
+                .map_err(|_| FsError::ArithmeticOverflow)?;
+            let mut block = if dst == 0 && len == block_size as usize {
+                vec![0u8; block_size as usize]
+            } else {
+                self.read_block(disk_block)?
+            };
+            block[dst..dst + len].copy_from_slice(&data[src..src + len]);
+            self.write_data_block(disk_block, &block)?;
+        }
+        self.rebuild_data_fork(ino, &mut inode, extents, location.inode_size, batch)?;
+        inode.core.size = inode.core.size.max(end);
+        let info = inode_to_file_info(
+            ino,
+            &inode,
+            self.superblock.block_size,
+            self.superblock.has_bigtime(),
+            self.filesystem_size,
+        )?;
+        self.stage_inode(batch, ino, location, &inode)?;
+        Ok((data.len(), info))
+    }
+
+    /// Stage one inode's delalloc flush into a batch shared with other inodes.
+    pub fn stage_delalloc_to_size(
+        &mut self,
+        ino: u64,
+        pending: &PendingWrites,
+        size: u64,
+        batch: &mut WriteBatch,
+    ) -> FsResult<VfsFileInfo> {
+        if size > i64::MAX as u64 {
+            return Err(FsError::FileTooLarge);
+        }
+        if !pending.is_empty() {
+            let block_size = u64::from(self.superblock.block_size);
+            let retained_blocks = size.div_ceil(block_size);
+            for (file_block, block) in pending.ranges() {
+                if file_block >= retained_blocks {
+                    break;
+                }
+                let offset = file_block
                     .checked_mul(block_size)
                     .ok_or(FsError::ArithmeticOverflow)?;
-                let range_start = offset.max(block_start);
-                let range_end = end.min(block_start + block_size);
-                let dst = usize::try_from(range_start - block_start)
-                    .map_err(|_| FsError::ArithmeticOverflow)?;
-                let src = usize::try_from(range_start - offset)
-                    .map_err(|_| FsError::ArithmeticOverflow)?;
-                let len = usize::try_from(range_end - range_start)
-                    .map_err(|_| FsError::ArithmeticOverflow)?;
-                let mut block = if dst == 0 && len == block_size as usize {
-                    vec![0u8; block_size as usize]
-                } else {
-                    self.read_block(disk_block)?
-                };
-                block[dst..dst + len].copy_from_slice(&data[src..src + len]);
-                self.write_data_block(disk_block, &block)?;
+                self.stage_write_data_with_info(ino, offset, block, batch)?;
             }
         }
-        self.device.flush().map_err(|_| FsError::DiskError)?;
-
-        let mut batch = WriteBatch::new();
-        self.rebuild_data_fork(ino, &mut inode, extents, location.inode_size, &mut batch)?;
-        inode.core.size = inode.core.size.max(end);
-        self.commit_inode_with_batch(ino, location, inode, batch)?;
-        self.data_rollback.clear();
-        Ok(data.len())
+        self.stage_set_size(ino, size, batch)?;
+        let location = self.inode_location(ino)?;
+        let inode = self.read_inode(ino, location)?;
+        inode_to_file_info(
+            ino,
+            &inode,
+            self.superblock.block_size,
+            self.superblock.has_bigtime(),
+            self.filesystem_size,
+        )
     }
 
     /// Change logical file size, freeing and zeroing extents on shrink and
     /// preserving holes on extend.
     pub fn set_size(&mut self, ino: u64, new_size: u64) -> FsResult<()> {
+        let mut batch = WriteBatch::new();
+        self.stage_set_size(ino, new_size, &mut batch)?;
+        self.flush_staged_data()?;
+        self.commit_batch(&mut batch)?;
+        self.data_rollback.clear();
+        Ok(())
+    }
+
+    fn stage_set_size(&mut self, ino: u64, new_size: u64, batch: &mut WriteBatch) -> FsResult<()> {
         if new_size > i64::MAX as u64 {
             return Err(FsError::FileTooLarge);
         }
@@ -295,7 +622,6 @@ impl WriteContext<'_> {
             return Ok(());
         }
         let block_size = u64::from(self.superblock.block_size);
-        let mut batch = WriteBatch::new();
 
         if new_size < inode.core.size {
             match &mut inode.data_fork {
@@ -304,11 +630,7 @@ impl WriteContext<'_> {
                     data.truncate(size);
                 }
                 DataFork::Extents(_) | DataFork::Btree { .. } => {
-                    let read_block = |block| self.read_block(block);
-                    let mut extents = inode.collect_extents(
-                        &ClosureBlockReader::new(&read_block),
-                        self.superblock.is_v5(),
-                    )?;
+                    let mut extents = self.collect_inode_extents(&inode)?;
                     let target_blocks = new_size.div_ceil(block_size);
                     let mut retained = Vec::with_capacity(extents.len());
                     for mut extent in extents.drain(..) {
@@ -346,13 +668,7 @@ impl WriteContext<'_> {
                         block[tail..].fill(0);
                         self.write_data_block(disk_block, &block)?;
                     }
-                    self.rebuild_data_fork(
-                        ino,
-                        &mut inode,
-                        retained,
-                        location.inode_size,
-                        &mut batch,
-                    )?;
+                    self.rebuild_data_fork(ino, &mut inode, retained, location.inode_size, batch)?;
                 }
                 _ => return Err(FsError::NotImplemented),
             }
@@ -398,7 +714,7 @@ impl WriteContext<'_> {
                             &mut inode,
                             extents,
                             location.inode_size,
-                            &mut batch,
+                            batch,
                         )?;
                     }
                 }
@@ -408,9 +724,7 @@ impl WriteContext<'_> {
         }
 
         inode.core.size = new_size;
-        self.device.flush().map_err(|_| FsError::DiskError)?;
-        self.commit_inode_with_batch(ino, location, inode, batch)?;
-        self.data_rollback.clear();
+        self.stage_inode(batch, ino, location, &inode)?;
         Ok(())
     }
 
@@ -599,6 +913,9 @@ impl WriteContext<'_> {
         validate_name(name)?;
         let target_location = self.inode_location(target_ino)?;
         let mut target = self.read_inode(target_ino, target_location)?;
+        if target.core.nlink == 0 {
+            return Err(FsError::InodeNotFound);
+        }
         if target.core.is_dir() {
             return Err(FsError::PermissionDenied);
         }
@@ -657,7 +974,12 @@ impl WriteContext<'_> {
     }
 
     /// Remove one directory entry after validating its inode number.
-    pub fn unlink_inode(&mut self, parent_ino: u64, name: &str, target_ino: u64) -> FsResult<()> {
+    pub fn unlink_inode(
+        &mut self,
+        parent_ino: u64,
+        name: &str,
+        target_ino: u64,
+    ) -> FsResult<VfsFileInfo> {
         validate_name(name)?;
         let parent_location = self.inode_location(parent_ino)?;
         let target_location = self.inode_location(target_ino)?;
@@ -687,8 +1009,14 @@ impl WriteContext<'_> {
             target.core.nlink = target.core.nlink.checked_sub(1).ok_or(FsError::Corrupted)?;
         }
         if target.core.nlink == 0 {
-            self.free_inode_data(&mut target)?;
-            self.inode_allocator.free_inode(target_ino)?;
+            if self.pinned_inodes.contains(&target_ino) {
+                let (ag, ag_ino) = self.inode_ag_parts(target_ino)?;
+                target.core.next_unlinked =
+                    self.inode_allocator.insert_unlinked_inode(ag, ag_ino)?;
+            } else {
+                self.free_inode_data(&mut target)?;
+                self.inode_allocator.free_inode(target_ino)?;
+            }
         }
         touch_inode(
             &mut parent.core,
@@ -706,7 +1034,94 @@ impl WriteContext<'_> {
         )?;
         self.stage_inode(&mut batch, parent_ino, parent_location, &parent)?;
         self.stage_inode(&mut batch, target_ino, target_location, &target)?;
+        self.commit_batch(&mut batch)?;
+        inode_to_file_info(
+            target_ino,
+            &target,
+            self.superblock.block_size,
+            self.superblock.has_bigtime(),
+            self.filesystem_size,
+        )
+    }
+
+    /// Reclaim an inode after its final pinned handle is closed. Until then an
+    /// unlinked inode keeps its data blocks allocated, matching POSIX open-file
+    /// deletion semantics and preventing use-after-free by concurrent readers.
+    pub fn reclaim_unlinked_inode(&mut self, ino: u64) -> FsResult<()> {
+        let location = self.inode_location(ino)?;
+        let mut inode = self.read_inode(ino, location)?;
+        if inode.core.nlink != 0 {
+            return Ok(());
+        }
+
+        // Remove the AGI hash-list entry before releasing any blocks or the
+        // inode chunk bitmap. A non-head removal also updates and stages the
+        // predecessor in the same transaction.
+        let (ag, ag_ino) = self.inode_ag_parts(ino)?;
+        let (predecessor, successor) = self.inode_allocator.remove_unlinked_inode(ag, ag_ino)?;
+        if inode.core.next_unlinked != successor {
+            return Err(FsError::Corrupted);
+        }
+        inode.core.next_unlinked = u32::MAX;
+        let mut batch = WriteBatch::new();
+        if let Some(predecessor) = predecessor {
+            let predecessor_ino = self.absolute_inode(ag, predecessor)?;
+            let predecessor_location = self.inode_location(predecessor_ino)?;
+            let mut predecessor_inode = self.read_inode(predecessor_ino, predecessor_location)?;
+            if predecessor_inode.core.nlink != 0 {
+                return Err(FsError::Corrupted);
+            }
+            predecessor_inode.core.next_unlinked = successor;
+            touch_inode(
+                &mut predecessor_inode.core,
+                self.superblock.has_bigtime(),
+                false,
+                false,
+                true,
+            )?;
+            self.stage_inode(
+                &mut batch,
+                predecessor_ino,
+                predecessor_location,
+                &predecessor_inode,
+            )?;
+        }
+
+        self.free_inode_data(&mut inode)?;
+        self.inode_allocator.free_inode(ino)?;
+        touch_inode(
+            &mut inode.core,
+            self.superblock.has_bigtime(),
+            false,
+            false,
+            true,
+        )?;
+        self.stage_inode(&mut batch, ino, location, &inode)?;
         self.commit_batch(&mut batch)
+    }
+
+    fn collect_inode_extents(&self, inode: &Inode) -> FsResult<Vec<Extent>> {
+        match &inode.data_fork {
+            DataFork::Extents(extents) => Ok(extents.clone()),
+            DataFork::Btree {
+                level,
+                num_recs,
+                data,
+            } => {
+                let root = BmbtRoot::parse(data, *level, *num_recs)?;
+                let read_block = |block| self.read_block(block);
+                let reader = ClosureBlockReader::new(&read_block);
+                btree_collect_extents_checked(
+                    &root,
+                    &reader,
+                    self.superblock.is_v5(),
+                    inode.core.ino,
+                    Some(self.superblock.metadata_uuid()),
+                    self.superblock.block_size as usize,
+                )
+            }
+            _ => Err(FsError::NotImplemented),
+        }
     }
 
     fn free_inode_data(&mut self, inode: &mut Inode) -> FsResult<()> {
@@ -715,25 +1130,32 @@ impl WriteContext<'_> {
         }
         match &inode.data_fork {
             DataFork::Local(_) | DataFork::Empty | DataFork::Device { .. } => {}
-            DataFork::Extents(_) | DataFork::Btree { .. } => {
+            DataFork::Extents(extents) => {
+                for extent in extents {
+                    self.free_absolute_extent(extent.start_block, extent.block_count)?;
+                }
+            }
+            DataFork::Btree {
+                level,
+                num_recs,
+                data,
+            } => {
+                let root = BmbtRoot::parse(data, *level, *num_recs)?;
                 let read_block = |block| self.read_block(block);
-                let extents = inode.collect_extents(
-                    &ClosureBlockReader::new(&read_block),
+                let reader = ClosureBlockReader::new(&read_block);
+                let extents = btree_collect_extents_checked(
+                    &root,
+                    &reader,
                     self.superblock.is_v5(),
+                    inode.core.ino,
+                    Some(self.superblock.metadata_uuid()),
+                    self.superblock.block_size as usize,
                 )?;
                 for extent in extents {
                     self.free_absolute_extent(extent.start_block, extent.block_count)?;
                 }
-                if let DataFork::Btree {
-                    level,
-                    num_recs,
-                    data,
-                } = &inode.data_fork
-                {
-                    let root = BmbtRoot::parse(data, *level, *num_recs)?;
-                    for block in self.collect_bmbt_blocks(&root)? {
-                        self.free_absolute_block(block)?;
-                    }
+                for block in self.collect_bmbt_blocks(&root, inode.core.ino)? {
+                    self.free_absolute_block(block)?;
                 }
             }
         }
@@ -838,14 +1260,14 @@ impl WriteContext<'_> {
         new_parent: u64,
         new_name: &str,
         flags: RenameFlags,
-    ) -> FsResult<()> {
+    ) -> FsResult<Option<VfsFileInfo>> {
         if flags.exchange {
             return Err(FsError::NotSupported);
         }
         validate_name(old_name)?;
         validate_name(new_name)?;
         if old_parent == new_parent && old_name == new_name {
-            return Ok(());
+            return Ok(None);
         }
 
         let old_location = self.inode_location(old_parent)?;
@@ -872,7 +1294,7 @@ impl WriteContext<'_> {
             .find(|entry| entry.name == new_name.as_bytes());
         if let Some(destination) = &destination {
             if destination.inode == source.inode {
-                return Ok(());
+                return Ok(None);
             }
             if flags.no_replace || !flags.replace_if_exists {
                 return Err(FsError::AlreadyExists);
@@ -933,8 +1355,14 @@ impl WriteContext<'_> {
                     .ok_or(FsError::Corrupted)?;
             }
             if destination_inode.core.nlink == 0 {
-                self.free_inode_data(destination_inode)?;
-                self.inode_allocator.free_inode(*destination_ino)?;
+                if self.pinned_inodes.contains(destination_ino) {
+                    let (ag, ag_ino) = self.inode_ag_parts(*destination_ino)?;
+                    destination_inode.core.next_unlinked =
+                        self.inode_allocator.insert_unlinked_inode(ag, ag_ino)?;
+                } else {
+                    self.free_inode_data(destination_inode)?;
+                    self.inode_allocator.free_inode(*destination_ino)?;
+                }
             }
             touch_inode(
                 &mut destination_inode.core,
@@ -1007,7 +1435,18 @@ impl WriteContext<'_> {
             )?;
             self.stage_inode(&mut batch, new_parent, new_location, &new_parent_inode)?;
         }
-        self.commit_batch(&mut batch)
+        self.commit_batch(&mut batch)?;
+        match replaced {
+            Some((ino, _, inode)) => inode_to_file_info(
+                ino,
+                &inode,
+                self.superblock.block_size,
+                self.superblock.has_bigtime(),
+                self.filesystem_size,
+            )
+            .map(Some),
+            None => Ok(None),
+        }
     }
 
     fn is_descendant(&self, ancestor: u64, mut inode: u64) -> FsResult<bool> {
@@ -1030,11 +1469,7 @@ impl WriteContext<'_> {
         match &inode.data_fork {
             DataFork::Local(data) => ShortformHeader::parse(data).map(|header| header.parent),
             DataFork::Extents(_) | DataFork::Btree { .. } => {
-                let read_block = |block| self.read_block(block);
-                let extents = inode.collect_extents(
-                    &ClosureBlockReader::new(&read_block),
-                    self.superblock.is_v5(),
-                )?;
+                let extents = self.collect_inode_extents(inode)?;
                 let block_size = u64::from(self.superblock.block_size);
                 for extent in extents {
                     if extent.file_offset.saturating_mul(block_size) >= 1u64 << 35 {
@@ -1167,11 +1602,39 @@ impl WriteContext<'_> {
         Ok(())
     }
 
-    fn commit_batch(&mut self, batch: &mut WriteBatch) -> FsResult<()> {
+    fn stage_transaction_metadata(&mut self, batch: &mut WriteBatch) -> FsResult<()> {
         self.allocator.stage(batch)?;
         self.inode_allocator.stage(batch)?;
         self.stage_superblock(batch)?;
-        batch.commit(self.journal).map(|_| ())
+        self.dirty_blocks.extend(
+            batch
+                .buffer_blocks(u64::from(self.superblock.block_size))
+                .collect::<Vec<_>>(),
+        );
+        Ok(())
+    }
+
+    pub fn flush_staged_data(&self) -> FsResult<()> {
+        self.device.flush().map_err(|_| FsError::DiskError)
+    }
+
+    fn commit_batch(&mut self, batch: &mut WriteBatch) -> FsResult<()> {
+        self.stage_transaction_metadata(batch)?;
+        batch.commit(self.journal)?;
+        self.allocator.finish_transaction();
+        self.inode_allocator.finish_transaction();
+        Ok(())
+    }
+
+    /// Commit one already-staged multi-inode delalloc batch with one log force.
+    pub fn commit_delalloc_batch(&mut self, batch: &mut WriteBatch) -> FsResult<u64> {
+        self.stage_transaction_metadata(batch)?;
+        self.flush_staged_data()?;
+        let lsn = batch.commit_group(self.journal)?;
+        self.allocator.finish_transaction();
+        self.inode_allocator.finish_transaction();
+        self.data_rollback.clear();
+        Ok(lsn)
     }
 
     fn logical_entries(&self, parent_ino: u64, parent: &Inode) -> FsResult<Vec<NewDirEntry>> {
@@ -1182,7 +1645,7 @@ impl WriteContext<'_> {
             self.superblock.block_size,
             self.superblock.total_blocks,
             self.superblock.is_v5(),
-            |block| self.read_block(block),
+            self,
         )?;
         entries
             .into_iter()
@@ -1338,13 +1801,7 @@ impl WriteContext<'_> {
 
         let old_extents = match &inode.data_fork {
             DataFork::Local(_) | DataFork::Empty => Vec::new(),
-            DataFork::Extents(_) | DataFork::Btree { .. } => {
-                let read_block = |block| self.read_block(block);
-                inode.collect_extents(
-                    &ClosureBlockReader::new(&read_block),
-                    self.superblock.is_v5(),
-                )?
-            }
+            DataFork::Extents(_) | DataFork::Btree { .. } => self.collect_inode_extents(inode)?,
             _ => return Err(FsError::NotSupported),
         };
         for extent in &old_extents {
@@ -1592,7 +2049,7 @@ impl WriteContext<'_> {
             } = &inode.data_fork
             {
                 let root = BmbtRoot::parse(data, *level, *num_recs)?;
-                for block in self.collect_bmbt_blocks(&root)? {
+                for block in self.collect_bmbt_blocks(&root, ino)? {
                     self.free_absolute_block(block)?;
                 }
             }
@@ -1607,7 +2064,7 @@ impl WriteContext<'_> {
                     data,
                 } => {
                     let root = BmbtRoot::parse(data, *level, *num_recs)?;
-                    self.collect_bmbt_blocks(&root)?
+                    self.collect_bmbt_blocks(&root, ino)?
                 }
                 _ => Vec::new(),
             };
@@ -1727,8 +2184,8 @@ impl WriteContext<'_> {
     }
 
     fn commit_inode(&mut self, ino: u64, location: InodeLocation, inode: Inode) -> FsResult<()> {
-        let batch = WriteBatch::new();
-        self.commit_inode_with_batch(ino, location, inode, batch)
+        self.commit_inode_with_batch(ino, location, inode, WriteBatch::new())
+            .map(|_| ())
     }
 
     fn commit_inode_with_batch(
@@ -1737,7 +2194,7 @@ impl WriteContext<'_> {
         location: InodeLocation,
         mut inode: Inode,
         mut batch: WriteBatch,
-    ) -> FsResult<()> {
+    ) -> FsResult<VfsFileInfo> {
         touch_inode(
             &mut inode.core,
             self.superblock.has_bigtime(),
@@ -1745,12 +2202,26 @@ impl WriteContext<'_> {
             true,
             true,
         )?;
+        let info = inode_to_file_info(
+            ino,
+            &inode,
+            self.superblock.block_size,
+            self.superblock.has_bigtime(),
+            self.filesystem_size,
+        )?;
         self.stage_inode(&mut batch, ino, location, &inode)?;
         self.allocator.stage(&mut batch)?;
         self.inode_allocator.stage(&mut batch)?;
         self.stage_superblock(&mut batch)?;
+        self.dirty_blocks.extend(
+            batch
+                .buffer_blocks(u64::from(self.superblock.block_size))
+                .collect::<Vec<_>>(),
+        );
         batch.commit(self.journal)?;
-        Ok(())
+        self.allocator.finish_transaction();
+        self.inode_allocator.finish_transaction();
+        Ok(info)
     }
 
     fn allocate_extents(&mut self, file_offset: u64, blocks: u64) -> FsResult<Vec<Extent>> {
@@ -1789,22 +2260,34 @@ impl WriteContext<'_> {
         write_exact_at(self.device.as_ref(), offset, data, self.filesystem_size)
     }
 
-    fn collect_bmbt_blocks(&self, root: &BmbtRoot) -> FsResult<Vec<u64>> {
+    fn collect_bmbt_blocks(&self, root: &BmbtRoot, owner: u64) -> FsResult<Vec<u64>> {
         let mut blocks = Vec::new();
         for ptr in &root.ptrs {
-            self.collect_bmbt_node(ptr.block, root.level, &mut blocks)?;
+            self.collect_bmbt_node(ptr.block, root.level, owner, &mut blocks)?;
         }
         Ok(blocks)
     }
 
-    fn collect_bmbt_node(&self, block: u64, level: u16, output: &mut Vec<u64>) -> FsResult<()> {
+    fn collect_bmbt_node(
+        &self,
+        block: u64,
+        level: u16,
+        owner: u64,
+        output: &mut Vec<u64>,
+    ) -> FsResult<()> {
         if !output.iter().all(|seen| *seen != block) || output.len() > 1 << 20 {
             return Err(FsError::Corrupted);
         }
         output.push(block);
         let raw = self.read_block(block)?;
         let header = BtreeBlockLong::parse(&raw, self.superblock.is_v5())?;
-        header.verify_crc(&raw)?;
+        header.verify_metadata(
+            &raw,
+            block,
+            raw.len(),
+            Some(owner),
+            Some(self.superblock.metadata_uuid()),
+        )?;
         if header.level.checked_add(1) != Some(level) {
             return Err(FsError::Corrupted);
         }
@@ -1814,7 +2297,7 @@ impl WriteContext<'_> {
                 let offset = ptrs_offset + index * 8;
                 let bytes = raw.get(offset..offset + 8).ok_or(FsError::Corrupted)?;
                 let ptr = u64::from_be_bytes(bytes.try_into().map_err(|_| FsError::Corrupted)?);
-                self.collect_bmbt_node(ptr, header.level, output)?;
+                self.collect_bmbt_node(ptr, header.level, owner, output)?;
             }
         }
         Ok(())
@@ -1835,6 +2318,33 @@ impl WriteContext<'_> {
         let mut raw = vec![0u8; block_size];
         read_exact_at(self.device.as_ref(), offset, &mut raw, self.filesystem_size)?;
         Ok(raw)
+    }
+
+    fn inode_ag_parts(&self, ino: u64) -> FsResult<(u32, u32)> {
+        let shift = u32::from(self.superblock.ag_block_log)
+            + u32::from(self.superblock.inode_per_block_log);
+        if shift >= 32 {
+            return Err(FsError::Corrupted);
+        }
+        let ag = ino >> shift;
+        if ag >= u64::from(self.superblock.ag_count) {
+            return Err(FsError::InodeNotFound);
+        }
+        let ag_ino = ino & ((1u64 << shift) - 1);
+        let ag_ino = u32::try_from(ag_ino).map_err(|_| FsError::InodeNotFound)?;
+        Ok((ag as u32, ag_ino))
+    }
+
+    fn absolute_inode(&self, ag: u32, ag_ino: u32) -> FsResult<u64> {
+        if ag >= self.superblock.ag_count {
+            return Err(FsError::InodeNotFound);
+        }
+        let shift = u32::from(self.superblock.ag_block_log)
+            + u32::from(self.superblock.inode_per_block_log);
+        if shift >= 32 || u64::from(ag_ino) >= (1u64 << shift) {
+            return Err(FsError::InodeNotFound);
+        }
+        Ok((u64::from(ag) << shift) | u64::from(ag_ino))
     }
 
     fn inode_location(&self, ino: u64) -> FsResult<InodeLocation> {
@@ -1873,6 +2383,9 @@ impl WriteContext<'_> {
     }
 
     fn read_inode(&self, ino: u64, location: InodeLocation) -> FsResult<Inode> {
+        if let Some(inode) = self.staged_inodes.get(&ino) {
+            return Ok(inode.clone());
+        }
         let block =
             self.read_block(location.block_offset / u64::from(self.superblock.block_size))?;
         let end = location
@@ -1888,12 +2401,15 @@ impl WriteContext<'_> {
             if inode.core.version >= 3 && inode.core.ino != ino {
                 return Err(FsError::Corrupted);
             }
+            if inode.core.uuid != self.superblock.metadata_uuid() {
+                return Err(FsError::Corrupted);
+            }
         }
         Ok(inode)
     }
 
     fn stage_inode(
-        &self,
+        &mut self,
         batch: &mut WriteBatch,
         ino: u64,
         location: InodeLocation,
@@ -1901,6 +2417,10 @@ impl WriteContext<'_> {
     ) -> FsResult<()> {
         if inode.core.version >= 3 && inode.core.ino != ino {
             return Err(FsError::InvalidArgument);
+        }
+        self.dirty_inodes.insert(ino);
+        if inode.core.is_dir() {
+            self.dirty_directories.insert(ino);
         }
         let serialized = serialize_inode(inode, location.inode_size)?;
         let mut block = batch.read_buffer(
@@ -1947,6 +2467,7 @@ impl WriteContext<'_> {
             location.inode_size,
             self.journal.current_lsn(),
         )?);
+        self.staged_inodes.insert(ino, inode.clone());
         Ok(())
     }
 }
@@ -2001,4 +2522,77 @@ fn coalesce_extents(extents: &mut Vec<Extent>) -> FsResult<()> {
     }
     *extents = merged;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delalloc_budget_is_bounded_and_overwrites_do_not_allocate() {
+        let budget = DelallocBudget::with_capacity(128);
+        let mut pending = PendingWrites::default();
+        pending
+            .write(0, &[0x11; 64], 64, 0, &budget, |_| unreachable!())
+            .unwrap();
+        assert_eq!(budget.available(), 64);
+        pending
+            .write(64, &[0x22; 64], 64, 64, &budget, |_| unreachable!())
+            .unwrap();
+        assert_eq!(budget.available(), 0);
+        assert!(matches!(
+            pending.write(128, &[0x33; 64], 64, 128, &budget, |_| unreachable!()),
+            Err(FsError::OutOfMemory)
+        ));
+        assert_eq!(pending.size(), 128);
+        assert_eq!(pending.memory_bytes(64), 128);
+
+        pending
+            .write(0, &[0x44; 64], 64, 128, &budget, |_| unreachable!())
+            .unwrap();
+        assert_eq!(budget.available(), 0);
+        let mut read = [0u8; 128];
+        pending.overlay_read(0, &mut read, 64);
+        assert_eq!(&read[..64], &[0x44; 64]);
+        assert_eq!(&read[64..], &[0x22; 64]);
+    }
+
+    #[test]
+    fn failed_multi_block_write_restores_prior_blocks_and_budget() {
+        let budget = DelallocBudget::with_capacity(256);
+        let mut pending = PendingWrites::default();
+        pending
+            .write(0, &[0x11; 64], 64, 0, &budget, |_| unreachable!())
+            .unwrap();
+        let available = budget.available();
+        let result = pending.write(0, &[0x99; 65], 64, 64, &budget, |file_block| {
+            if file_block == 1 {
+                Err(FsError::DiskError)
+            } else {
+                Ok(vec![0xAA; 64])
+            }
+        });
+        assert!(matches!(result, Err(FsError::DiskError)));
+        assert_eq!(budget.available(), available);
+        assert_eq!(pending.memory_bytes(64), 64);
+        assert_eq!(pending.size(), 64);
+        let mut read = [0u8; 64];
+        pending.overlay_read(0, &mut read, 64);
+        assert_eq!(read, [0x11; 64]);
+    }
+
+    #[test]
+    fn partial_delalloc_write_preserves_disk_bytes_and_zeroes_holes() {
+        let budget = DelallocBudget::with_capacity(128);
+        let mut pending = PendingWrites {
+            size: 64,
+            ..PendingWrites::default()
+        };
+        pending
+            .write(3, b"XY", 64, 64, &budget, |_| Ok(vec![0xAA; 64]))
+            .unwrap();
+        let mut read = [0u8; 8];
+        pending.overlay_read(0, &mut read, 64);
+        assert_eq!(read, [0xAA, 0xAA, 0xAA, b'X', b'Y', 0xAA, 0xAA, 0xAA]);
+    }
 }

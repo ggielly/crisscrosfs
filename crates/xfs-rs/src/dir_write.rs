@@ -860,6 +860,21 @@ fn write_dir3_identification(
     raw[48..56].copy_from_slice(&owner.to_be_bytes());
 }
 
+/// Identification fields for dir3 data/block/free headers, which start with
+/// magic/CRC rather than the DA-node link/magic header.
+fn write_dir3_block_identification(
+    raw: &mut [u8],
+    disk_address: u64,
+    lsn: u64,
+    uuid: [u8; 16],
+    owner: u64,
+) {
+    raw[8..16].copy_from_slice(&disk_address.to_be_bytes());
+    raw[16..24].copy_from_slice(&lsn.to_be_bytes());
+    raw[24..40].copy_from_slice(&uuid);
+    raw[40..48].copy_from_slice(&owner.to_be_bytes());
+}
+
 /// Build data blocks, LEAFN blocks, a DA node root, and one free-index block.
 ///
 /// `disk_addresses` is ordered as data blocks, leaf blocks, root node, free
@@ -934,7 +949,10 @@ pub fn build_node_directory(
     leaf_entries.sort_by_key(|entry| entry.hashval);
 
     let leaf_header_size = if is_v5 { 64 } else { 16 };
-    let leaf_offset = (1u64 << 35) / block_size as u64;
+    // DA sibling and node pointers are logical filesystem-block numbers, not
+    // directory-block numbers. This builder currently emits one filesystem
+    // block per directory block, so block_size is also the filesystem size.
+    let leaf_offset = XFS_DIR2_LEAF_OFFSET / block_size as u64;
     let mut leaf_blocks = Vec::with_capacity(leaf_count);
     let mut root_entries = Vec::with_capacity(leaf_count);
     for (leaf_index, chunk) in leaf_entries.chunks(leaf_capacity).enumerate() {
@@ -1000,23 +1018,23 @@ pub fn build_node_directory(
     let mut free = vec![0u8; block_size];
     if is_v5 {
         free[0..4].copy_from_slice(&XFS_DIR3_FREE_MAGIC.to_be_bytes());
-        write_dir3_identification(&mut free, free_address, lsn, uuid, owner);
-        free[56..60].copy_from_slice(&0u32.to_be_bytes());
-        free[60..64].copy_from_slice(&(data_count as u32).to_be_bytes());
-        free[64..68].copy_from_slice(&(data_count as u32).to_be_bytes());
+        write_dir3_block_identification(&mut free, free_address, lsn, uuid, owner);
+        free[48..52].copy_from_slice(&0u32.to_be_bytes());
+        free[52..56].copy_from_slice(&(data_count as u32).to_be_bytes());
+        free[56..60].copy_from_slice(&(data_count as u32).to_be_bytes());
     } else {
         free[0..4].copy_from_slice(&XFS_DIR2_FREE_MAGIC.to_be_bytes());
         free[4..8].copy_from_slice(&0u32.to_be_bytes());
         free[8..12].copy_from_slice(&(data_count as u32).to_be_bytes());
         free[12..16].copy_from_slice(&(data_count as u32).to_be_bytes());
     }
-    let bests_offset = if is_v5 { 72 } else { 16 };
+    let bests_offset = if is_v5 { 64 } else { 16 };
     for (index, best) in best_free.iter().enumerate() {
         let offset = bests_offset + index * 2;
         free[offset..offset + 2].copy_from_slice(&best.to_be_bytes());
     }
     if is_v5 {
-        crate::crc::recalculate_crc_le(&mut free, 12).ok_or(FsError::BufferTooSmall)?;
+        crate::crc::recalculate_crc_le(&mut free, 4).ok_or(FsError::BufferTooSmall)?;
     }
     Ok(DirNodeBuild {
         data_blocks,
@@ -1176,6 +1194,8 @@ pub fn parse_block_directory(
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use super::*;
     use crate::directory::DirFileType;
 
@@ -1275,7 +1295,7 @@ mod tests {
             } else {
                 XFS_DIR2_LEAFN_MAGIC
             };
-            let leaf_offset = (1u64 << 35) / 512;
+            let leaf_offset = XFS_DIR2_LEAF_OFFSET / 512;
             for (index, leaf) in build.leaf_blocks.iter().enumerate() {
                 assert_eq!(u16::from_be_bytes([leaf[8], leaf[9]]), leaf_magic);
                 let logical = leaf_offset + index as u64 + 1;
@@ -1329,7 +1349,7 @@ mod tests {
                 ]);
                 assert!(crate::crc::verify_crc32c_field(&build.root_block, 12, crc, true).is_ok());
             }
-            let (firstdb, nvalid, nused) = if is_v5 { (56, 60, 64) } else { (4, 8, 12) };
+            let (firstdb, nvalid, nused) = if is_v5 { (48, 52, 56) } else { (4, 8, 12) };
             assert_eq!(
                 u32::from_be_bytes([
                     build.free_block[firstdb],
@@ -1357,6 +1377,17 @@ mod tests {
                 ]),
                 data_count as u32
             );
+            if is_v5 {
+                assert_eq!(
+                    u32::from_be_bytes(build.free_block[0..4].try_into().unwrap()),
+                    XFS_DIR3_FREE_MAGIC
+                );
+                let free_header = crate::directory::FreeHeaderV5::parse(&build.free_block).unwrap();
+                assert_eq!(free_header.first_db, 0);
+                assert_eq!(free_header.nvalid, data_count as u32);
+                assert_eq!(free_header.nused, data_count as u32);
+                free_header.verify_crc(&build.free_block).unwrap();
+            }
         }
     }
 

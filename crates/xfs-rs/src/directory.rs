@@ -9,6 +9,23 @@ use fs_abstraction::{safe_math::CheckedSliceOps, FsError, FsResult};
 
 use crate::constants::*;
 
+/// Checked, hash-directed lookup for extent and B+tree directory forks.
+///
+/// This module is declared here so the lookup API remains available as
+/// `xfs_rs::directory::dir_lookup` without changing the crate root.
+#[cfg(feature = "alloc")]
+#[path = "dir_lookup.rs"]
+pub mod dir_lookup;
+
+#[cfg(feature = "alloc")]
+pub use dir_lookup::{
+    lookup_directory,
+    DirGeometry,
+    DirLookupOptions,
+    MAX_DIR_LOOKUP_BLOCKS_DEFAULT,
+    MAX_DIR_LOOKUP_DEPTH_DEFAULT,
+};
+
 /// Calculate the canonical XFS directory hash for a name.
 ///
 /// XFS consumes complete groups of four bytes with the canonical
@@ -340,6 +357,9 @@ impl DataHeaderV5 {
             return Err(FsError::BufferTooSmall);
         }
         let magic = buffer.read_be_u32(0)?;
+        if magic != XFS_DIR3_DATA_MAGIC && magic != XFS_DIR3_BLOCK_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
         let crc = buffer.read_le_u32(4)?;
         let block_no = buffer.read_be_u64(8)?;
         let lsn = buffer.read_be_u64(16)?;
@@ -361,6 +381,51 @@ impl DataHeaderV5 {
             best_free,
         })
     }
+
+    /// Verify the CRC over the complete directory block.
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if raw.len() < Self::SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
+        verify_dir3_crc(raw, 4, self.crc)
+    }
+
+    /// Verify CRC, physical block number, directory owner and optional UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        expected_owner: u64,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw)?;
+        let expected = crate::address::fs_block_to_daddr(expected_fs_block, raw.len())?;
+        if self.block_no != expected
+            || self.owner != expected_owner
+            || expected_uuid.is_some_and(|uuid| self.uuid != uuid)
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+}
+
+/// Verify a dir3 CRC field.
+///
+/// The parser historically reads these fields as little-endian, matching the
+/// existing image fixtures. Accept the byte-swapped representation as well so
+/// metadata produced by the opposite host-endian convention remains readable;
+/// in both cases the stored value must equal the calculated CRC32C.
+fn verify_dir3_crc(raw: &[u8], offset: usize, crc: u32) -> FsResult<()> {
+    let end = offset.checked_add(4).ok_or(FsError::ArithmeticOverflow)?;
+    let field = raw.get(offset..end).ok_or(FsError::BufferTooSmall)?;
+    let stored_le = u32::from_le_bytes([field[0], field[1], field[2], field[3]]);
+    let stored_be = stored_le.swap_bytes();
+    if crc != stored_le && crc != stored_be {
+        return Err(FsError::Corrupted);
+    }
+    crate::crc::verify_crc32c_field(raw, offset, stored_le, true)
+        .or_else(|_| crate::crc::verify_crc32c_field(raw, offset, stored_be, false))
 }
 
 /// A leaf entry in a block or leaf directory.
@@ -474,6 +539,201 @@ impl BlockInfoV5 {
             uuid,
             owner: buffer.read_be_u64(offset + 48)?,
         })
+    }
+
+    /// Verify the CRC over the complete directory block.
+    pub fn verify_crc(&self, raw: &[u8], offset: usize) -> FsResult<()> {
+        let end = offset
+            .checked_add(Self::SIZE)
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if end > raw.len() {
+            return Err(FsError::BufferTooSmall);
+        }
+        verify_dir3_crc(raw, offset + 12, self.crc)
+    }
+
+    /// Verify CRC, physical block number, directory owner and optional UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        offset: usize,
+        expected_fs_block: u64,
+        expected_owner: u64,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw, offset)?;
+        let expected = crate::address::fs_block_to_daddr(expected_fs_block, raw.len())?;
+        if self.block_no != expected
+            || self.owner != expected_owner
+            || expected_uuid.is_some_and(|uuid| self.uuid != uuid)
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+}
+
+impl LeafHeaderV5 {
+    /// Parse a v5 directory leaf header at the start of `buffer`.
+    pub fn parse(buffer: &[u8]) -> FsResult<Self> {
+        let info = BlockInfoV5::parse(buffer, 0)?;
+        if info.magic != XFS_DIR3_LEAF_MAGIC && info.magic != XFS_DIR3_LEAFN_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
+        let count = buffer.read_be_u16(BlockInfoV5::SIZE)?;
+        let stale = buffer.read_be_u16(BlockInfoV5::SIZE + 2)?;
+        if stale > count {
+            return Err(FsError::Corrupted);
+        }
+        Ok(Self { info, count, stale })
+    }
+
+    /// Verify CRC, physical block number, directory owner and optional UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        expected_owner: u64,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.info
+            .verify_metadata(raw, 0, expected_fs_block, expected_owner, expected_uuid)
+    }
+}
+
+/// Header of a v5 directory free-index block.
+#[derive(Debug, Clone)]
+pub struct FreeHeaderV5 {
+    pub magic: u32,
+    pub crc: u32,
+    pub block_no: u64,
+    pub lsn: u64,
+    pub uuid: [u8; 16],
+    pub owner: u64,
+    pub first_db: u32,
+    pub nvalid: u32,
+    pub nused: u32,
+}
+
+impl FreeHeaderV5 {
+    pub const SIZE: usize = 64;
+
+    /// Parse a v5 directory free-index header at the start of `buffer`.
+    pub fn parse(buffer: &[u8]) -> FsResult<Self> {
+        if buffer.len() < Self::SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
+        let magic = buffer.read_be_u32(0)?;
+        if magic != XFS_DIR3_FREE_MAGIC {
+            return Err(FsError::InvalidMagic);
+        }
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&buffer[24..40]);
+        let header = Self {
+            magic,
+            crc: buffer.read_be_u32(4)?,
+            block_no: buffer.read_be_u64(8)?,
+            lsn: buffer.read_be_u64(16)?,
+            uuid,
+            owner: buffer.read_be_u64(40)?,
+            first_db: buffer.read_be_u32(48)?,
+            nvalid: buffer.read_be_u32(52)?,
+            nused: buffer.read_be_u32(56)?,
+        };
+        if header.nused > header.nvalid {
+            return Err(FsError::Corrupted);
+        }
+        Ok(header)
+    }
+
+    /// Verify the CRC over the complete directory free-index block.
+    pub fn verify_crc(&self, raw: &[u8]) -> FsResult<()> {
+        if raw.len() < Self::SIZE {
+            return Err(FsError::BufferTooSmall);
+        }
+        verify_dir3_crc(raw, 4, self.crc)
+    }
+
+    /// Verify CRC, physical block number, directory owner and optional UUID.
+    pub fn verify_metadata(
+        &self,
+        raw: &[u8],
+        expected_fs_block: u64,
+        expected_owner: u64,
+        expected_uuid: Option<[u8; 16]>,
+    ) -> FsResult<()> {
+        self.verify_crc(raw)?;
+        let expected = crate::address::fs_block_to_daddr(expected_fs_block, raw.len())?;
+        if self.block_no != expected
+            || self.owner != expected_owner
+            || expected_uuid.is_some_and(|uuid| self.uuid != uuid)
+        {
+            return Err(FsError::Corrupted);
+        }
+        Ok(())
+    }
+}
+
+/// Verify the CRC of any v5 directory data, block, leaf, node or free-index
+/// header without checking its location or owner.
+pub fn verify_v5_directory_block_crc(raw: &[u8]) -> FsResult<()> {
+    let magic = raw.read_be_u32(0)?;
+    match magic {
+        XFS_DIR3_DATA_MAGIC | XFS_DIR3_BLOCK_MAGIC => DataHeaderV5::parse(raw)?.verify_crc(raw),
+        XFS_DIR3_FREE_MAGIC => FreeHeaderV5::parse(raw)?.verify_crc(raw),
+        _ => {
+            let magic16 = raw.read_be_u16(8)?;
+            if !matches!(
+                magic16,
+                XFS_DIR3_LEAF_MAGIC | XFS_DIR3_LEAFN_MAGIC | XFS_DIR3_NODE_MAGIC
+            ) {
+                return Err(FsError::InvalidMagic);
+            }
+            BlockInfoV5::parse(raw, 0)?.verify_crc(raw, 0)
+        }
+    }
+}
+
+/// Verify any v5 directory data, block, leaf, node or free-index header.
+///
+/// `raw` must be exactly one complete directory block. `expected_fs_block` is
+/// the absolute filesystem block requested from the backing device.
+pub fn verify_v5_directory_block(
+    raw: &[u8],
+    expected_fs_block: u64,
+    expected_owner: u64,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<()> {
+    let magic = raw.read_be_u32(0)?;
+    match magic {
+        XFS_DIR3_DATA_MAGIC | XFS_DIR3_BLOCK_MAGIC => DataHeaderV5::parse(raw)?.verify_metadata(
+            raw,
+            expected_fs_block,
+            expected_owner,
+            expected_uuid,
+        ),
+        XFS_DIR3_FREE_MAGIC => FreeHeaderV5::parse(raw)?.verify_metadata(
+            raw,
+            expected_fs_block,
+            expected_owner,
+            expected_uuid,
+        ),
+        _ => {
+            // DA leaf/node blocks begin with forw/back pointers; their magic
+            // is the third field in xfs_da_blkinfo at offset 8.
+            let magic16 = raw.read_be_u16(8)?;
+            if !matches!(
+                magic16,
+                XFS_DIR3_LEAF_MAGIC | XFS_DIR3_LEAFN_MAGIC | XFS_DIR3_NODE_MAGIC
+            ) {
+                return Err(FsError::InvalidMagic);
+            }
+            let info = BlockInfoV5::parse(raw, 0)?;
+            if info.magic != magic16 {
+                return Err(FsError::InvalidMagic);
+            }
+            info.verify_metadata(raw, 0, expected_fs_block, expected_owner, expected_uuid)
+        }
     }
 }
 
@@ -631,6 +891,44 @@ pub fn find_entry_block(
     has_ftype: bool,
     is_v5: bool,
 ) -> FsResult<DirEntry> {
+    find_entry_block_internal(buffer, name, block_size, has_ftype, is_v5, None, None, None)
+}
+
+/// Owner- and location-aware variant of [`find_entry_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn find_entry_block_checked(
+    buffer: &[u8],
+    name: &[u8],
+    block_size: u32,
+    has_ftype: bool,
+    is_v5: bool,
+    expected_fs_block: u64,
+    expected_owner: u64,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<DirEntry> {
+    find_entry_block_internal(
+        buffer,
+        name,
+        block_size,
+        has_ftype,
+        is_v5,
+        Some(expected_fs_block),
+        Some(expected_owner),
+        expected_uuid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_entry_block_internal(
+    buffer: &[u8],
+    name: &[u8],
+    block_size: u32,
+    has_ftype: bool,
+    is_v5: bool,
+    expected_fs_block: Option<u64>,
+    expected_owner: Option<u64>,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<DirEntry> {
     let block_size = usize::try_from(block_size).map_err(|_| FsError::Corrupted)?;
     if block_size < BlockTail::SIZE {
         return Err(FsError::Corrupted);
@@ -645,6 +943,15 @@ pub fn find_entry_block(
     };
     if buffer.read_be_u32(0)? != expected_magic {
         return Err(FsError::InvalidMagic);
+    }
+    let block = &buffer[..block_size];
+    if is_v5 {
+        if let (Some(expected_fs_block), Some(expected_owner)) = (expected_fs_block, expected_owner)
+        {
+            verify_v5_directory_block(block, expected_fs_block, expected_owner, expected_uuid)?;
+        } else {
+            DataHeaderV5::parse(block)?.verify_crc(block)?;
+        }
     }
 
     let tail_offset = block_size - BlockTail::SIZE;
@@ -691,6 +998,53 @@ pub fn parse_data_block<'a>(
     is_block_format: bool,
     block_size: u32,
 ) -> FsResult<DataDirIter<'a>> {
+    parse_data_block_internal(
+        buffer,
+        has_ftype,
+        is_v5,
+        is_block_format,
+        block_size,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Owner- and location-aware variant of [`parse_data_block`].
+#[allow(clippy::too_many_arguments)]
+pub fn parse_data_block_checked<'a>(
+    buffer: &'a [u8],
+    has_ftype: bool,
+    is_v5: bool,
+    is_block_format: bool,
+    block_size: u32,
+    expected_fs_block: u64,
+    expected_owner: u64,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<DataDirIter<'a>> {
+    parse_data_block_internal(
+        buffer,
+        has_ftype,
+        is_v5,
+        is_block_format,
+        block_size,
+        Some(expected_fs_block),
+        Some(expected_owner),
+        expected_uuid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_data_block_internal<'a>(
+    buffer: &'a [u8],
+    has_ftype: bool,
+    is_v5: bool,
+    is_block_format: bool,
+    block_size: u32,
+    expected_fs_block: Option<u64>,
+    expected_owner: Option<u64>,
+    expected_uuid: Option<[u8; 16]>,
+) -> FsResult<DataDirIter<'a>> {
     let block_size = usize::try_from(block_size).map_err(|_| FsError::Corrupted)?;
     if buffer.len() < block_size {
         return Err(FsError::BufferTooSmall);
@@ -707,6 +1061,15 @@ pub fn parse_data_block<'a>(
     };
     if buffer.read_be_u32(0)? != expected_magic {
         return Err(FsError::InvalidMagic);
+    }
+    let block = &buffer[..block_size];
+    if is_v5 {
+        if let (Some(expected_fs_block), Some(expected_owner)) = (expected_fs_block, expected_owner)
+        {
+            verify_v5_directory_block(block, expected_fs_block, expected_owner, expected_uuid)?;
+        } else {
+            DataHeaderV5::parse(block)?.verify_crc(block)?;
+        }
     }
 
     let header_size = if is_v5 {
@@ -754,6 +1117,9 @@ pub fn validate_dir_block_magic(magic: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -849,6 +1215,64 @@ mod tests {
         let header = DataHeaderV5::parse(&buf).unwrap();
         assert_eq!(header.crc, crc);
         assert_eq!(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]), crc);
+    }
+
+    #[test]
+    fn v5_directory_headers_verify_crc_blkno_owner_and_uuid() {
+        let owner = 77u64;
+        let uuid = [0xA5; 16];
+        let cases = [
+            (XFS_DIR3_DATA_MAGIC as u64, 8, 24, 40),
+            (XFS_DIR3_BLOCK_MAGIC as u64, 8, 24, 40),
+            (u64::from(XFS_DIR3_LEAF_MAGIC), 16, 32, 48),
+            (u64::from(XFS_DIR3_LEAFN_MAGIC), 16, 32, 48),
+            (u64::from(XFS_DIR3_NODE_MAGIC), 16, 32, 48),
+            (XFS_DIR3_FREE_MAGIC as u64, 8, 24, 40),
+        ];
+        for (magic, block_offset, uuid_offset, owner_offset) in cases {
+            let mut block = vec![0u8; 512];
+            if magic <= u64::from(u16::MAX) {
+                block[8..10].copy_from_slice(&(magic as u16).to_be_bytes());
+            } else {
+                block[..4].copy_from_slice(&(magic as u32).to_be_bytes());
+            }
+            block[block_offset..block_offset + 8].copy_from_slice(&3u64.to_be_bytes());
+            block[uuid_offset..uuid_offset + 16].copy_from_slice(&uuid);
+            block[owner_offset..owner_offset + 8].copy_from_slice(&owner.to_be_bytes());
+            let crc_offset = if magic <= u64::from(u16::MAX) { 12 } else { 4 };
+            crate::crc::recalculate_crc_be(&mut block, crc_offset).unwrap();
+            assert!(
+                verify_v5_directory_block(&block, 3, owner, Some(uuid)).is_ok(),
+                "magic {magic:08x}"
+            );
+
+            let mut wrong_block = block.clone();
+            wrong_block[block_offset..block_offset + 8].copy_from_slice(&4u64.to_be_bytes());
+            crate::crc::recalculate_crc_be(&mut wrong_block, crc_offset).unwrap();
+            assert!(matches!(
+                verify_v5_directory_block(&wrong_block, 3, owner, Some(uuid)),
+                Err(FsError::Corrupted)
+            ));
+
+            let mut wrong_owner = block.clone();
+            wrong_owner[owner_offset..owner_offset + 8].copy_from_slice(&78u64.to_be_bytes());
+            crate::crc::recalculate_crc_be(&mut wrong_owner, crc_offset).unwrap();
+            assert!(matches!(
+                verify_v5_directory_block(&wrong_owner, 3, owner, Some(uuid)),
+                Err(FsError::Corrupted)
+            ));
+            assert!(matches!(
+                verify_v5_directory_block(&block, 3, owner, Some([0xAA; 16])),
+                Err(FsError::Corrupted)
+            ));
+
+            let mut bad_crc = block;
+            bad_crc[200] ^= 1;
+            assert!(matches!(
+                verify_v5_directory_block(&bad_crc, 3, owner, Some(uuid)),
+                Err(FsError::Corrupted)
+            ));
+        }
     }
 
     #[test]

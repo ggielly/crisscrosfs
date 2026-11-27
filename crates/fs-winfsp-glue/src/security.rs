@@ -35,10 +35,14 @@
 //! not receive `FILE_DELETE_CHILD`; setuid/setgid have no Windows ACL
 //! equivalent and are intentionally ignored.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, MutexGuard},
+};
 
-use fs_abstraction::types::VfsFileInfo;
+use fs_abstraction::{types::VfsFileInfo, FsError};
 use serde::Deserialize;
+use xfs_rs::attr::{AclEntryTag, PosixAcl};
 
 const SD_REVISION: u8 = 1;
 const SID_REVISION: u8 = 1;
@@ -97,6 +101,13 @@ fn system_sid() -> Vec<u8> {
 fn administrators_sid() -> Vec<u8> {
     // S-1-5-32-544
     sid([0, 0, 0, 0, 0, 5], &[32, 544])
+}
+
+fn valid_sid(bytes: &[u8]) -> bool {
+    bytes.len() >= 8
+        && bytes[0] == SID_REVISION
+        && bytes[1] <= 15
+        && bytes.len() == 8 + usize::from(bytes[1]) * 4
 }
 
 /// Returns the SID of the user owning the current process.
@@ -310,6 +321,10 @@ fn build_security_descriptor(owner: &[u8], group: &[u8], aces: &[(u8, u32, &[u8]
     sd
 }
 
+type DescriptorKey = (u32, u32, u32, Option<Arc<[u8]>>);
+type SharedDescriptor = Arc<[u8]>;
+type DescriptorCache = HashMap<DescriptorKey, SharedDescriptor>;
+
 /// Builds security descriptors for XFS inode metadata.
 pub struct AclMapper {
     read_only: bool,
@@ -318,6 +333,7 @@ pub struct AclMapper {
     everyone_sid: Vec<u8>,
     system_sid: Vec<u8>,
     administrators_sid: Vec<u8>,
+    descriptors: Mutex<DescriptorCache>,
 }
 
 impl AclMapper {
@@ -353,6 +369,7 @@ impl AclMapper {
             everyone_sid: everyone_sid(),
             system_sid: system_sid(),
             administrators_sid: administrators_sid(),
+            descriptors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -365,6 +382,8 @@ impl AclMapper {
     ) -> Self {
         let mut uid_map = uid_map;
         let mut gid_map = gid_map;
+        uid_map.retain(|_, sid| valid_sid(sid));
+        gid_map.retain(|_, sid| valid_sid(sid));
         uid_map.entry(0).or_insert_with(system_sid);
         gid_map.entry(0).or_insert_with(administrators_sid);
 
@@ -375,15 +394,181 @@ impl AclMapper {
             everyone_sid: everyone_sid(),
             system_sid: system_sid(),
             administrators_sid: administrators_sid(),
+            descriptors: Mutex::new(HashMap::new()),
         }
     }
 
     /// Builds the self-relative security descriptor for `info`.
-    pub fn security_descriptor(&self, info: &VfsFileInfo) -> Vec<u8> {
+    ///
+    /// Descriptors are immutable and shared by files with equivalent mode,
+    /// ownership, and access-ACL bytes. Default ACLs do not affect the current
+    /// file's descriptor and are therefore not part of the cache key.
+    pub fn security_descriptor(&self, info: &VfsFileInfo) -> Arc<[u8]> {
+        let access_acl = info
+            .posix_acl
+            .as_ref()
+            .and_then(|acl| acl.access.as_ref())
+            .cloned();
+        let key = (info.mode, info.uid, info.gid, access_acl);
+        if let Some(cached) = self.descriptors().get(&key).cloned() {
+            return cached;
+        }
+        let descriptor: Arc<[u8]> = self.build_security_descriptor(info).into();
+        self.descriptors()
+            .entry(key)
+            .or_insert_with(|| descriptor.clone())
+            .clone()
+    }
+
+    fn descriptors(&self) -> MutexGuard<'_, DescriptorCache> {
+        self.descriptors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn build_security_descriptor(&self, info: &VfsFileInfo) -> Vec<u8> {
+        if let Some(raw_acl) = info.posix_acl.as_ref().and_then(|acl| acl.access.as_ref()) {
+            return self.build_acl_descriptor(info, raw_acl);
+        }
+        self.build_mode_descriptor(info)
+    }
+
+    fn empty_descriptor(&self) -> Vec<u8> {
+        build_security_descriptor(&self.system_sid, &self.administrators_sid, &[])
+    }
+
+    fn build_acl_descriptor(&self, info: &VfsFileInfo, raw_acl: &[u8]) -> Vec<u8> {
+        let acl = match PosixAcl::parse(raw_acl) {
+            Ok(acl) => acl,
+            Err(error) => {
+                tracing::warn!(ino = info.ino, %error, "Ignoring malformed POSIX ACL; denying access");
+                return self.empty_descriptor();
+            }
+        };
+        let Some(owner_sid) = self.uid_map.get(&info.uid) else {
+            return self.empty_descriptor();
+        };
+        let Some(group_obj_sid) = self.gid_map.get(&info.gid) else {
+            // An unmapped ACL identity cannot be represented faithfully. In
+            // particular, omitting it would let Everyone grant the other class.
+            return self.empty_descriptor();
+        };
+
+        let mut owner_permissions = 0u8;
+        let mut group_obj_permissions = 0u8;
+        let mut other_permissions = 0u8;
+        let mut mask = None;
+        let mut named_users = Vec::new();
+        let mut named_groups = Vec::new();
+        for entry in acl.entries() {
+            match entry.tag {
+                AclEntryTag::UserObj => owner_permissions = entry.perm,
+                AclEntryTag::GroupObj => group_obj_permissions = entry.perm,
+                AclEntryTag::Other => other_permissions = entry.perm,
+                AclEntryTag::Mask => mask = Some(entry.perm),
+                AclEntryTag::User => named_users.push((entry.id, entry.perm)),
+                AclEntryTag::Group => named_groups.push((entry.id, entry.perm)),
+            }
+        }
+        let mask = mask.unwrap_or(0b111);
+        let is_directory = info.is_dir();
+
+        let mut users_by_sid: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        for (uid, permissions) in named_users {
+            let Some(sid) = self.uid_map.get(&uid) else {
+                return self.empty_descriptor();
+            };
+            let rights = rights_for(info.mode, permissions & mask, is_directory, self.read_only);
+            *users_by_sid.entry(sid.clone()).or_default() |= rights;
+        }
+
+        let mut groups_by_sid: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        let group_obj_rights = rights_for(
+            info.mode,
+            group_obj_permissions & mask,
+            is_directory,
+            self.read_only,
+        );
+        *groups_by_sid.entry(group_obj_sid.clone()).or_default() |= group_obj_rights;
+        for (gid, permissions) in named_groups {
+            let Some(sid) = self.gid_map.get(&gid) else {
+                return self.empty_descriptor();
+            };
+            let rights = rights_for(info.mode, permissions & mask, is_directory, self.read_only);
+            *groups_by_sid.entry(sid.clone()).or_default() |= rights;
+        }
+
+        let owner_rights = rights_for(info.mode, owner_permissions, is_directory, self.read_only);
+        let other_rights = rights_for(info.mode, other_permissions, is_directory, self.read_only);
+        let all_user_rights = users_by_sid
+            .values()
+            .fold(0u32, |rights, entry| rights | *entry);
+        let all_group_rights = groups_by_sid
+            .values()
+            .fold(0u32, |rights, entry| rights | *entry);
+
+        // Windows unions matching allow ACEs. Compute the single POSIX class
+        // that wins for each mapped SID, then emit explicit denies for rights
+        // offered by lower-priority classes. All denies precede all allows.
+        let mut effective: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        let mut denies: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        effective.insert(owner_sid.clone(), owner_rights);
+        *denies.entry(owner_sid.clone()).or_default() |=
+            (all_user_rights | all_group_rights | other_rights) & !owner_rights;
+
+        for (sid, rights) in &users_by_sid {
+            if sid != owner_sid {
+                *effective.entry(sid.clone()).or_default() |= *rights;
+                *denies.entry(sid.clone()).or_default() |=
+                    (all_group_rights | other_rights) & !*rights;
+            }
+        }
+        for (sid, rights) in &groups_by_sid {
+            if sid != owner_sid && !users_by_sid.contains_key(sid) {
+                *effective.entry(sid.clone()).or_default() |= *rights;
+                *denies.entry(sid.clone()).or_default() |= other_rights & !*rights;
+            }
+        }
+
+        let mut aces: Vec<(u8, u32, &[u8])> =
+            Vec::with_capacity(denies.len() + effective.len() + usize::from(other_rights != 0));
+        for (sid, rights) in &denies {
+            if *rights != 0 {
+                aces.push((ACCESS_DENIED_ACE_TYPE, *rights, sid.as_slice()));
+            }
+        }
+        for (sid, rights) in &effective {
+            if *rights != 0 {
+                aces.push((ACCESS_ALLOWED_ACE_TYPE, *rights, sid.as_slice()));
+            }
+        }
+        if other_rights != 0 {
+            aces.push((ACCESS_ALLOWED_ACE_TYPE, other_rights, &self.everyone_sid));
+        }
+
+        // Windows stores ACL and ACE sizes in 16-bit fields. A valid POSIX
+        // ACL can contain more entries than fit in one DACL; deny access rather
+        // than emitting a truncated or otherwise invalid descriptor.
+        let Ok(acl_size) = aces.iter().try_fold(ACL_HEADER_SIZE, |size, (_, _, sid)| {
+            size.checked_add(ACE_HEADER_SIZE)
+                .ok_or(FsError::ArithmeticOverflow)?
+                .checked_add(sid.len())
+                .ok_or(FsError::ArithmeticOverflow)
+        }) else {
+            return self.empty_descriptor();
+        };
+        if u16::try_from(acl_size).is_err() {
+            return self.empty_descriptor();
+        }
+
+        build_security_descriptor(owner_sid, group_obj_sid, aces.as_slice())
+    }
+
+    fn build_mode_descriptor(&self, info: &VfsFileInfo) -> Vec<u8> {
         let Some(owner_sid) = self.uid_map.get(&info.uid) else {
             // Without an owner mapping we cannot know which caller must use
             // the owner class instead of group/other.  Fail closed.
-            return build_security_descriptor(&self.system_sid, &self.administrators_sid, &[]);
+            return self.empty_descriptor();
         };
 
         let group_sid = self.gid_map.get(&info.gid);
@@ -399,24 +584,15 @@ impl AclMapper {
         let other_rights = rights_for(info.mode, other_bits, is_directory, self.read_only);
 
         let mut aces: Vec<(u8, u32, &[u8])> = Vec::with_capacity(5);
-        if owner_rights != 0 {
-            aces.push((ACCESS_ALLOWED_ACE_TYPE, owner_rights, owner_sid));
-        }
-        if group_rights != 0 {
-            aces.push((ACCESS_ALLOWED_ACE_TYPE, group_rights, group_sid.unwrap()));
-        }
-        if other_rights != 0 {
-            aces.push((ACCESS_ALLOWED_ACE_TYPE, other_rights, &self.everyone_sid));
-        }
 
-        // POSIX owner class wins over group/other.  A matching deny ACE removes
+        // POSIX owner class wins over group/other. A matching deny ACE removes
         // any overlapping rights that Windows would otherwise union.
         let owner_deny = (group_rights | other_rights) & !owner_rights;
         if owner_deny != 0 {
             aces.push((ACCESS_DENIED_ACE_TYPE, owner_deny, owner_sid));
         }
 
-        // POSIX group class wins over other.  If owner and group map to the
+        // POSIX group class wins over other. If owner and group map to the
         // same SID the owner deny above already implements owner precedence;
         // adding a group deny here would incorrectly remove owner rights.
         if let Some(group_sid) = group_sid {
@@ -426,6 +602,17 @@ impl AclMapper {
                     aces.push((ACCESS_DENIED_ACE_TYPE, group_deny, group_sid));
                 }
             }
+        }
+
+        // Canonical DACL ordering requires every deny before any allow.
+        if owner_rights != 0 {
+            aces.push((ACCESS_ALLOWED_ACE_TYPE, owner_rights, owner_sid));
+        }
+        if group_rights != 0 {
+            aces.push((ACCESS_ALLOWED_ACE_TYPE, group_rights, group_sid.unwrap()));
+        }
+        if other_rights != 0 {
+            aces.push((ACCESS_ALLOWED_ACE_TYPE, other_rights, &self.everyone_sid));
         }
 
         build_security_descriptor(
@@ -438,7 +625,7 @@ impl AclMapper {
 
 #[cfg(test)]
 mod tests {
-    use fs_abstraction::types::{VfsFileType, VfsTimestamp};
+    use fs_abstraction::types::{VfsFileType, VfsPosixAcl, VfsTimestamp};
 
     use super::*;
 
@@ -453,6 +640,7 @@ mod tests {
             nlink: 1,
             uid,
             gid,
+            posix_acl: None,
             rdev: 0,
             atime: VfsTimestamp::default(),
             mtime: VfsTimestamp::default(),
@@ -511,6 +699,43 @@ mod tests {
         AclMapper::with_mappings(read_only, BTreeMap::new(), BTreeMap::new())
     }
 
+    fn acl_bytes(entries: &[(AclEntryTag, u8, u32)]) -> Arc<[u8]> {
+        let mut bytes = Vec::with_capacity(4 + entries.len() * 8);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for &(tag, perm, id) in entries {
+            bytes.extend_from_slice(&(tag as u16).to_le_bytes());
+            bytes.extend_from_slice(&(perm as u16).to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes.into()
+    }
+
+    fn with_acl(mut info: VfsFileInfo, access: Arc<[u8]>) -> VfsFileInfo {
+        info.posix_acl = Some(VfsPosixAcl {
+            access: Some(access),
+            default: None,
+        });
+        info
+    }
+
+    fn mapped_acl_mapper(read_only: bool) -> (AclMapper, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let owner = sid([0, 0, 0, 0, 0, 5], &[21, 1000]);
+        let named_user = sid([0, 0, 0, 0, 0, 5], &[21, 1001]);
+        let group = sid([0, 0, 0, 0, 0, 5], &[32, 1000]);
+        let named_group = sid([0, 0, 0, 0, 0, 5], &[32, 1001]);
+        let mapper = AclMapper::with_mappings(
+            read_only,
+            BTreeMap::from([(1000, owner.clone()), (1001, named_user.clone())]),
+            BTreeMap::from([(1000, group.clone()), (1001, named_group.clone())]),
+        );
+        (mapper, owner, named_user, group, named_group)
+    }
+
+    fn ace_index(sd: &[u8], kind: u8, sid: &[u8]) -> Option<usize> {
+        (0..acl_count(sd) as usize)
+            .find(|&index| ace_type(sd, index) == kind && ace_sid(sd, index) == sid)
+    }
+
     #[test]
     fn descriptor_is_self_relative_with_protected_dacl() {
         let sd =
@@ -539,19 +764,201 @@ mod tests {
     }
 
     #[test]
+    fn identical_modes_share_one_security_descriptor() {
+        let mapper = root_mapper(false);
+        let first = mapper.security_descriptor(&info(0o100644, 0, 0, VfsFileType::RegularFile));
+        let second = mapper.security_descriptor(&info(0o100644, 0, 0, VfsFileType::RegularFile));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn different_access_acls_do_not_share_a_cached_descriptor() {
+        let mapper = root_mapper(false);
+        let base = info(0o100640, 0, 0, VfsFileType::RegularFile);
+        let first_acl = acl_bytes(&[
+            (AclEntryTag::UserObj, 6, u32::MAX),
+            (AclEntryTag::GroupObj, 4, u32::MAX),
+            (AclEntryTag::Other, 0, u32::MAX),
+        ]);
+        let second_acl = acl_bytes(&[
+            (AclEntryTag::UserObj, 6, u32::MAX),
+            (AclEntryTag::GroupObj, 4, u32::MAX),
+            (AclEntryTag::Other, 4, u32::MAX),
+        ]);
+        let first_info = with_acl(base.clone(), first_acl.clone());
+        let second_info = with_acl(base.clone(), second_acl);
+        let first = mapper.security_descriptor(&first_info);
+        let second = mapper.security_descriptor(&second_info);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &first,
+            &mapper.security_descriptor(&with_acl(base, first_acl))
+        ));
+    }
+
+    #[test]
+    fn acl_mask_caps_named_users_and_groups_but_not_owner_or_other() {
+        let (mapper, owner, named_user, group, named_group) = mapped_acl_mapper(false);
+        let raw = acl_bytes(&[
+            (AclEntryTag::UserObj, 6, u32::MAX),
+            (AclEntryTag::User, 7, 1001),
+            (AclEntryTag::GroupObj, 7, u32::MAX),
+            (AclEntryTag::Group, 5, 1001),
+            (AclEntryTag::Mask, 4, u32::MAX),
+            (AclEntryTag::Other, 1, u32::MAX),
+        ]);
+        PosixAcl::parse(&raw).unwrap();
+        let sd = mapper.security_descriptor(&with_acl(
+            info(0o100640, 1000, 1000, VfsFileType::RegularFile),
+            raw,
+        ));
+        assert_eq!(acl_count(&sd), 9);
+
+        let user_index = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &named_user).unwrap();
+        let group_index = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &group).unwrap();
+        let named_group_index = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &named_group).unwrap();
+        assert_eq!(ace_mask(&sd, user_index), FILE_GENERIC_READ);
+        assert_eq!(ace_mask(&sd, group_index), FILE_GENERIC_READ);
+        assert_eq!(ace_mask(&sd, named_group_index), FILE_GENERIC_READ);
+
+        let owner_index = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &owner).unwrap();
+        assert_ne!(ace_mask(&sd, owner_index) & FILE_GENERIC_WRITE, 0);
+        assert_eq!(
+            ace_mask(&sd, owner_index)
+                & (FILE_GENERIC_EXECUTE & !(FILE_GENERIC_READ | FILE_GENERIC_WRITE)),
+            0
+        );
+        let everyone_index = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &everyone_sid()).unwrap();
+        assert_eq!(ace_mask(&sd, everyone_index), FILE_GENERIC_EXECUTE);
+
+        let mut saw_allow = false;
+        for index in 0..acl_count(&sd) as usize {
+            if ace_type(&sd, index) == ACCESS_ALLOWED_ACE_TYPE {
+                saw_allow = true;
+            } else {
+                assert!(!saw_allow, "all deny ACEs must precede allow ACEs");
+            }
+        }
+    }
+
+    #[test]
+    fn named_user_class_wins_when_user_and_group_map_to_the_same_sid() {
+        let owner = sid([0, 0, 0, 0, 0, 5], &[21, 1000]);
+        let shared = sid([0, 0, 0, 0, 0, 5], &[21, 2000]);
+        let group = sid([0, 0, 0, 0, 0, 5], &[32, 1000]);
+        let mapper = AclMapper::with_mappings(
+            false,
+            BTreeMap::from([(1000, owner.clone()), (2000, shared.clone())]),
+            BTreeMap::from([(1000, group), (2000, shared.clone())]),
+        );
+        let raw = acl_bytes(&[
+            (AclEntryTag::UserObj, 6, u32::MAX),
+            (AclEntryTag::User, 4, 2000),
+            (AclEntryTag::GroupObj, 0, u32::MAX),
+            (AclEntryTag::Group, 6, 2000),
+            (AclEntryTag::Mask, 7, u32::MAX),
+            (AclEntryTag::Other, 1, u32::MAX),
+        ]);
+        let sd = mapper.security_descriptor(&with_acl(
+            info(0o100600, 1000, 1000, VfsFileType::RegularFile),
+            raw,
+        ));
+
+        let allow = ace_index(&sd, ACCESS_ALLOWED_ACE_TYPE, &shared).unwrap();
+        assert_eq!(ace_mask(&sd, allow), FILE_GENERIC_READ);
+        let deny = ace_index(&sd, ACCESS_DENIED_ACE_TYPE, &shared).unwrap();
+        assert_ne!(ace_mask(&sd, deny) & FILE_GENERIC_WRITE, 0);
+        assert_ne!(ace_mask(&sd, deny) & FILE_GENERIC_EXECUTE, 0);
+    }
+
+    #[test]
+    fn malformed_or_unmapped_access_acls_fail_closed_without_mode_fallback() {
+        let mapper = root_mapper(false);
+        let base = info(0o100644, 0, 0, VfsFileType::RegularFile);
+        let malformed = Arc::from([0u8, 0, 0, 0].as_slice());
+        assert_eq!(
+            acl_count(&mapper.security_descriptor(&with_acl(base.clone(), malformed))),
+            0
+        );
+
+        let unmapped_named_user = acl_bytes(&[
+            (AclEntryTag::UserObj, 6, u32::MAX),
+            (AclEntryTag::User, 4, 1000),
+            (AclEntryTag::GroupObj, 4, u32::MAX),
+            (AclEntryTag::Mask, 4, u32::MAX),
+            (AclEntryTag::Other, 4, u32::MAX),
+        ]);
+        assert_eq!(
+            acl_count(&mapper.security_descriptor(&with_acl(base, unmapped_named_user))),
+            0
+        );
+    }
+
+    #[test]
+    fn invalid_sid_mappings_and_oversized_acls_fail_closed() {
+        let invalid_mapper = AclMapper::with_mappings(
+            false,
+            BTreeMap::from([(1000, Vec::new())]),
+            BTreeMap::from([(1000, sid([0, 0, 0, 0, 0, 5], &[32, 1000]))]),
+        );
+        assert_eq!(
+            acl_count(&invalid_mapper.security_descriptor(&info(
+                0o100644,
+                1000,
+                1000,
+                VfsFileType::RegularFile,
+            ))),
+            0
+        );
+
+        let mut uid_map = BTreeMap::new();
+        let mut entries = vec![(AclEntryTag::UserObj, 0, u32::MAX)];
+        for id in 1..=3500 {
+            uid_map.insert(id, sid([0, 0, 0, 0, 0, 5], &[21, id]));
+            entries.push((AclEntryTag::User, 4, id));
+        }
+        entries.push((AclEntryTag::GroupObj, 0, u32::MAX));
+        entries.push((AclEntryTag::Mask, 7, u32::MAX));
+        entries.push((AclEntryTag::Other, 0, u32::MAX));
+        let mapper = AclMapper::with_mappings(false, uid_map, BTreeMap::new());
+        let sd = mapper.security_descriptor(&with_acl(
+            info(0o100600, 0, 0, VfsFileType::RegularFile),
+            acl_bytes(&entries),
+        ));
+        assert_eq!(acl_count(&sd), 0);
+    }
+
+    #[test]
+    fn read_only_mount_strips_write_and_delete_from_acl_rights() {
+        let raw = acl_bytes(&[
+            (AclEntryTag::UserObj, 7, u32::MAX),
+            (AclEntryTag::GroupObj, 7, u32::MAX),
+            (AclEntryTag::Mask, 7, u32::MAX),
+            (AclEntryTag::Other, 7, u32::MAX),
+        ]);
+        let sd = root_mapper(true)
+            .security_descriptor(&with_acl(info(0o040777, 0, 0, VfsFileType::Directory), raw));
+        for index in 0..acl_count(&sd) as usize {
+            assert_eq!(ace_mask(&sd, index) & FILE_WRITE_RIGHTS, 0);
+        }
+    }
+
+    #[test]
     fn other_bits_map_to_everyone() {
         let sd =
             root_mapper(false).security_descriptor(&info(0o100004, 0, 0, VfsFileType::RegularFile));
 
         assert_eq!(acl_count(&sd), 3);
-        assert_eq!(ace_type(&sd, 0), ACCESS_ALLOWED_ACE_TYPE);
-        assert_eq!(sid_string(&ace_sid(&sd, 0)), "S-1-1-0");
-        assert_eq!(ace_mask(&sd, 0), FILE_GENERIC_READ);
-        // Owner and group must not inherit the "other" class.
+        // Owner and group must not inherit the "other" class. Denies come
+        // first.
+        assert_eq!(ace_type(&sd, 0), ACCESS_DENIED_ACE_TYPE);
+        assert_eq!(sid_string(&ace_sid(&sd, 0)), "S-1-5-18");
         assert_eq!(ace_type(&sd, 1), ACCESS_DENIED_ACE_TYPE);
-        assert_eq!(sid_string(&ace_sid(&sd, 1)), "S-1-5-18");
-        assert_eq!(ace_type(&sd, 2), ACCESS_DENIED_ACE_TYPE);
-        assert_eq!(sid_string(&ace_sid(&sd, 2)), "S-1-5-32-544");
+        assert_eq!(sid_string(&ace_sid(&sd, 1)), "S-1-5-32-544");
+        assert_eq!(ace_type(&sd, 2), ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(sid_string(&ace_sid(&sd, 2)), "S-1-1-0");
+        assert_eq!(ace_mask(&sd, 2), FILE_GENERIC_READ);
     }
 
     #[test]
@@ -589,16 +996,16 @@ mod tests {
         ));
 
         assert_eq!(acl_count(&sd), 4);
-        assert_eq!(ace_type(&sd, 0), ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(ace_type(&sd, 0), ACCESS_DENIED_ACE_TYPE);
         assert_eq!(ace_sid(&sd, 0), owner);
-        assert_eq!(ace_type(&sd, 1), ACCESS_ALLOWED_ACE_TYPE);
-        assert_eq!(sid_string(&ace_sid(&sd, 1)), "S-1-1-0");
-        assert_eq!(ace_type(&sd, 2), ACCESS_DENIED_ACE_TYPE);
+        assert_eq!(ace_mask(&sd, 0), FILE_GENERIC_READ & !FILE_GENERIC_WRITE);
+        assert_eq!(ace_type(&sd, 1), ACCESS_DENIED_ACE_TYPE);
+        assert_eq!(ace_sid(&sd, 1), group);
+        assert_eq!(ace_mask(&sd, 1), FILE_GENERIC_READ);
+        assert_eq!(ace_type(&sd, 2), ACCESS_ALLOWED_ACE_TYPE);
         assert_eq!(ace_sid(&sd, 2), owner);
-        assert_eq!(ace_mask(&sd, 2), FILE_GENERIC_READ & !FILE_GENERIC_WRITE);
-        assert_eq!(ace_type(&sd, 3), ACCESS_DENIED_ACE_TYPE);
-        assert_eq!(ace_sid(&sd, 3), group);
-        assert_eq!(ace_mask(&sd, 3), FILE_GENERIC_READ);
+        assert_eq!(ace_type(&sd, 3), ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(sid_string(&ace_sid(&sd, 3)), "S-1-1-0");
     }
 
     #[test]
@@ -618,19 +1025,19 @@ mod tests {
         ));
 
         assert_eq!(acl_count(&sd), 4);
-        assert_eq!(ace_type(&sd, 0), ACCESS_ALLOWED_ACE_TYPE);
-        assert_eq!(ace_sid(&sd, 0), group);
-        assert_eq!(ace_type(&sd, 1), ACCESS_ALLOWED_ACE_TYPE);
-        assert_eq!(sid_string(&ace_sid(&sd, 1)), "S-1-1-0");
-        assert_eq!(ace_type(&sd, 2), ACCESS_DENIED_ACE_TYPE);
-        assert_eq!(ace_sid(&sd, 2), owner);
+        assert_eq!(ace_type(&sd, 0), ACCESS_DENIED_ACE_TYPE);
+        assert_eq!(ace_sid(&sd, 0), owner);
         assert_eq!(
-            ace_mask(&sd, 2) & FILE_GENERIC_EXECUTE,
+            ace_mask(&sd, 0) & FILE_GENERIC_EXECUTE,
             FILE_GENERIC_EXECUTE
         );
-        assert_eq!(ace_type(&sd, 3), ACCESS_DENIED_ACE_TYPE);
-        assert_eq!(ace_sid(&sd, 3), group);
-        assert_eq!(ace_mask(&sd, 3), FILE_GENERIC_EXECUTE & !FILE_GENERIC_READ);
+        assert_eq!(ace_type(&sd, 1), ACCESS_DENIED_ACE_TYPE);
+        assert_eq!(ace_sid(&sd, 1), group);
+        assert_eq!(ace_mask(&sd, 1), FILE_GENERIC_EXECUTE & !FILE_GENERIC_READ);
+        assert_eq!(ace_type(&sd, 2), ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(ace_sid(&sd, 2), group);
+        assert_eq!(ace_type(&sd, 3), ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(sid_string(&ace_sid(&sd, 3)), "S-1-1-0");
     }
 
     fn owner_sid(sd: &[u8]) -> Vec<u8> {
@@ -691,17 +1098,34 @@ mod tests {
             PSID,
         };
 
-        let sd =
-            root_mapper(false).security_descriptor(&info(0o100644, 0, 0, VfsFileType::RegularFile));
-        let descriptor = PSECURITY_DESCRIPTOR(sd.as_ptr() as *mut std::ffi::c_void);
-        assert!(unsafe { IsValidSecurityDescriptor(descriptor) }.as_bool());
+        let mode_info = info(0o100644, 0, 0, VfsFileType::RegularFile);
+        let mode_sd = root_mapper(false).security_descriptor(&mode_info);
+        let (mapper, ..) = mapped_acl_mapper(false);
+        let acl_sd = mapper.security_descriptor(&with_acl(
+            info(0o100640, 1000, 1000, VfsFileType::RegularFile),
+            acl_bytes(&[
+                (AclEntryTag::UserObj, 6, u32::MAX),
+                (AclEntryTag::User, 7, 1001),
+                (AclEntryTag::GroupObj, 7, u32::MAX),
+                (AclEntryTag::Group, 5, 1001),
+                (AclEntryTag::Mask, 4, u32::MAX),
+                (AclEntryTag::Other, 1, u32::MAX),
+            ]),
+        ));
 
-        let acl = dacl_offset(&sd);
-        assert!(unsafe { IsValidAcl((&sd[acl] as *const u8).cast()) }.as_bool());
+        for sd in [&mode_sd, &acl_sd] {
+            let descriptor = PSECURITY_DESCRIPTOR(sd.as_ptr() as *mut std::ffi::c_void);
+            assert!(unsafe { IsValidSecurityDescriptor(descriptor) }.as_bool());
 
-        for index in 0..acl_count(&sd) as usize {
-            let sid = ace_sid(&sd, index);
-            assert!(unsafe { IsValidSid(PSID(sid.as_ptr() as *mut std::ffi::c_void)) }.as_bool());
+            let acl = dacl_offset(sd);
+            assert!(unsafe { IsValidAcl((&sd[acl] as *const u8).cast()) }.as_bool());
+
+            for index in 0..acl_count(sd) as usize {
+                let sid = ace_sid(sd, index);
+                assert!(
+                    unsafe { IsValidSid(PSID(sid.as_ptr() as *mut std::ffi::c_void)) }.as_bool()
+                );
+            }
         }
     }
 }

@@ -1,18 +1,22 @@
 //! Transactional XFS inode allocation using existing INOBT/FINOBT chunks.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use fs_abstraction::{BlockDevice, FsError, FsResult};
 use xfs_rs::{
     inode_alloc::{InodeBtreeRec, SparseInodeBtreeRec},
     short_btree::{
-        collect_short_btree,
+        collect_short_btree_checked,
         plan_short_btree,
         required_block_count,
         ShortBtreeKind,
         ShortBtreeSnapshot,
     },
     AgInodeHeader,
+    Inode,
     Superblock,
 };
 
@@ -22,6 +26,7 @@ use crate::{
 };
 
 const XFS_SB_FEAT_RO_COMPAT_FINOBT: u32 = 1 << 0;
+const NULLAGINO: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 enum InodeRecord {
@@ -94,6 +99,8 @@ pub struct InodeAllocator {
     states: BTreeMap<u32, AgState>,
     free_inode_delta: i128,
     inode_count_delta: i128,
+    /// `di_next_unlinked` values changed earlier in the same transaction.
+    unlinked_next: BTreeMap<(u32, u32), u32>,
 }
 
 impl InodeAllocator {
@@ -105,6 +112,7 @@ impl InodeAllocator {
             states: BTreeMap::new(),
             free_inode_delta: 0,
             inode_count_delta: 0,
+            unlinked_next: BTreeMap::new(),
         })
     }
 
@@ -114,6 +122,17 @@ impl InodeAllocator {
 
     pub fn inode_count_delta(&self) -> i128 {
         self.inode_count_delta
+    }
+
+    /// Forget transaction-local accounting after the caller has successfully
+    /// committed the staged superblock. The unlinked-pointer overlay is also
+    /// transaction-local: retaining it would make later AGI walks observe
+    /// links that are no longer pending. On failure the owner rebuilds the
+    /// allocator from disk instead of calling this method.
+    pub fn finish_transaction(&mut self) {
+        self.free_inode_delta = 0;
+        self.inode_count_delta = 0;
+        self.unlinked_next.clear();
     }
 
     /// Allocate one inode from an existing chunk.
@@ -245,6 +264,133 @@ impl InodeAllocator {
         Ok(())
     }
 
+    /// Insert an AG-relative inode at the head of its AGI unlinked bucket.
+    ///
+    /// Returns the previous bucket head, which the caller must store in the
+    /// inode's `di_next_unlinked` field. The complete chain is checked for
+    /// duplicates, cycles and out-of-range inode numbers before mutation.
+    pub fn insert_unlinked_inode(&mut self, ag: u32, ag_ino: u32) -> FsResult<u32> {
+        let bucket = self.unlinked_bucket(ag, ag_ino)?;
+        let head = self.load_ag(ag)?.agi.unlinked[bucket];
+        let chain = self.unlinked_chain(ag, head)?;
+        if chain.contains(&ag_ino) {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let state = self.load_ag(ag)?;
+        state.agi.unlinked[bucket] = ag_ino;
+        state.dirty = true;
+        self.unlinked_next.insert((ag, ag_ino), head);
+        Ok(head)
+    }
+
+    /// Remove an AG-relative inode from its AGI unlinked bucket.
+    ///
+    /// Returns `(predecessor, successor)`. If `predecessor` is `Some`, the
+    /// caller must update that inode's `di_next_unlinked` to `successor` and
+    /// stage it in the same transaction. The removed inode's own next pointer
+    /// must be reset to `NULLAGINO` by the caller.
+    pub fn remove_unlinked_inode(&mut self, ag: u32, ag_ino: u32) -> FsResult<(Option<u32>, u32)> {
+        let bucket = self.unlinked_bucket(ag, ag_ino)?;
+        let head = self.load_ag(ag)?.agi.unlinked[bucket];
+        let chain = self.unlinked_chain(ag, head)?;
+        let position = chain
+            .iter()
+            .position(|candidate| *candidate == ag_ino)
+            .ok_or(FsError::NotFound)?;
+        let successor = chain.get(position + 1).copied().unwrap_or(NULLAGINO);
+        let predecessor = position.checked_sub(1).map(|index| chain[index]);
+
+        if let Some(predecessor) = predecessor {
+            self.unlinked_next.insert((ag, predecessor), successor);
+        }
+        self.unlinked_next.insert((ag, ag_ino), NULLAGINO);
+        let state = self.load_ag(ag)?;
+        if predecessor.is_none() {
+            state.agi.unlinked[bucket] = successor;
+        }
+        state.dirty = true;
+        Ok((predecessor, successor))
+    }
+
+    fn unlinked_bucket(&self, ag: u32, ag_ino: u32) -> FsResult<usize> {
+        if ag >= self.sb.ag_count {
+            return Err(FsError::InvalidArgument);
+        }
+        let shift = u32::from(self.sb.ag_block_log) + u32::from(self.sb.inode_per_block_log);
+        if shift >= 32 {
+            return Err(FsError::Corrupted);
+        }
+        if ag_ino == NULLAGINO || u64::from(ag_ino) >= (1u64 << shift) {
+            return Err(FsError::InvalidArgument);
+        }
+        // Kernel and xfsprogs both hash the AG-relative inode number itself,
+        // not its containing inode block: `agino % XFS_AGI_UNLINKED_BUCKETS`.
+        Ok((ag_ino % 64) as usize)
+    }
+
+    fn unlinked_chain(&self, ag: u32, head: u32) -> FsResult<Vec<u32>> {
+        let shift = u32::from(self.sb.ag_block_log) + u32::from(self.sb.inode_per_block_log);
+        if shift >= 32 {
+            return Err(FsError::Corrupted);
+        }
+        let capacity = 1u64 << shift;
+        if head == NULLAGINO {
+            return Ok(Vec::new());
+        }
+        let expected_bucket = self.unlinked_bucket(ag, head)?;
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut current = head;
+        while current != NULLAGINO {
+            if self.unlinked_bucket(ag, current)? != expected_bucket {
+                return Err(FsError::Corrupted);
+            }
+            if !seen.insert(current) || seen.len() as u64 > capacity {
+                return Err(FsError::Corrupted);
+            }
+            chain.push(current);
+            current = match self.unlinked_next.get(&(ag, current)) {
+                Some(next) => *next,
+                None => self.read_unlinked_next(ag, current)?,
+            };
+        }
+        Ok(chain)
+    }
+
+    fn read_unlinked_next(&self, ag: u32, ag_ino: u32) -> FsResult<u32> {
+        let shift = u32::from(self.sb.ag_block_log) + u32::from(self.sb.inode_per_block_log);
+        if shift >= 32 || self.sb.inode_per_block_log >= 32 {
+            return Err(FsError::Corrupted);
+        }
+        let inodes_per_block = 1u64 << self.sb.inode_per_block_log;
+        let block_in_ag = u64::from(ag_ino) >> self.sb.inode_per_block_log;
+        let inode_in_block = u64::from(ag_ino) & (inodes_per_block - 1);
+        let block = (u64::from(ag))
+            .checked_mul(u64::from(self.sb.ag_blocks))
+            .and_then(|value| value.checked_add(block_in_ag))
+            .ok_or(FsError::ArithmeticOverflow)?;
+        if block >= self.sb.total_blocks {
+            return Err(FsError::InodeNotFound);
+        }
+        let inode_size = self.sb.inode_size as usize;
+        let offset = block
+            .checked_mul(u64::from(self.sb.block_size))
+            .and_then(|value| {
+                inode_in_block
+                    .checked_mul(inode_size as u64)
+                    .and_then(|inode_offset| value.checked_add(inode_offset))
+            })
+            .ok_or(FsError::ArithmeticOverflow)?;
+        let mut raw = vec![0u8; inode_size];
+        read_exact_at(self.device.as_ref(), offset, &mut raw, self.filesystem_size)?;
+        let inode = Inode::parse_with_features(&raw, inode_size, self.sb.features_incompat)?;
+        if self.sb.is_v5() {
+            inode.verify_crc(&raw, inode_size)?;
+        }
+        Ok(inode.core.next_unlinked)
+    }
+
     /// Stage rebuilt INOBT/FINOBT blocks and AGI sectors.
     pub fn stage(&mut self, batch: &mut WriteBatch) -> FsResult<()> {
         let sb = self.sb.clone();
@@ -370,17 +516,19 @@ impl InodeAllocator {
             let offset = Self::ag_header_offset(&self.sb, ag, 2)?;
             let mut raw = vec![0u8; self.sb.sector_size as usize];
             read_exact_at(self.device.as_ref(), offset, &mut raw, self.filesystem_size)?;
-            let agi = AgInodeHeader::parse(&raw)?;
-            if self.sb.is_v5() {
-                agi.verify_crc(&raw)?;
-            }
+            let agi = AgInodeHeader::parse_checked(
+                &raw,
+                self.sb.is_v5(),
+                ag,
+                self.sb.is_v5().then_some(self.sb.metadata_uuid()),
+            )?;
             if agi.seq_number != ag {
                 return Err(FsError::Corrupted);
             }
             let sparse = self.sb.has_sparse_inodes();
             let read_block = |block| self.read_block(block);
             let reader = ClosureBlockReader::new(&read_block);
-            let ibt = collect_short_btree(
+            let ibt = collect_short_btree_checked(
                 ShortBtreeKind::Inode,
                 agi.inode_root,
                 agi.inode_level.checked_sub(1).ok_or(FsError::Corrupted)? as u16,
@@ -390,6 +538,7 @@ impl InodeAllocator {
                 self.sb.ag_blocks,
                 u32::from(self.sb.sector_size),
                 &reader,
+                self.sb.is_v5().then_some(self.sb.metadata_uuid()),
             )?;
             let ibt_records = Self::parse_records(&ibt.records, sparse)?;
             let has_finobt = self.sb.features_ro_compat & XFS_SB_FEAT_RO_COMPAT_FINOBT != 0;
@@ -397,7 +546,7 @@ impl InodeAllocator {
                 if agi.free_inode_root == 0 {
                     return Err(FsError::Corrupted);
                 }
-                let snapshot = collect_short_btree(
+                let snapshot = collect_short_btree_checked(
                     ShortBtreeKind::FreeInode,
                     agi.free_inode_root,
                     agi.free_inode_level
@@ -409,6 +558,7 @@ impl InodeAllocator {
                     self.sb.ag_blocks,
                     u32::from(self.sb.sector_size),
                     &reader,
+                    self.sb.is_v5().then_some(self.sb.metadata_uuid()),
                 )?;
                 let records = Self::parse_records(&snapshot.records, sparse)?;
                 (Some(snapshot), records)
@@ -459,5 +609,125 @@ impl InodeAllocator {
         ag_offset
             .checked_add(sector.saturating_mul(sb.sector_size as u64))
             .ok_or(FsError::ArithmeticOverflow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoIoDevice;
+
+    impl BlockDevice for NoIoDevice {
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> FsResult<usize> {
+            Err(FsError::InvalidBlockAddress)
+        }
+
+        fn write_at(&self, _offset: u64, _input: &[u8]) -> FsResult<usize> {
+            Err(FsError::ReadOnly)
+        }
+
+        fn size(&self) -> u64 {
+            0
+        }
+    }
+
+    fn test_superblock() -> Superblock {
+        let mut raw = vec![0u8; xfs_rs::XFS_SB_SIZE_V4];
+        raw[0..4].copy_from_slice(&xfs_rs::XFS_SB_MAGIC.to_be_bytes());
+        raw[4..8].copy_from_slice(&4096u32.to_be_bytes());
+        raw[8..16].copy_from_slice(&1024u64.to_be_bytes());
+        raw[0x54..0x58].copy_from_slice(&1024u32.to_be_bytes());
+        raw[0x58..0x5C].copy_from_slice(&1u32.to_be_bytes());
+        raw[0x64..0x66].copy_from_slice(&4u16.to_be_bytes());
+        raw[0x66..0x68].copy_from_slice(&512u16.to_be_bytes());
+        raw[0x68..0x6A].copy_from_slice(&256u16.to_be_bytes());
+        raw[0x6A..0x6C].copy_from_slice(&16u16.to_be_bytes());
+        raw[0x78] = 12;
+        raw[0x79] = 9;
+        raw[0x7A] = 8;
+        raw[0x7B] = 4;
+        raw[0x7C] = 10;
+        Superblock::parse(&raw).unwrap()
+    }
+
+    fn test_agi() -> AgInodeHeader {
+        let mut raw = vec![0u8; 512];
+        raw[0..4].copy_from_slice(&xfs_rs::XFS_AGI_MAGIC.to_be_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_be_bytes());
+        let mut agi = AgInodeHeader::parse(&raw).unwrap();
+        agi.unlinked.fill(NULLAGINO);
+        agi
+    }
+
+    fn allocator_with_empty_ag() -> InodeAllocator {
+        let mut allocator = InodeAllocator::new(Arc::new(NoIoDevice), test_superblock()).unwrap();
+        allocator.states.insert(
+            0,
+            AgState {
+                agi: test_agi(),
+                ibt: ShortBtreeSnapshot {
+                    records: Vec::new(),
+                    blocks: Vec::new(),
+                    root_level: 0,
+                },
+                ibt_records: Vec::new(),
+                fibt: None,
+                fibt_records: Vec::new(),
+                dirty: false,
+            },
+        );
+        allocator
+    }
+
+    #[test]
+    fn unlinked_insert_and_remove_preserve_bucket_order() {
+        let mut allocator = allocator_with_empty_ag();
+        assert_eq!(allocator.insert_unlinked_inode(0, 128).unwrap(), NULLAGINO);
+        assert_eq!(allocator.insert_unlinked_inode(0, 192).unwrap(), 128);
+        assert!(matches!(
+            allocator.insert_unlinked_inode(0, 128),
+            Err(FsError::AlreadyExists)
+        ));
+
+        assert_eq!(
+            allocator.remove_unlinked_inode(0, 128).unwrap(),
+            (Some(192), NULLAGINO)
+        );
+        // Simulate the writer staging the predecessor's updated next pointer.
+        allocator.unlinked_next.insert((0, 192), NULLAGINO);
+        assert_eq!(
+            allocator.remove_unlinked_inode(0, 192).unwrap(),
+            (None, NULLAGINO)
+        );
+        assert_eq!(allocator.states[&0].agi.unlinked[0], NULLAGINO);
+    }
+
+    #[test]
+    fn unlinked_lists_reject_cycles_and_out_of_range_inodes() {
+        let mut allocator = allocator_with_empty_ag();
+        allocator.states.get_mut(&0).unwrap().agi.unlinked[0] = 128;
+        allocator.unlinked_next.insert((0, 128), 192);
+        allocator.unlinked_next.insert((0, 192), 128);
+        assert!(matches!(
+            allocator.insert_unlinked_inode(0, 256),
+            Err(FsError::Corrupted)
+        ));
+        assert!(matches!(
+            allocator.insert_unlinked_inode(0, 1 << 14),
+            Err(FsError::InvalidArgument)
+        ));
+        assert!(matches!(
+            allocator.insert_unlinked_inode(1, 128),
+            Err(FsError::InvalidArgument)
+        ));
+
+        let mut cross_bucket = allocator_with_empty_ag();
+        cross_bucket.states.get_mut(&0).unwrap().agi.unlinked[0] = 128;
+        cross_bucket.unlinked_next.insert((0, 128), 129);
+        assert!(matches!(
+            cross_bucket.insert_unlinked_inode(0, 256),
+            Err(FsError::Corrupted)
+        ));
     }
 }

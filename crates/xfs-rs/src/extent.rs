@@ -2,10 +2,10 @@
 //!
 //! XFS uses 128-bit extent records packed into 16 bytes.
 
-use fs_abstraction::{
-    safe_math::{CheckedOps, CheckedSliceOps},
-    FsError,
-    FsResult,
+use fs_abstraction::{safe_math::CheckedOps, FsError, FsResult};
+use zerocopy::{
+    byteorder::{BigEndian, U64},
+    FromBytes,
 };
 
 /// A parsed XFS extent record.
@@ -41,14 +41,23 @@ impl Extent {
     /// | flag  | file offset      | start block      | block count   |
     /// +-------+------------------+------------------+---------------+
     /// ```
+    #[inline]
     pub fn parse(buffer: &[u8]) -> FsResult<Self> {
         if buffer.len() < Self::SIZE {
             return Err(FsError::BufferTooSmall);
         }
 
-        // Read as two 64-bit big-endian values
-        let hi = buffer.read_be_u64(0)?;
-        let lo = buffer.read_be_u64(8)?;
+        // Borrow the two big-endian words directly from the on-disk record.
+        let high_bytes = buffer.get(..8).ok_or(FsError::BufferTooSmall)?;
+        let low_bytes = buffer.get(8..16).ok_or(FsError::BufferTooSmall)?;
+        let hi = U64::<BigEndian>::ref_from_prefix(high_bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get();
+        let lo = U64::<BigEndian>::ref_from_prefix(low_bytes)
+            .map_err(|_| FsError::BufferTooSmall)?
+            .0
+            .get();
 
         // Parse fields
         // Bit 127 (MSB of hi) = unwritten flag

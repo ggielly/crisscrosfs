@@ -120,7 +120,7 @@ pub fn inode_crc(inode_bytes: &[u8]) -> u32 {
 pub enum CrcEndian {
     /// `__le32`, used by superblock, inode and B+tree block CRCs.
     Little,
-    /// `__be32`, used by AGF, AGI and dir3 CRCs.
+    /// Big-endian metadata CRC representation.
     Big,
 }
 

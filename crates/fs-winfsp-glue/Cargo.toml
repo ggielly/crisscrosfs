@@ -46,14 +46,20 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Fast small-allocation allocator for dispatcher and parser workloads
+mimalloc = "0.1"
+
 # Error handling & logging
 thiserror = "2.0.18"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.2"
+
+# Unicode case folding for optional case-insensitive lookup
+unicase = "2"
 
 # Serialization for config
 serde = { version = "1.0", features = ["derive"] }

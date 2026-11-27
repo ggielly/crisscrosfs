@@ -7,7 +7,7 @@
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::string::String;
+use alloc::{string::String, sync::Arc};
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
@@ -154,6 +154,23 @@ impl From<VfsTimestamp> for SystemTime {
     }
 }
 
+/// Immutable POSIX ACL xattr bytes exposed by a read-only backend.
+///
+/// These are the raw Linux `posix_acl_xattr` values, not Windows security
+/// descriptors. Sharing them through `Arc<[u8]>` keeps metadata clones cheap
+/// without implying that the VFS can modify ACLs.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VfsPosixAcl {
+    /// `system.posix_acl_access`, when present and validated by the backend.
+    pub access: Option<Arc<[u8]>>,
+    /// `system.posix_acl_default`, when present and validated by the backend.
+    ///
+    /// Default ACLs describe inheritance for newly created children and do not
+    /// change the current file's access descriptor.
+    pub default: Option<Arc<[u8]>>,
+}
+
 /// File metadata structure.
 ///
 /// Contains all metadata about a file or directory that can be
@@ -178,6 +195,11 @@ pub struct VfsFileInfo {
     pub uid: u32,
     /// Owner group ID
     pub gid: u32,
+    /// Validated raw POSIX ACL xattrs, if the backend provides them.
+    ///
+    /// This is read-only metadata. It does not advertise ACL write support.
+    #[cfg(feature = "alloc")]
+    pub posix_acl: Option<VfsPosixAcl>,
     /// Device ID (for device files)
     pub rdev: u64,
     /// Last access time
@@ -224,6 +246,8 @@ impl Default for VfsFileInfo {
             nlink: 1,
             uid: 0,
             gid: 0,
+            #[cfg(feature = "alloc")]
+            posix_acl: None,
             rdev: 0,
             atime: VfsTimestamp::default(),
             mtime: VfsTimestamp::default(),
@@ -351,4 +375,33 @@ pub struct OpenFlags {
     pub append: bool,
     /// Open directory
     pub directory: bool,
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_info_clones_share_immutable_acl_bytes() {
+        let access: Arc<[u8]> = Arc::from([2u8, 0, 0, 0].as_slice());
+        let default: Arc<[u8]> = Arc::from([3u8, 0, 0, 0].as_slice());
+        let info = VfsFileInfo {
+            posix_acl: Some(VfsPosixAcl {
+                access: Some(access.clone()),
+                default: Some(default.clone()),
+            }),
+            ..VfsFileInfo::default()
+        };
+        let cloned = info.clone();
+
+        assert!(Arc::ptr_eq(
+            info.posix_acl.as_ref().unwrap().access.as_ref().unwrap(),
+            cloned.posix_acl.as_ref().unwrap().access.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            info.posix_acl.as_ref().unwrap().default.as_ref().unwrap(),
+            cloned.posix_acl.as_ref().unwrap().default.as_ref().unwrap()
+        ));
+        assert_eq!(VfsFileInfo::default().posix_acl, None);
+    }
 }

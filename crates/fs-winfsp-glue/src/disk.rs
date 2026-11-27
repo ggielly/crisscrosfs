@@ -5,24 +5,25 @@
 //! - Partitions (\\.\X:)
 //! - Image files
 
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-    sync::{Arc, Mutex},
-};
+#[cfg(windows)]
+#[path = "disk/async_io.rs"]
+mod async_io;
+#[cfg(not(windows))]
+use std::fs::File;
+#[cfg(not(windows))]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(any(test, not(windows)))]
+use std::sync::Mutex;
+use std::{path::Path, sync::Arc};
 
+#[cfg(windows)]
+use async_io::OverlappedFile;
 use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
             CreateFileW,
-            FlushFileBuffers,
-            ReadFile,
-            SetFilePointerEx,
-            WriteFile,
-            FILE_BEGIN,
             FILE_FLAGS_AND_ATTRIBUTES,
             FILE_GENERIC_READ,
             FILE_SHARE_READ,
@@ -317,7 +318,10 @@ fn write_all_at<W: DiskWriter + ?Sized>(writer: &W, offset: u64, buffer: &[u8]) 
 
 /// Reader for image files (.img, .raw, etc.).
 pub struct ImageFileReader {
-    file: std::sync::Mutex<File>,
+    #[cfg(windows)]
+    file: OverlappedFile,
+    #[cfg(not(windows))]
+    file: Mutex<File>,
     size: u64,
 }
 
@@ -333,14 +337,20 @@ impl ImageFileReader {
             std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ.0)
+                .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0)
                 .open(path.as_ref())?
         };
         #[cfg(not(windows))]
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
+        #[cfg(windows)]
+        let file = OverlappedFile::from_file(file)?;
 
         Ok(Self {
-            file: std::sync::Mutex::new(file),
+            #[cfg(windows)]
+            file,
+            #[cfg(not(windows))]
+            file: Mutex::new(file),
             size,
         })
     }
@@ -348,10 +358,17 @@ impl ImageFileReader {
 
 impl DiskReader for ImageFileReader {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        let bytes_read = file.read(buffer)?;
-        Ok(bytes_read)
+        #[cfg(windows)]
+        {
+            self.file.read_sync(offset, buffer)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            let bytes_read = file.read(buffer)?;
+            Ok(bytes_read)
+        }
     }
 
     fn total_size(&self) -> u64 {
@@ -394,7 +411,10 @@ pub fn open_writable_image<P: AsRef<Path>>(
 /// and implements the DiskWriter trait.
 #[allow(dead_code)]
 pub(crate) struct ImageFileWriter {
-    file: std::sync::Mutex<File>,
+    #[cfg(windows)]
+    file: OverlappedFile,
+    #[cfg(not(windows))]
+    file: Mutex<File>,
     size: u64,
 }
 
@@ -413,6 +433,7 @@ impl ImageFileWriter {
                 .write(true)
                 // Deny other writers and deletion/replacement while mounted.
                 .share_mode(FILE_SHARE_READ.0)
+                .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0)
                 .open(path.as_ref())?
         };
         #[cfg(not(windows))]
@@ -427,9 +448,14 @@ impl ImageFileWriter {
             ));
         }
         let size = metadata.len();
+        #[cfg(windows)]
+        let file = OverlappedFile::from_file(file)?;
 
         Ok(Self {
-            file: std::sync::Mutex::new(file),
+            #[cfg(windows)]
+            file,
+            #[cfg(not(windows))]
+            file: Mutex::new(file),
             size,
         })
     }
@@ -448,6 +474,7 @@ impl ImageFileWriter {
                 .create(true)
                 .truncate(true)
                 .share_mode(FILE_SHARE_READ.0)
+                .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0)
                 .open(path.as_ref())?
         };
         #[cfg(not(windows))]
@@ -458,11 +485,16 @@ impl ImageFileWriter {
             .truncate(true)
             .open(path.as_ref())?;
 
-        // Set the file size
+        // Set the file size before associating the handle with the IOCP.
         file.set_len(size)?;
+        #[cfg(windows)]
+        let file = OverlappedFile::from_file(file)?;
 
         Ok(Self {
-            file: std::sync::Mutex::new(file),
+            #[cfg(windows)]
+            file,
+            #[cfg(not(windows))]
+            file: Mutex::new(file),
             size,
         })
     }
@@ -470,10 +502,17 @@ impl ImageFileWriter {
 
 impl DiskReader for ImageFileWriter {
     fn read_raw_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        let bytes_read = file.read(buffer)?;
-        Ok(bytes_read)
+        #[cfg(windows)]
+        {
+            self.file.read_sync(offset, buffer)
+        }
+        #[cfg(not(windows))]
+        {
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            let bytes_read = file.read(buffer)?;
+            Ok(bytes_read)
+        }
     }
 
     fn total_size(&self) -> u64 {
@@ -491,18 +530,33 @@ impl DiskReader for ImageFileWriter {
 
 impl DiskWriter for ImageFileWriter {
     fn write_raw_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        use std::io::Write;
-
         validate_device_write_range(offset, data.len(), self.size)?;
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
-        let bytes_written = file.write(data)?;
-        Ok(bytes_written)
+
+        #[cfg(windows)]
+        {
+            self.file.write_sync(offset, data)
+        }
+        #[cfg(not(windows))]
+        {
+            use std::io::Write;
+
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            let bytes_written = file.write(data)?;
+            Ok(bytes_written)
+        }
     }
 
     fn flush_raw(&self) -> Result<()> {
-        let file = self.file.lock().unwrap();
-        file.sync_all()?;
+        #[cfg(windows)]
+        {
+            self.file.flush()?;
+        }
+        #[cfg(not(windows))]
+        {
+            let file = self.file.lock().unwrap();
+            file.sync_all()?;
+        }
         Ok(())
     }
 }
@@ -691,19 +745,18 @@ impl fs_abstraction::BlockDevice for PartitionWriter {
 
 /// Reader for physical Windows disks.
 pub struct PhysicalDiskReader {
-    handle: HANDLE,
+    #[cfg(windows)]
+    handle: OverlappedFile,
     size: u64,
     sector_size: u32,
-    /// Serialises every operation on the shared handle, including seeks,
-    /// reads, retries, and the extended-DASD IOCTL.
-    io_lock: Mutex<()>,
 }
 
-// SAFETY: HANDLE is an opaque Win32 resource and is not modelled as Send/Sync
-// by the windows crate. Every operation using it is protected by `io_lock`;
-// construction-time geometry IOCTLs run before the handle is shared, and
-// `CloseHandle` runs only from Drop after all shared references are gone.
+// SAFETY: OverlappedFile owns the Win32 handle and IOCP. Every queued request
+// owns a distinct OVERLAPPED and keeps the handle alive until its completion is
+// retrieved; geometry IOCTLs run before the handle is shared.
+#[cfg(windows)]
 unsafe impl Send for PhysicalDiskReader {}
+#[cfg(windows)]
 unsafe impl Sync for PhysicalDiskReader {}
 
 impl PhysicalDiskReader {
@@ -736,19 +789,23 @@ impl PhysicalDiskReader {
         tracing::debug!("Wide path created with {} characters", wide_path.len());
 
         // Different types of paths may need different flags
-        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_RANDOM_ACCESS};
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_OVERLAPPED,
+            FILE_FLAG_RANDOM_ACCESS,
+        };
 
         // Use buffered I/O: unbuffered I/O would require sector-aligned buffer
         // addresses and lengths, but the VFS passes ordinary `Vec<u8>` buffers
         // of arbitrary alignment/length. The OS cache handles alignment for us.
+        // All disk handles are overlapped and associated with an IOCP so reads
+        // and writes at independent offsets can be queued concurrently.
         let flags = if path.contains("HarddiskVolume") {
-            tracing::debug!("Detected HarddiskVolume path, using FILE_ATTRIBUTE_NORMAL only");
-            FILE_ATTRIBUTE_NORMAL.0
+            tracing::debug!("Detected HarddiskVolume path, using overlapped buffered I/O");
+            FILE_ATTRIBUTE_NORMAL.0 | FILE_FLAG_OVERLAPPED.0
         } else {
-            tracing::debug!("Using raw disk access flags");
-            let mut f = FILE_ATTRIBUTE_NORMAL.0;
-            f |= FILE_FLAG_RANDOM_ACCESS.0;
-            f
+            tracing::debug!("Using overlapped raw disk access flags");
+            FILE_ATTRIBUTE_NORMAL.0 | FILE_FLAG_RANDOM_ACCESS.0 | FILE_FLAG_OVERLAPPED.0
         };
 
         tracing::debug!("Attempting to call CreateFileW with flags: 0x{:X}", flags);
@@ -860,12 +917,12 @@ impl PhysicalDiskReader {
             }
         };
         tracing::debug!("Disk size: {}, sector size: {}", size, sector_size);
+        let handle = OverlappedFile::from_raw(handle)?;
 
         Ok(Self {
             handle,
             size,
             sector_size,
-            io_lock: Mutex::new(()),
         })
     }
 
@@ -991,37 +1048,20 @@ impl DiskReader for PhysicalDiskReader {
             return Ok(0);
         }
 
-        // Seek + read must be atomic with respect to other readers: the
-        // handle's file pointer is shared by every WinFsp worker thread.
-        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
-
         unsafe {
-            // For volume handles, we need to use SetFilePointerEx and ReadFile
-            // Seek to offset
-            let mut new_pos: i64 = 0;
-            SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
-                |e| {
-                    tracing::error!("SetFilePointerEx failed: error code 0x{:X}", e.code().0);
-                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-                },
-            )?;
-            tracing::debug!("Seek successful, new position: {}", new_pos);
-
-            // Read data
-            let mut bytes_read: u32 = 0;
-            let result = ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None);
+            let result = self.handle.read_sync(offset, buffer);
 
             match result {
-                Ok(()) => {
+                Ok(bytes_read) => {
                     tracing::debug!("Read successful: {} bytes read", bytes_read);
-                    Ok(bytes_read as usize)
+                    Ok(bytes_read)
                 }
-                Err(e) => {
-                    tracing::error!("ReadFile failed: error code 0x{:X}", e.code().0);
+                Err(error) => {
+                    tracing::error!("Overlapped ReadFile failed: {}", error);
 
                     // For volume devices, sometimes we need to use
                     // DeviceIoControl with FSCTL_ALLOW_EXTENDED_DASD_IO to
-                    // bypass certain restrictions
+                    // bypass certain restrictions.
                     use windows::Win32::System::{
                         Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO,
                         IO::DeviceIoControl,
@@ -1029,7 +1069,7 @@ impl DiskReader for PhysicalDiskReader {
 
                     let mut bytes_returned: u32 = 0;
                     let allow_extended_result = DeviceIoControl(
-                        self.handle,
+                        self.handle.handle(),
                         FSCTL_ALLOW_EXTENDED_DASD_IO,
                         None,
                         0,
@@ -1041,84 +1081,19 @@ impl DiskReader for PhysicalDiskReader {
 
                     if allow_extended_result.is_ok() {
                         tracing::debug!("Extended DASD I/O allowed, retrying read");
-
-                        // Retry the seek and read
-                        SetFilePointerEx(
-                            self.handle,
-                            offset as i64,
-                            Some(&mut new_pos),
-                            FILE_BEGIN,
-                        )
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Second SetFilePointerEx failed: error code 0x{:X}",
-                                e.code().0
-                            );
-                            XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-                        })?;
-
-                        bytes_read = 0;
-                        let result_retry =
-                            ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None);
-                        match result_retry {
-                            Ok(()) => {
-                                tracing::debug!("Retry read successful: {} bytes read", bytes_read);
-                                Ok(bytes_read as usize)
-                            }
-                            Err(e_retry) => {
-                                tracing::error!(
-                                    "Retry ReadFile also failed: error code 0x{:X}",
-                                    e_retry.code().0
-                                );
-
-                                // Check for specific error codes
-                                let error_code = e_retry.code().0 as u32;
-                                if error_code == 0x80070057 {
-                                    // ERROR_INVALID_PARAMETER
-                                    tracing::error!(
-                                        "Invalid parameter error when reading from mounted volume."
-                                    );
-                                    tracing::error!(
-                                        "This typically means the volume is mounted and Windows \
-                                         restricts direct access."
-                                    );
-                                    tracing::error!(
-                                        "Try using an unmounted volume or a disk image file \
-                                         instead."
-                                    );
-                                }
-
-                                Err(XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
-                                    e_retry.code().0,
-                                )))
-                            }
-                        }
+                        // Retry with a fresh OVERLAPPED at the same explicit
+                        // offset; no shared file pointer is involved.
+                        self.handle.read_sync(offset, buffer)
                     } else {
                         let dasd_error = allow_extended_result.err().unwrap();
-                        tracing::error!(
-                            "Failed to enable extended DASD I/O: error code 0x{:X}",
-                            dasd_error.code().0
-                        );
-
-                        // Check if the failure to enable extended DASD I/O is
-                        // due to the volume being mounted
-                        let dasd_error_code = dasd_error.code().0 as u32;
-                        if dasd_error_code == 0x80070057 {
-                            // ERROR_INVALID_PARAMETER
-                            tracing::error!("Cannot enable extended DASD I/O on mounted volume.");
+                        tracing::error!("Failed to enable extended DASD I/O: {}", dasd_error);
+                        if dasd_error.code().0 as u32 == 0x8007_0057 {
                             tracing::error!(
-                                "The volume is likely mounted and Windows prevents direct access \
-                                 to protect data integrity."
-                            );
-                            tracing::error!(
-                                "To read XFS filesystem, use an unmounted volume or a disk image \
-                                 file."
+                                "Cannot enable extended DASD I/O on mounted volume. Use an \
+                                 unmounted volume or a disk image file."
                             );
                         }
-
-                        Err(XfsWinfspError::IoError(std::io::Error::from_raw_os_error(
-                            dasd_error.code().0 as i32,
-                        )))
+                        Err(XfsWinfspError::IoError(std::io::Error::other(dasd_error)))
                     }
                 }
             }
@@ -1131,15 +1106,6 @@ impl DiskReader for PhysicalDiskReader {
 
     fn get_sector_size(&self) -> u32 {
         self.sector_size
-    }
-}
-
-impl Drop for PhysicalDiskReader {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
     }
 }
 
@@ -1164,19 +1130,18 @@ impl fs_abstraction::BlockDevice for PhysicalDiskReader {
 /// Use with extreme caution.
 #[allow(dead_code)]
 pub(crate) struct PhysicalDiskWriter {
-    handle: HANDLE,
+    #[cfg(windows)]
+    handle: OverlappedFile,
     size: u64,
     sector_size: u32,
-    /// Serialises every operation on the shared handle, including seeks,
-    /// reads, writes, flushes, and construction-time geometry IOCTLs.
-    io_lock: Mutex<()>,
 }
 
-// SAFETY: HANDLE is an opaque Win32 resource and is not modelled as Send/Sync
-// by the windows crate. Every shared-handle operation (including flush) is
-// protected by `io_lock`; geometry IOCTLs run before the handle is shared, and
-// `CloseHandle` runs only from Drop after all shared references are gone.
+// SAFETY: OverlappedFile serializes only completion bookkeeping, not disk I/O.
+// Each queued read/write owns its OVERLAPPED and keeps the handle alive until
+// its completion packet has been retrieved.
+#[cfg(windows)]
 unsafe impl Send for PhysicalDiskWriter {}
+#[cfg(windows)]
 unsafe impl Sync for PhysicalDiskWriter {}
 
 #[allow(dead_code)]
@@ -1208,10 +1173,11 @@ impl PhysicalDiskWriter {
         tracing::debug!("PhysicalDiskWriter::open_by_path: {}", path);
         let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
-        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED};
 
-        // Buffered I/O accepts the ordinary, potentially unaligned VFS buffers.
-        let flags = FILE_ATTRIBUTE_NORMAL.0;
+        // Buffered overlapped I/O accepts ordinary, potentially unaligned VFS
+        // buffers and allows independent positional requests to be queued.
+        let flags = FILE_ATTRIBUTE_NORMAL.0 | FILE_FLAG_OVERLAPPED.0;
 
         // Writable raw-device mounts must exclude every other writer. There is
         // deliberately no broader-access fallback: sharing write access would
@@ -1274,12 +1240,12 @@ impl PhysicalDiskWriter {
             size,
             sector_size
         );
+        let handle = OverlappedFile::from_raw(handle)?;
 
         Ok(Self {
             handle,
             size,
             sector_size,
-            io_lock: Mutex::new(()),
         })
     }
 }
@@ -1290,20 +1256,7 @@ impl DiskReader for PhysicalDiskWriter {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            let mut new_pos: i64 = 0;
-            SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
-                |e| XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0)),
-            )?;
-
-            let mut bytes_read: u32 = 0;
-            ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None).map_err(|e| {
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-            })?;
-
-            Ok(bytes_read as usize)
-        }
+        self.handle.read_sync(offset, buffer)
     }
 
     fn total_size(&self) -> u64 {
@@ -1325,35 +1278,17 @@ impl DiskWriter for PhysicalDiskWriter {
         if data.is_empty() {
             return Ok(0);
         }
-        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            let mut new_pos: i64 = 0;
-            SetFilePointerEx(self.handle, offset as i64, Some(&mut new_pos), FILE_BEGIN).map_err(
-                |e| {
-                    tracing::error!("SetFilePointerEx failed: 0x{:X}", e.code().0);
-                    XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-                },
-            )?;
+        let bytes_written = self.handle.write_sync(offset, data).map_err(|error| {
+            tracing::error!("Overlapped WriteFile failed: {}", error);
+            error
+        })?;
 
-            let mut bytes_written: u32 = 0;
-            WriteFile(self.handle, Some(data), Some(&mut bytes_written), None).map_err(|e| {
-                tracing::error!("WriteFile failed: 0x{:X}", e.code().0);
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-            })?;
-
-            tracing::trace!("write_at: offset={} wrote {} bytes", offset, bytes_written);
-            Ok(bytes_written as usize)
-        }
+        tracing::trace!("write_at: offset={} wrote {} bytes", offset, bytes_written);
+        Ok(bytes_written)
     }
 
     fn flush_raw(&self) -> Result<()> {
-        let _guard = self.io_lock.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            FlushFileBuffers(self.handle).map_err(|e| {
-                XfsWinfspError::IoError(std::io::Error::from_raw_os_error(e.code().0))
-            })?;
-        }
-        Ok(())
+        self.handle.flush()
     }
 }
 
@@ -1386,12 +1321,8 @@ impl fs_abstraction::BlockDevice for PhysicalDiskWriter {
 
 impl Drop for PhysicalDiskWriter {
     fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        // Flush before closing
+        // Flush before the OverlappedFile owner closes the handle and IOCP.
         let _ = self.flush_raw();
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
     }
 }
 
@@ -2032,6 +1963,42 @@ pub(crate) fn open_disk_with_partitions_rw(
 mod tests {
     use super::*;
 
+    struct TestImage {
+        path: std::path::PathBuf,
+    }
+
+    impl TestImage {
+        fn new(data: &[u8]) -> Self {
+            use std::{
+                sync::atomic::{AtomicU64, Ordering},
+                time::{SystemTime, UNIX_EPOCH},
+            };
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "crisscrossfs-disk-{}-{timestamp}-{id}.img",
+                std::process::id()
+            ));
+            std::fs::write(&path, data).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestImage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     struct MemoryDisk {
         data: Mutex<Vec<u8>>,
         sector_size: u32,
@@ -2286,6 +2253,161 @@ mod tests {
             validate_device_write_range(u64::MAX, 1, u64::MAX),
             Err(XfsWinfspError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn image_reads_use_requested_offsets_and_return_eof_prefix() {
+        let data: Vec<u8> = (0..16).collect();
+        let image = TestImage::new(&data);
+        let reader = ImageFileReader::open(image.path()).unwrap();
+
+        let mut buffer = [0xAA; 6];
+        assert_eq!(reader.read_raw_at(5, &mut buffer).unwrap(), 6);
+        assert_eq!(&buffer, &data[5..11]);
+
+        assert_eq!(reader.read_raw_at(14, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer[..2], &data[14..16]);
+        assert_eq!(reader.read_raw_at(16, &mut buffer).unwrap(), 0);
+        assert_eq!(reader.read_raw_at(0, &mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn image_writes_use_requested_offsets_and_preserve_bounds() {
+        let original = vec![0x5A; 32];
+        let image = TestImage::new(&original);
+        let writer = ImageFileWriter::open(image.path()).unwrap();
+
+        assert_eq!(writer.write_raw_at(7, b"abcdef").unwrap(), 6);
+        assert_eq!(writer.write_raw_at(24, b"12345678").unwrap(), 8);
+        assert!(matches!(
+            writer.write_raw_at(28, b"12345"),
+            Err(XfsWinfspError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            writer.write_raw_at(i64::MAX as u64 + 1, b""),
+            Err(XfsWinfspError::InvalidArgument(_))
+        ));
+        drop(writer);
+
+        let mut expected = original;
+        expected[7..13].copy_from_slice(b"abcdef");
+        expected[24..32].copy_from_slice(b"12345678");
+        assert_eq!(std::fs::read(image.path()).unwrap(), expected);
+        assert_eq!(std::fs::metadata(image.path()).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn concurrent_image_io_uses_independent_positions() {
+        use std::sync::Barrier;
+
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 64;
+        const BLOCK_SIZE: usize = 64;
+
+        let image = TestImage::new(&vec![0xA5; 4096]);
+        let writer = ImageFileWriter::open(image.path()).unwrap();
+        let barrier = Barrier::new(THREADS);
+
+        std::thread::scope(|scope| {
+            for thread_id in 0..THREADS {
+                let writer = &writer;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let offset = (thread_id * 256 + 17) as u64;
+                    for iteration in 0..ITERATIONS {
+                        let mut expected = [0u8; BLOCK_SIZE];
+                        for (index, byte) in expected.iter_mut().enumerate() {
+                            *byte = (thread_id * 31 + iteration * 17 + index) as u8;
+                        }
+
+                        assert_eq!(
+                            DiskWriter::write_raw_at(writer, offset, &expected).unwrap(),
+                            BLOCK_SIZE,
+                            "thread {thread_id}, iteration {iteration}"
+                        );
+
+                        let mut actual = [0u8; BLOCK_SIZE];
+                        assert_eq!(
+                            DiskReader::read_raw_at(writer, offset, &mut actual).unwrap(),
+                            BLOCK_SIZE,
+                            "thread {thread_id}, iteration {iteration}"
+                        );
+                        assert_eq!(actual, expected);
+                    }
+                });
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_disk_positional_io_uses_overlapped_offsets() {
+        use std::{os::windows::fs::OpenOptionsExt, sync::Barrier};
+
+        const THREADS: usize = 4;
+        const ITERATIONS: usize = 32;
+        const BLOCK_SIZE: usize = 64;
+
+        let original = vec![0xA5; 2048];
+        let image = TestImage::new(&original);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0)
+            .open(image.path())
+            .unwrap();
+        let size = file.metadata().unwrap().len();
+        let handle = OverlappedFile::from_file(file).unwrap();
+        let disk = PhysicalDiskWriter {
+            handle,
+            size,
+            sector_size: 512,
+        };
+        let mut tail_buffer = [0u8; 4];
+        assert_eq!(disk.read_raw_at(size - 2, &mut tail_buffer).unwrap(), 2);
+        assert_eq!(&tail_buffer[..2], &original[original.len() - 2..]);
+        let mut eof_buffer = [0u8; 1];
+        assert_eq!(disk.read_raw_at(size, &mut eof_buffer).unwrap(), 0);
+        let barrier = Barrier::new(THREADS);
+
+        std::thread::scope(|scope| {
+            for thread_id in 0..THREADS {
+                let disk = &disk;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let offset = (thread_id * 256 + 17) as u64;
+                    for iteration in 0..ITERATIONS {
+                        let mut expected = [0u8; BLOCK_SIZE];
+                        for (index, byte) in expected.iter_mut().enumerate() {
+                            *byte = (thread_id * 31 + iteration * 17 + index) as u8;
+                        }
+                        assert_eq!(
+                            DiskWriter::write_raw_at(disk, offset, &expected).unwrap(),
+                            BLOCK_SIZE
+                        );
+
+                        let mut actual = [0u8; BLOCK_SIZE];
+                        assert_eq!(
+                            DiskReader::read_raw_at(disk, offset, &mut actual).unwrap(),
+                            BLOCK_SIZE
+                        );
+                        assert_eq!(actual, expected);
+                    }
+                });
+            }
+        });
+        drop(disk);
+
+        let mut expected = original;
+        for thread_id in 0..THREADS {
+            let offset = thread_id * 256 + 17;
+            for (index, byte) in expected[offset..offset + BLOCK_SIZE].iter_mut().enumerate() {
+                *byte = (thread_id * 31 + (ITERATIONS - 1) * 17 + index) as u8;
+            }
+        }
+        assert_eq!(std::fs::read(image.path()).unwrap(), expected);
     }
 
     #[test]

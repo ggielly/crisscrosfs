@@ -7,7 +7,7 @@
 //! clean unmount record. The tail advances after every successful metadata
 //! flush, so already-durable records are not replayed over later data reuse.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use fs_abstraction::{BlockDevice, FsError, FsResult};
 use xfs_rs::{
@@ -28,7 +28,10 @@ use xfs_rs::{
     Superblock,
 };
 
-use crate::io::{read_exact_at, write_exact_at};
+use crate::{
+    io::{read_exact_at, write_exact_at},
+    transaction::PreparedTransaction,
+};
 
 const BASIC_BLOCK_SIZE: u64 = 512;
 const DEFAULT_ICLOG_SIZE: u32 = 32 * 1024;
@@ -190,8 +193,7 @@ impl Journal {
     }
 
     /// Append and force one committed transaction, then apply its metadata
-    /// images. If application fails after the log commit, the instance is
-    /// poisoned and must be remounted so recovery can finish the transaction.
+    /// images. This is the one-batch form of [`Self::commit_group`].
     pub(crate) fn commit(
         &mut self,
         items: Vec<LogBufferItem>,
@@ -203,7 +205,61 @@ impl Journal {
         if items.is_empty() && inode_items.is_empty() {
             return Ok(self.current_lsn());
         }
+        self.commit_group(vec![PreparedTransaction::new(items, inode_items)])
+    }
+
+    /// Aggregate prepared metadata batches into one standard v2 checkpoint
+    /// record and one transaction ID, force it once, then apply the merged
+    /// metadata once. Shared buffer/inode targets are coalesced in preparation
+    /// order with the last complete image winning. If application fails the
+    /// journal is poisoned so remount recovery can finish the group.
+    pub(crate) fn commit_group(&mut self, transactions: Vec<PreparedTransaction>) -> FsResult<u64> {
+        if self.poisoned {
+            return Err(FsError::ReadOnly);
+        }
+        if transactions
+            .iter()
+            .all(|transaction| transaction.items.is_empty() && transaction.inode_items.is_empty())
+        {
+            return Ok(self.current_lsn());
+        }
+
         let tid = self.next_tid;
+        let mut items: Vec<LogBufferItem> = Vec::new();
+        let mut inode_items: Vec<xfs_rs::log_format::LogInodeItem> = Vec::new();
+        let mut buffer_indices = BTreeMap::<u64, usize>::new();
+        let mut inode_indices = BTreeMap::<u64, usize>::new();
+        for transaction in &transactions {
+            for item in &transaction.items {
+                if let Some(&index) = buffer_indices.get(&item.block_num) {
+                    if items[index].data.len() != item.data.len() {
+                        return Err(FsError::InvalidArgument);
+                    }
+                    items[index] = item.clone();
+                    // Earlier batches may have dirtied chunks absent from the
+                    // last batch's relative bitmap. Log the complete final
+                    // image.
+                    items[index].dirty_chunks.clear();
+                } else {
+                    items.try_reserve(1).map_err(|_| FsError::OutOfMemory)?;
+                    buffer_indices.insert(item.block_num, items.len());
+                    items.push(item.clone());
+                }
+            }
+            for item in &transaction.inode_items {
+                if let Some(&index) = inode_indices.get(&item.ino) {
+                    // Writer-prepared inode items are complete images, so the
+                    // last item also carries the final data-fork fields.
+                    inode_items[index] = item.clone();
+                } else {
+                    inode_items
+                        .try_reserve(1)
+                        .map_err(|_| FsError::OutOfMemory)?;
+                    inode_indices.insert(item.ino, inode_items.len());
+                    inode_items.push(item.clone());
+                }
+            }
+        }
         let tx = LogTransaction {
             tid,
             items,
@@ -524,7 +580,11 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+        Mutex,
+    };
 
     use fs_abstraction::BlockDevice;
     use xfs_rs::log_format::{LogBufferType, XLOG_FMT_LINUX_LE};
@@ -533,12 +593,18 @@ mod tests {
 
     struct Device {
         data: Mutex<Vec<u8>>,
+        flush_calls: AtomicUsize,
+        log_writes: AtomicUsize,
+        fail_write_at: AtomicU64,
     }
 
     impl Device {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 data: Mutex::new(vec![0u8; 4096 * 128]),
+                flush_calls: AtomicUsize::new(0),
+                log_writes: AtomicUsize::new(0),
+                fail_write_at: AtomicU64::new(u64::MAX),
             })
         }
     }
@@ -553,6 +619,12 @@ mod tests {
         }
 
         fn write_at(&self, offset: u64, input: &[u8]) -> FsResult<usize> {
+            if self.fail_write_at.load(Ordering::SeqCst) == offset {
+                return Err(FsError::DiskError);
+            }
+            if (16 * 4096..32 * 4096).contains(&offset) {
+                self.log_writes.fetch_add(1, Ordering::SeqCst);
+            }
             let mut data = self.data.lock().unwrap();
             let offset = usize::try_from(offset).map_err(|_| FsError::InvalidArgument)?;
             data[offset..offset + input.len()].copy_from_slice(input);
@@ -565,6 +637,11 @@ mod tests {
 
         fn supports_write(&self) -> bool {
             true
+        }
+
+        fn flush(&self) -> FsResult<()> {
+            self.flush_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -820,6 +897,108 @@ mod tests {
         );
         assert_eq!(reopened.cycle, journal.cycle);
         assert_eq!(reopened.head_block, journal.head_block);
+    }
+
+    fn buffer_item(target: u64, byte: u8) -> LogBufferItem {
+        LogBufferItem {
+            block_num: target,
+            data: vec![byte; 512],
+            buffer_type: LogBufferType::Btree,
+            inode_buffer: false,
+            dirty_chunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn group_commit_uses_one_record_one_id_and_recovers_every_batch() {
+        let device = Device::new();
+        let superblock = superblock();
+        let mut journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+        let first_tid = journal.next_tid;
+        let lsn = journal
+            .commit_group(vec![
+                PreparedTransaction::new(vec![buffer_item(20, 0xA1)], Vec::new()),
+                PreparedTransaction::new(vec![buffer_item(21, 0xB2)], Vec::new()),
+            ])
+            .unwrap();
+        assert_eq!(lsn >> 32, 1);
+        assert_eq!(journal.next_tid, first_tid + 1);
+        assert_eq!(device.log_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(device.flush_calls.load(Ordering::SeqCst), 2);
+
+        let records = journal.scan().unwrap();
+        assert_eq!(records.len(), 1);
+        let decoded = records[0].decoded.as_ref().unwrap();
+        assert_eq!(decoded.tid, first_tid);
+        assert_eq!(decoded.items.len(), 2);
+        drop(journal);
+
+        let mut reopened = Journal::new(device.clone(), superblock).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(reopened.next_tid, first_tid + 1);
+        let data = device.data.lock().unwrap();
+        assert_eq!(&data[20 * 512..21 * 512], &[0xA1; 512]);
+        assert_eq!(&data[21 * 512..22 * 512], &[0xB2; 512]);
+    }
+
+    #[test]
+    fn group_commit_coalesces_shared_targets_with_last_image_winning() {
+        let device = Device::new();
+        let superblock = superblock();
+        let mut journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+        let tid = journal.next_tid;
+        journal
+            .commit_group(vec![
+                PreparedTransaction::new(vec![buffer_item(20, 0xA1)], Vec::new()),
+                PreparedTransaction::new(vec![buffer_item(20, 0xB2)], Vec::new()),
+            ])
+            .unwrap();
+        assert!(!journal.is_poisoned());
+        assert_eq!(journal.next_tid, tid + 1);
+        assert_eq!(device.log_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(device.flush_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            &device.data.lock().unwrap()[20 * 512..21 * 512],
+            &[0xB2; 512]
+        );
+        drop(journal);
+
+        let mut reopened = Journal::new(device.clone(), superblock).unwrap();
+        reopened.recover().unwrap();
+        assert_eq!(
+            &device.data.lock().unwrap()[20 * 512..21 * 512],
+            &[0xB2; 512]
+        );
+    }
+
+    #[test]
+    fn group_apply_failure_poisons_and_recovery_finishes_the_group() {
+        let device = Device::new();
+        let superblock = superblock();
+        let mut journal = Journal::new(device.clone(), superblock.clone()).unwrap();
+        device.fail_write_at.store(21 * 512, Ordering::SeqCst);
+        assert!(matches!(
+            journal.commit_group(vec![
+                PreparedTransaction::new(vec![buffer_item(20, 0xA1)], Vec::new()),
+                PreparedTransaction::new(vec![buffer_item(21, 0xB2)], Vec::new()),
+            ]),
+            Err(FsError::DiskError)
+        ));
+        assert!(journal.is_poisoned());
+        assert_eq!(device.log_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &device.data.lock().unwrap()[20 * 512..21 * 512],
+            &[0xA1; 512]
+        );
+        drop(journal);
+
+        device.fail_write_at.store(u64::MAX, Ordering::SeqCst);
+        let mut reopened = Journal::new(device.clone(), superblock).unwrap();
+        reopened.recover().unwrap();
+        assert!(!reopened.is_poisoned());
+        let data = device.data.lock().unwrap();
+        assert_eq!(&data[20 * 512..21 * 512], &[0xA1; 512]);
+        assert_eq!(&data[21 * 512..22 * 512], &[0xB2; 512]);
     }
 
     #[test]

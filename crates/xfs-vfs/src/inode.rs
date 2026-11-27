@@ -48,6 +48,7 @@ pub fn inode_to_file_info(
         } else {
             None
         },
+        posix_acl: None,
     })
 }
 
